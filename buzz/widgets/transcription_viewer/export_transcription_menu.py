@@ -1,16 +1,29 @@
 import logging
+import os
+import tempfile
+
 from PyQt6.QtGui import QAction
-from PyQt6.QtCore import pyqtSignal
-from PyQt6.QtWidgets import QWidget, QMenu, QFileDialog
+from PyQt6.QtCore import Qt, QProcess, pyqtSignal
+from PyQt6.QtWidgets import QWidget, QMenu, QFileDialog, QMessageBox, QProgressDialog
 
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
+from buzz.ffmpeg_video_player import _find_ffmpeg, probe_video
 from buzz.locale import _
 from buzz.transcriber.file_transcriber import write_output
 from buzz.transcriber.transcriber import (
     OutputFormat,
     Segment,
 )
+
+
+# Video export modes (not part of OutputFormat enum). Format: <label>, <ext>.
+MP4_BURNED = "MP4_BURNED"
+MP4_SOFT = "MP4_SOFT"
+VIDEO_MODES = {
+    MP4_BURNED: (_("MP4 - Burned Subtitles"), "mp4"),
+    MP4_SOFT: (_("MP4 - Soft Subtitles"), "mp4"),
+}
 
 
 class ExportTranscriptionMenu(QMenu):
@@ -41,25 +54,50 @@ class ExportTranscriptionMenu(QMenu):
         ]
         for action in self.translation_actions:
             action.setVisible(has_translation)
-        actions = self.text_actions + self.translation_actions
+
+        # ponytail: burned subtitles always available (use text if no translation);
+        # soft subtitles can embed any srt, so always available too.
+        self.video_burned_action = QAction(
+            text=f"{VIDEO_MODES[MP4_BURNED][0]} - {translation_label}"
+            if has_translation
+            else f"{VIDEO_MODES[MP4_BURNED][0]} - {text_label}",
+            parent=self,
+        )
+        self.video_soft_action = QAction(
+            text=f"{VIDEO_MODES[MP4_SOFT][0]} - {translation_label}"
+            if has_translation
+            else f"{VIDEO_MODES[MP4_SOFT][0]} - {text_label}",
+            parent=self,
+        )
+
+        actions = (
+            self.text_actions
+            + self.translation_actions
+            + [self.video_burned_action, self.video_soft_action]
+        )
         self.addActions(actions)
         self.triggered.connect(self.on_menu_triggered)
 
     @staticmethod
     def extract_format_and_segment_key(action_text: str):
-        parts = action_text.split('-')
-        output_format = parts[0].strip()
+        parts = action_text.split('-', 1)
+        head = parts[0].strip()
         label = parts[1].strip() if len(parts) > 1 else None
         segment_key = 'translation' if label == _('Translation') else 'text'
-
-        return output_format, segment_key
+        return head, segment_key
 
     def on_translation_available(self):
         for action in self.translation_actions:
             action.setVisible(True)
+        self.video_burned_action.setText(
+            f"{VIDEO_MODES[MP4_BURNED][0]} - {_('Translation')}"
+        )
+        self.video_soft_action.setText(
+            f"{VIDEO_MODES[MP4_SOFT][0]} - {_('Translation')}"
+        )
 
-    def on_menu_triggered(self, action: QAction):
-        segments = [
+    def _get_segments(self) -> list[Segment]:
+        return [
             Segment(
                 start=segment.start_time,
                 end=segment.end_time,
@@ -70,26 +108,185 @@ class ExportTranscriptionMenu(QMenu):
             )
         ]
 
-        output_format_value, segment_key = self.extract_format_and_segment_key(action.text())
-        output_format = OutputFormat(output_format_value.lower())
+    def on_menu_triggered(self, action: QAction):
+        action_text = action.text()
+        head, segment_key = self.extract_format_and_segment_key(action_text)
 
+        # Video export branch
+        if head in (VIDEO_MODES[MP4_BURNED][0], VIDEO_MODES[MP4_SOFT][0]):
+            mode = MP4_BURNED if head == VIDEO_MODES[MP4_BURNED][0] else MP4_SOFT
+            self._export_video(mode, segment_key)
+            return
+
+        # Subtitle file branch (original behavior)
+        output_format = OutputFormat(head.lower())
         default_path = self.transcription.get_output_file_path(
             output_format=output_format
         )
-
         (output_file_path, nil) = QFileDialog.getSaveFileName(
             self,
             _("Save File"),
             default_path,
             _("Text files") + f" (*.{output_format.value})",
         )
+        if output_file_path == "":
+            return
+        write_output(
+            path=output_file_path,
+            segments=self._get_segments(),
+            output_format=output_format,
+            segment_key=segment_key,
+        )
 
+    def _export_video(self, mode: str, segment_key: str):
+        """Burn or soft-embed subtitles into an MP4 via ffmpeg (async, QProcess)."""
+        media_file = self.transcription.file
+        if not media_file or not os.path.isfile(media_file):
+            QMessageBox.critical(
+                self, _("Export Video"),
+                _("Source media not found: {}").format(media_file or ""),
+            )
+            return
+
+        label, ext = VIDEO_MODES[mode]
+        base = os.path.splitext(os.path.basename(media_file))[0]
+        default_path = os.path.join(
+            os.path.dirname(media_file), f"{base}.{ext}"
+        )
+        filter_str = f"{_('Video files')} (*.{ext})"
+        output_file_path, _ = QFileDialog.getSaveFileName(
+            self, _("Save File"), default_path, filter_str
+        )
         if output_file_path == "":
             return
 
-        write_output(
-            path=output_file_path,
-            segments=segments,
-            output_format=output_format,
-            segment_key=segment_key
+        segments = self._get_segments()
+        srt_fd, srt_path = tempfile.mkstemp(suffix=".srt", text=True)
+        os.close(srt_fd)
+        try:
+            write_output(
+                path=srt_path,
+                segments=segments,
+                output_format=OutputFormat.SRT,
+                segment_key=segment_key,
+            )
+        except Exception as e:
+            logging.error("Writing temp SRT failed: %s", e)
+            self._cleanup_srt(srt_path)
+            QMessageBox.critical(
+                self, _("Export Video"),
+                _("Failed to prepare subtitles: {}").format(e),
+            )
+            return
+
+        duration_ms = self._probe_duration_ms(media_file)
+
+        prog = QProgressDialog(
+            _("Exporting video with subtitles..."), _("Cancel"), 0, 100, self
         )
+        prog.setWindowTitle(_("Export Video"))
+        prog.setWindowModality(Qt.WindowModality.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.setValue(0)
+
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        proc.srt_path = srt_path
+        proc.output_path = output_file_path
+        proc.duration_ms = duration_ms
+        proc.dialog = prog
+        prog.canceled.connect(proc.kill)
+
+        proc.readyRead.connect(lambda: self._on_ffmpeg_output(proc))
+        proc.finished.connect(lambda code, st: self._on_ffmpeg_finished(proc, code, st))
+        proc.errorOccurred.connect(
+            lambda err: self._on_ffmpeg_error(proc, err)
+        )
+
+        self._start_ffmpeg(proc, mode, media_file, srt_path, output_file_path)
+
+    @staticmethod
+    def _start_ffmpeg(
+        proc: QProcess, mode: str, media_file: str, srt_path: str, output_path: str
+    ):
+        ffmpeg = _find_ffmpeg()
+        # Escape backslashes/colons so the subtitles filter parses the path.
+        srt_filter_arg = srt_path.replace(chr(92), chr(92) * 2)
+        srt_filter_arg = srt_filter_arg.replace(":", chr(92) + ":")
+        if os.name == "nt":
+            srt_escaped = srt_path.replace(chr(92), "/" + chr(92))
+            srt_filter_arg = srt_escaped
+
+        if mode == MP4_BURNED:
+            cmd = [
+                ffmpeg, "-y", "-i", media_file,
+                "-vf", f"subtitles={srt_filter_arg}",
+                "-c:a", "copy",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                "-progress", "pipe:1", "-nostats",
+                output_path,
+            ]
+        else:  # MP4_SOFT
+            cmd = [
+                ffmpeg, "-y", "-i", media_file, "-i", srt_path,
+                "-map", "0", "-map", "1",
+                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                "-metadata:s:s:0", "language=chi",
+                "-progress", "pipe:1", "-nostats",
+                output_path,
+            ]
+        proc.start(cmd[0], cmd[1:])
+
+    def _on_ffmpeg_output(self, proc: QProcess):
+        data = bytes(proc.readAll()).decode("utf-8", errors="replace")
+        for line in data.splitlines():
+            line = line.strip()
+            if line.startswith("out_time_ms=") or line.startswith("out_time_us="):
+                try:
+                    us = int(line.split("=", 1)[1])
+                    ms = max(0, us // 1000)
+                except ValueError:
+                    continue
+                if proc.duration_ms:
+                    pct = min(100, int(ms * 100 / proc.duration_ms))
+                    proc.dialog.setValue(pct)
+            elif line == "progress=end":
+                proc.dialog.setValue(100)
+
+    def _on_ffmpeg_finished(self, proc: QProcess, exit_code: int, _exit_status):
+        self._cleanup_srt(proc.srt_path)
+        if exit_code == 0 and os.path.isfile(proc.output_path):
+            proc.dialog.close()
+            QMessageBox.information(
+                self, _("Export Video"),
+                _("Saved: {}").format(proc.output_path),
+            )
+        else:
+            proc.dialog.close()
+            QMessageBox.critical(
+                self, _("Export Video"),
+                _("ffmpeg failed (exit code {}). Check that ffmpeg is installed and the output path is writable.").format(exit_code),
+            )
+
+    def _on_ffmpeg_error(self, proc: QProcess, _err):
+        self._cleanup_srt(proc.srt_path)
+        proc.dialog.close()
+        QMessageBox.critical(
+            self, _("Export Video"),
+            _("Could not start ffmpeg. Make sure ffmpeg is installed and available in PATH."),
+        )
+
+    @staticmethod
+    def _cleanup_srt(srt_path):
+        try:
+            os.remove(srt_path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _probe_duration_ms(media_file: str) -> int:
+        try:
+            info = probe_video(media_file)
+            return int(info.get("duration_ms") or 0)
+        except Exception:
+            return 0
