@@ -57,18 +57,22 @@ class ExportTranscriptionMenu(QMenu):
 
         # ponytail: burned subtitles always available (use text if no translation);
         # soft subtitles can embed any srt, so always available too.
+        # segment_key stored in action data (not parsed from text — the format name
+        # contains " - " which breaks split); flipped to translation once it loads.
         self.video_burned_action = QAction(
             text=f"{VIDEO_MODES[MP4_BURNED][0]} - {translation_label}"
             if has_translation
             else f"{VIDEO_MODES[MP4_BURNED][0]} - {text_label}",
             parent=self,
         )
+        self.video_burned_action.setData({"mode": MP4_BURNED, "segment_key": "translation" if has_translation else "text"})
         self.video_soft_action = QAction(
             text=f"{VIDEO_MODES[MP4_SOFT][0]} - {translation_label}"
             if has_translation
             else f"{VIDEO_MODES[MP4_SOFT][0]} - {text_label}",
             parent=self,
         )
+        self.video_soft_action.setData({"mode": MP4_SOFT, "segment_key": "translation" if has_translation else "text"})
 
         actions = (
             self.text_actions
@@ -92,9 +96,11 @@ class ExportTranscriptionMenu(QMenu):
         self.video_burned_action.setText(
             f"{VIDEO_MODES[MP4_BURNED][0]} - {_('Translation')}"
         )
+        self.video_burned_action.setData({"mode": MP4_BURNED, "segment_key": "translation"})
         self.video_soft_action.setText(
             f"{VIDEO_MODES[MP4_SOFT][0]} - {_('Translation')}"
         )
+        self.video_soft_action.setData({"mode": MP4_SOFT, "segment_key": "translation"})
 
     def _get_segments(self) -> list[Segment]:
         return [
@@ -110,13 +116,18 @@ class ExportTranscriptionMenu(QMenu):
 
     def on_menu_triggered(self, action: QAction):
         action_text = action.text()
-        head, segment_key = self.extract_format_and_segment_key(action_text)
 
-        # Video export branch
-        if head in (VIDEO_MODES[MP4_BURNED][0], VIDEO_MODES[MP4_SOFT][0]):
-            mode = MP4_BURNED if head == VIDEO_MODES[MP4_BURNED][0] else MP4_SOFT
-            self._export_video(mode, segment_key)
+        # Video export branch — keyed off the action's data, not the split text
+        # (the text contains " - " which would otherwise break head parsing).
+        action_data = action.data()
+        if isinstance(action_data, dict) and action_data.get("mode") in VIDEO_MODES:
+            # segment_key stored in data (原文用 'text', 译文用 'translation'); never
+            # parse it from action_text — the format name itself contains " - ".
+            segment_key = action_data.get("segment_key", "text")
+            self._export_video(action_data["mode"], segment_key)
             return
+
+        head, segment_key = self.extract_format_and_segment_key(action_text)
 
         # Subtitle file branch (original behavior)
         output_format = OutputFormat(head.lower())
@@ -154,7 +165,7 @@ class ExportTranscriptionMenu(QMenu):
             os.path.dirname(media_file), f"{base}.{ext}"
         )
         filter_str = f"{_('Video files')} (*.{ext})"
-        output_file_path, _ = QFileDialog.getSaveFileName(
+        output_file_path, _ignored = QFileDialog.getSaveFileName(
             self, _("Save File"), default_path, filter_str
         )
         if output_file_path == "":
@@ -227,10 +238,14 @@ class ExportTranscriptionMenu(QMenu):
                 output_path,
             ]
         else:  # MP4_SOFT
+            # ponytail: transcode video to H.264 (don't copy) so QuickTime can play it —
+            # source codecs like AV1 leave QuickTime showing audio only. Upgrade: keep
+            # -c:v copy behind a "fast export" option if QT codec support ever broadens.
             cmd = [
                 ffmpeg, "-y", "-i", media_file, "-i", srt_path,
                 "-map", "0", "-map", "1",
-                "-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
+                "-c:a", "copy", "-c:s", "mov_text",
                 "-metadata:s:s:0", "language=chi",
                 "-progress", "pipe:1", "-nostats",
                 output_path,

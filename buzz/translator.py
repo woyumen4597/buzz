@@ -4,10 +4,9 @@ import logging
 import queue
 
 from typing import Optional, List, Tuple
-from openai import OpenAI, max_retries
+import httpx
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from buzz.locale import _
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import get_password, Key
 from buzz.transcriber.transcriber import TranscriptionOptions
@@ -15,6 +14,18 @@ from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDi
 
 
 BATCH_SIZE = 10
+
+DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+ANTHROPIC_VERSION = "2023-06-01"
+REQUEST_TIMEOUT = 180.0
+
+
+def _messages_url(base_url: str) -> str:
+    # base_url may or may not end in /v1; normalize so we hit .../v1/messages.
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        return base + "/messages"
+    return base + "/v1/messages"
 
 
 class Translator(QObject):
@@ -40,44 +51,59 @@ class Translator(QObject):
         self.queue = queue.Queue()
 
         settings = Settings()
-        custom_openai_base_url = os.getenv(
+        self.api_key = os.getenv(
+            "BUZZ_TRANSLATION_API_KEY", get_password(Key.OPENAI_API_KEY)
+        )
+        self.base_url = os.getenv(
             "BUZZ_TRANSLATION_API_BASE_URl",
-            settings.value(
-                key=Settings.Key.CUSTOM_OPENAI_BASE_URL, default_value=""
+            settings.value(Settings.Key.CUSTOM_OPENAI_BASE_URL, ""),
+        ) or DEFAULT_ANTHROPIC_BASE_URL
+
+        # ponytail: per-task llm_model wins, fall back to global preferences model.
+        self.llm_model = self.transcription_options.llm_model or os.getenv(
+            "BUZZ_TRANSLATION_API_MODEL",
+            settings.value(Settings.Key.OPENAI_API_MODEL, ""),
+        )
+
+    def _messages(self, system: str, user_content: str) -> Optional[str]:
+        """Call Anthropic Messages API via httpx. Returns top text block or None on error."""
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": ANTHROPIC_VERSION,
+            "content-type": "application/json",
+        }
+        body = {
+            "model": self.llm_model,
+            "max_tokens": 4096,
+            "system": system,
+            "messages": [{"role": "user", "content": user_content}],
+        }
+        try:
+            resp = httpx.post(
+                _messages_url(self.base_url),
+                headers=headers,
+                json=body,
+                timeout=REQUEST_TIMEOUT,
             )
-        )
-        openai_api_key = os.getenv(
-            "BUZZ_TRANSLATION_API_KEY",
-            get_password(Key.OPENAI_API_KEY)
-        )
-        self.openai_client = OpenAI(
-            api_key=openai_api_key,
-            base_url=custom_openai_base_url if custom_openai_base_url else None,
-            max_retries=0
-        )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logging.error(f"Translation error! Server response: {e}")
+            return None
+
+        content = data.get("content", [])
+        if content and isinstance(content, list) and content[0].get("text"):
+            logging.debug(f"Received translation response: {data}")
+            return content[0]["text"]
+        logging.error(f"Translation error! Unexpected response: {data}")
+        return None
 
     def _translate_single(self, transcript: str, transcript_id: int) -> Tuple[str, int]:
         """Translate a single transcript via the API. Returns (translation, transcript_id)."""
-        try:
-            completion = self.openai_client.chat.completions.create(
-                model=self.transcription_options.llm_model,
-                messages=[
-                    {"role": "system", "content": self.transcription_options.llm_prompt},
-                    {"role": "user", "content": transcript}
-                ],
-                timeout=60.0,
-            )
-        except Exception as e:
-            completion = None
-            logging.error(f"Translation error! Server response: {e}")
-
-        if completion and completion.choices and completion.choices[0].message:
-            logging.debug(f"Received translation response: {completion}")
-            return completion.choices[0].message.content, transcript_id
-        else:
-            logging.error(f"Translation error! Server response: {completion}")
-            # Translation error
-            return "", transcript_id
+        translation = self._messages(
+            system=self.transcription_options.llm_prompt, user_content=transcript
+        )
+        return translation or "", transcript_id
 
     def _translate_batch(self, items: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
         """Translate multiple transcripts in a single API call.
@@ -95,37 +121,15 @@ class Translator(QObject):
             f"[1] processed text\n[2] processed text"
         )
 
-        try:
-            completion = self.openai_client.chat.completions.create(
-                model=self.transcription_options.llm_model,
-                messages=[
-                    {"role": "system", "content": batch_prompt},
-                    {"role": "user", "content": combined}
-                ],
-                timeout=60.0,
-            )
-        except Exception as e:
-            completion = None
-            logging.error(f"Batch translation error! Server response: {e}")
-
-        if not (completion and completion.choices and completion.choices[0].message):
-            logging.error(f"Batch translation error! Server response: {completion}")
-            # Translation error
+        response_text = self._messages(system=batch_prompt, user_content=combined)
+        if not response_text:
             return [("", tid) for _, tid in items]
 
-        response_text = completion.choices[0].message.content
-        logging.debug(f"Received batch translation response: {response_text}")
-
         translations = self._parse_batch_response(response_text, len(items))
-
-        results = []
-        for i, (_, transcript_id) in enumerate(items):
-            if i < len(translations):
-                results.append((translations[i], transcript_id))
-            else:
-                # Translation error
-                results.append(("", transcript_id))
-        return results
+        return [
+            (translations[i], items[i][1]) if i < len(translations) else ("", items[i][1])
+            for i in range(len(items))
+        ]
 
     @staticmethod
     def _parse_batch_response(response: str, expected_count: int) -> List[str]:
@@ -189,6 +193,10 @@ class Translator(QObject):
         self, transcription_options: TranscriptionOptions
     ):
         self.transcription_options = transcription_options
+        # ponytail: re-resolve model so a per-task change wins over the global fallback.
+        self.llm_model = transcription_options.llm_model or Settings().value(
+            Settings.Key.OPENAI_API_MODEL, ""
+        )
 
     def enqueue(self, transcript: str, transcript_id: Optional[int] = None):
         self.queue.put((transcript, transcript_id))

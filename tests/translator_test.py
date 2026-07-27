@@ -61,9 +61,9 @@ class TestParseBatchResponse:
 
 
 class TestTranslator:
-    @patch('buzz.translator.OpenAI', autospec=True)
+    @patch('buzz.translator.httpx.post')
     @patch('buzz.translator.queue.Queue', autospec=True)
-    def test_start(self, mock_queue, mock_openai, qtbot):
+    def test_start(self, mock_queue, mock_post, qtbot):
         def side_effect(*args, **kwargs):
             if side_effect.call_count <= 1:
                 side_effect.call_count += 1
@@ -76,11 +76,12 @@ class TestTranslator:
 
         mock_queue.get.side_effect = side_effect
         mock_queue.get_nowait.side_effect = Empty
-        mock_chat = Mock()
-        mock_openai.return_value.chat = mock_chat
-        mock_chat.completions.create.return_value = Mock(
-            choices=[Mock(message=Mock(content="AI Translated: Hello, how are you?"))]
-        )
+        mock_resp = Mock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
+        }
+        mock_post.return_value = mock_resp
 
         transcription_options = TranscriptionOptions(
             enable_llm_translation=False,
@@ -98,12 +99,12 @@ class TestTranslator:
         translator.start()
 
         mock_queue.get.assert_called()
-        mock_chat.completions.create.assert_called()
+        mock_post.assert_called()
 
         translator.stop()
 
-    @patch('buzz.translator.OpenAI', autospec=True)
-    def test_translator(self, mock_openai, qtbot):
+    @patch('buzz.translator.httpx.post')
+    def test_translator(self, mock_post, qtbot):
 
         self.on_next_translation_called = False
 
@@ -111,11 +112,12 @@ class TestTranslator:
             self.on_next_translation_called = True
             assert text.startswith("AI Translated:")
 
-        mock_chat = Mock()
-        mock_openai.return_value.chat = mock_chat
-        mock_chat.completions.create.return_value = Mock(
-            choices=[Mock(message=Mock(content="AI Translated: Hello, how are you?"))]
-        )
+        mock_resp = Mock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
+        }
+        mock_post.return_value = mock_resp
 
         self.translation_thread = QThread()
         self.transcription_options = TranscriptionOptions(

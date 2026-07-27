@@ -1,6 +1,6 @@
 import re
 import logging
-import requests
+import httpx
 from typing import Optional
 from platformdirs import user_documents_dir
 
@@ -19,7 +19,6 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
 )
 from PyQt6.QtGui import QIcon
-from openai import AuthenticationError, OpenAI
 
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import get_password, Key
@@ -347,39 +346,47 @@ class ValidateOpenAIApiKeyJob(QRunnable):
 
     def run(self):
         settings = Settings()
-        custom_openai_base_url = settings.value(
+        base_url = settings.value(
             key=Settings.Key.CUSTOM_OPENAI_BASE_URL, default_value=""
+        ) or "https://api.anthropic.com"
+        model = settings.value(
+            key=Settings.Key.OPENAI_API_MODEL, default_value=""
         )
 
-        if custom_openai_base_url:
-            try:
-                if not custom_openai_base_url.endswith("/"):
-                    custom_openai_base_url += "/"
-
-                headers = {
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-
-                response = requests.get(custom_openai_base_url + "models", headers=headers, timeout=5)
-
-                if response.status_code != 200:
-                    self.signals.failed.emit(
-                        _("OpenAI API returned invalid response. Please check the API url or your key. "
-                          "Transcription and translation may still work if the API does not support key validation.")
-                    )
-                    return
-            except requests.exceptions.RequestException as exc:
-                self.signals.failed.emit(str(exc))
-                return
+        # ponytail: Anthropic has no /models list endpoint, so probe with a tiny
+        # /v1/messages call. 200 + content => key/url/model valid.
+        base = base_url.rstrip("/")
+        url = (base + "/messages") if base.endswith("/v1") else (base + "/v1/messages")
+        headers = {
+            "x-api-key": self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+        body = {
+            "model": model,
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
 
         try:
-            client = OpenAI(
-                api_key=self.api_key,
-                base_url=custom_openai_base_url if custom_openai_base_url else None,
-                timeout=15,
-            )
-            client.models.list()
+            resp = httpx.post(url, headers=headers, json=body, timeout=20)
+        except Exception as exc:
+            self.signals.failed.emit(str(exc))
+            return
+
+        if resp.status_code == 200:
             self.signals.success.emit()
-        except AuthenticationError as exc:
-            self.signals.failed.emit(exc.body["message"])
+            return
+
+        # Surface the API's own error message where possible.
+        message = str(resp.status_code)
+        try:
+            data = resp.json()
+            err = data.get("error", {})
+            if isinstance(err, dict) and err.get("message"):
+                message = err["message"]
+        except Exception:
+            pass
+        self.signals.failed.emit(
+            _("Anthropic API key test failed ({}). Check the API key, base URL and model name.").format(message)
+        )
