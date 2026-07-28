@@ -141,26 +141,31 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self.table_widget)
 
-        # Start transcriber thread
-        self.transcriber_thread = QThread()
+        # ponytail: fixed two workers; increase only after measuring VRAM/throughput.
+        # Start two independent transcriber workers.
+        self.transcriber_threads = [QThread() for _ in range(2)]
+        self.transcriber_workers = [
+            FileTranscriberQueueWorker() for _ in self.transcriber_threads
+        ]
+        self._next_transcriber_worker = 0
 
-        self.transcriber_worker = FileTranscriberQueueWorker()
-        self.transcriber_worker.plugin_manager = self.plugin_manager
-        self.transcriber_worker.moveToThread(self.transcriber_thread)
+        # Keep the first worker/thread names for compatibility.
+        self.transcriber_thread = self.transcriber_threads[0]
+        self.transcriber_worker = self.transcriber_workers[0]
 
-        self.transcriber_worker.task_started.connect(self.on_task_started)
-        self.transcriber_worker.task_progress.connect(self.on_task_progress)
-        self.transcriber_worker.task_download_progress.connect(
-            self.on_task_download_progress
-        )
-        self.transcriber_worker.task_error.connect(self.on_task_error)
-        self.transcriber_worker.task_completed.connect(self.on_task_completed)
+        for worker, thread in zip(self.transcriber_workers, self.transcriber_threads):
+            worker.plugin_manager = self.plugin_manager
+            worker.moveToThread(thread)
 
-        self.transcriber_worker.completed.connect(self.transcriber_thread.quit)
+            worker.task_started.connect(self.on_task_started)
+            worker.task_progress.connect(self.on_task_progress)
+            worker.task_download_progress.connect(self.on_task_download_progress)
+            worker.task_error.connect(self.on_task_error)
+            worker.task_completed.connect(self.on_task_completed)
 
-        self.transcriber_thread.started.connect(self.transcriber_worker.run)
-
-        self.transcriber_thread.start()
+            worker.completed.connect(thread.quit)
+            thread.started.connect(worker.run)
+            thread.start()
 
         self.load_geometry()
 
@@ -258,7 +263,8 @@ class MainWindow(QMainWindow):
         selected_transcriptions = self.table_widget.selected_transcriptions()
         for transcription in selected_transcriptions:
             transcription_id = transcription.id_as_uuid
-            self.transcriber_worker.cancel_task(transcription_id)
+            for worker in self.transcriber_workers:
+                worker.cancel_task(transcription_id)
             self.transcription_service.update_transcription_as_canceled(
                 transcription_id
             )
@@ -413,7 +419,11 @@ class MainWindow(QMainWindow):
     def add_task(self, task: FileTranscriptionTask):
         self.transcription_service.create_transcription(task)
         self.table_widget.refresh_all()
-        self.transcriber_worker.add_task(task)
+        worker = self.transcriber_workers[self._next_transcriber_worker]
+        self._next_transcriber_worker = (self._next_transcriber_worker + 1) % len(
+            self.transcriber_workers
+        )
+        worker.add_task(task)
 
     def on_transcriptions_updated(self):
         self.table_widget.refresh_all()
@@ -508,24 +518,29 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 logging.warning(f"Error cleaning up folder watcher: {e}")
 
-        try:
-            self.transcriber_worker.task_started.disconnect()
-            self.transcriber_worker.task_progress.disconnect()
-            self.transcriber_worker.task_download_progress.disconnect()
-            self.transcriber_worker.task_error.disconnect()
-            self.transcriber_worker.task_completed.disconnect()
-        except Exception as e:
-            logging.warning(f"Error disconnecting signals: {e}")
+        for worker in self.transcriber_workers:
+            try:
+                worker.task_started.disconnect()
+                worker.task_progress.disconnect()
+                worker.task_download_progress.disconnect()
+                worker.task_error.disconnect()
+                worker.task_completed.disconnect()
+            except Exception as e:
+                logging.warning(f"Error disconnecting signals: {e}")
 
-        self.transcriber_worker.stop()
-        self.transcriber_thread.quit()
+        for worker in self.transcriber_workers:
+            worker.stop()
 
-        if self.transcriber_thread.isRunning():
-            if not self.transcriber_thread.wait(10000):
-                logging.warning("Transcriber thread did not finish within 10s timeout, terminating")
-                self.transcriber_thread.terminate()
-                if not self.transcriber_thread.wait(2000):
-                    logging.error("Transcriber thread could not be terminated")
+        for thread in self.transcriber_threads:
+            thread.quit()
+
+        for thread in self.transcriber_threads:
+            if thread.isRunning():
+                if not thread.wait(10000):
+                    logging.warning("Transcriber thread did not finish within 10s timeout, terminating")
+                    thread.terminate()
+                    if not thread.wait(2000):
+                        logging.error("Transcriber thread could not be terminated")
 
         if self.transcription_viewer_widget is not None:
             self.transcription_viewer_widget.close()

@@ -1,15 +1,27 @@
 from unittest.mock import Mock, patch
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QSettings, Qt
 from pytestqt.qtbot import QtBot
 
 from buzz.model_loader import ModelType, TranscriptionModel
 from buzz.transcriber.transcriber import TranscriptionOptions
+from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
+    FileTranscriptionPreferences,
+)
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
 from tests.audio import test_audio_path
 
 
 class TestFileTranscriberWidget:
+    def test_file_translation_defaults_to_ai_enabled(self, tmp_path):
+        settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+
+        preferences = FileTranscriptionPreferences.load(settings)
+        assert preferences.enable_llm_translation is True
+
+        settings.setValue("enable_llm_translation", False)
+        assert FileTranscriptionPreferences.load(settings).enable_llm_translation is False
+
     def test_should_set_window_title(self, qtbot: QtBot):
         widget = FileTranscriberWidget(
             file_paths=[test_audio_path],

@@ -74,8 +74,8 @@ class Translator(QObject):
         self.queue = queue.Queue()
 
         settings = Settings()
-        self.api_key = os.getenv(
-            "BUZZ_TRANSLATION_API_KEY", get_password(Key.OPENAI_API_KEY)
+        self.api_key = os.getenv("BUZZ_TRANSLATION_API_KEY") or get_password(
+            Key.OPENAI_API_KEY
         )
         configured_base_url = os.getenv(
             "BUZZ_TRANSLATION_API_BASE_URL",
@@ -97,9 +97,8 @@ class Translator(QObject):
 
         # ponytail: per-task llm_model wins, fall back to global preferences model.
         self.llm_model = self.transcription_options.llm_model or os.getenv(
-            "BUZZ_TRANSLATION_API_MODEL",
-            settings.value(Settings.Key.OPENAI_API_MODEL, ""),
-        )
+            "BUZZ_TRANSLATION_API_MODEL"
+        ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
     def _messages(self, system: str, user_content: str) -> Optional[str]:
         """Call the configured translation protocol and return its text response."""
@@ -260,11 +259,14 @@ class Translator(QObject):
     ):
         self.transcription_options = transcription_options
         # ponytail: re-resolve model so a per-task change wins over the global fallback.
-        self.llm_model = transcription_options.llm_model or Settings().value(
-            Settings.Key.OPENAI_API_MODEL, ""
-        )
+        self.llm_model = transcription_options.llm_model or os.getenv(
+            "BUZZ_TRANSLATION_API_MODEL"
+        ) or Settings().value(Settings.Key.OPENAI_API_MODEL, "")
 
     def enqueue(self, transcript: str, transcript_id: Optional[int] = None):
+        self.llm_model = self.transcription_options.llm_model or os.getenv(
+            "BUZZ_TRANSLATION_API_MODEL"
+        ) or Settings().value(Settings.Key.OPENAI_API_MODEL, "")
         self.queue.put((transcript, transcript_id))
 
     def stop(self):

@@ -191,6 +191,46 @@ class TestMainWindow:
                 assert window.toolbar.open_transcript_action.isEnabled()
             else:
                 assert window.toolbar.open_transcript_action.isEnabled() is False
+
+        window.close()
+
+    def test_should_dispatch_tasks_across_transcriber_workers(
+        self, qtbot, transcription_service, monkeypatch
+    ):
+        workers = []
+        for _ in range(2):
+            worker = Mock()
+            for signal_name in (
+                "task_started",
+                "task_progress",
+                "task_download_progress",
+                "task_error",
+                "task_completed",
+                "completed",
+            ):
+                setattr(worker, signal_name, Mock())
+            workers.append(worker)
+
+        monkeypatch.setattr(
+            "buzz.widgets.main_window.FileTranscriberQueueWorker",
+            Mock(side_effect=workers),
+        )
+
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        window.transcription_service.create_transcription = Mock()
+        window.table_widget.refresh_all = Mock()
+
+        tasks = [Mock(), Mock(), Mock()]
+        for task in tasks:
+            window.add_task(task)
+
+        assert [args[0] for args, _ in workers[0].add_task.call_args_list] == [
+            tasks[0],
+            tasks[2],
+        ]
+        assert [args[0] for args, _ in workers[1].add_task.call_args_list] == [tasks[1]]
+
         window.close()
 
     @pytest.mark.parametrize("transcription_dao", [mock_transcriptions], indirect=True)

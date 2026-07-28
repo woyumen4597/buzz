@@ -451,11 +451,11 @@ msgstr "打开AI翻译模型文档"
 
 #: buzz/widgets/transcriber/advanced_settings_dialog.py
 msgid ""
-"Please translate each text sent to you from English to Spanish. Translation "
+"Please translate each text sent to you from Japanese to Chinese. Translation "
 "will be used in an automated system, please do not add any comments or "
 "notes, just the translation."
 msgstr ""
-"请将发送给您的每段文本从英语翻译成西班牙语。翻译将用于自动化系统，请不要添加"
+"请将发送给您的每段文本从日语翻译成中文。翻译将用于自动化系统，请不要添加"
 "任何评论或备注，只需提供翻译即可。"
 
 #: buzz/widgets/transcriber/advanced_settings_dialog.py

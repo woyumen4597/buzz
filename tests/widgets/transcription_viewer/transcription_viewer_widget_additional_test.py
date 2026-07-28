@@ -778,13 +778,8 @@ class TestTranscriptionViewerWidgetAdditional:
 
         widget.close()
 
-    @patch('buzz.translator.OpenAI')
-    def test_run_translation(self, mock_openai, qtbot: QtBot, transcription, transcription_service, shortcuts):
+    def test_run_translation(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
         """Test run_translation method"""
-        mock_openai.return_value.chat.completions.create.return_value = MagicMock(
-            choices=[MagicMock(message=MagicMock(content="Translated text"))]
-        )
-
         widget = TranscriptionViewerWidget(
             transcription, transcription_service, shortcuts
         )

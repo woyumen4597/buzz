@@ -58,7 +58,7 @@ class FileTranscriptionPreferences:
             else bool(extract_speech_value)
 
         initial_prompt = settings.value("initial_prompt", "")
-        enable_llm_translation_value = settings.value("enable_llm_translation", False)
+        enable_llm_translation_value = settings.value("enable_llm_translation", True)
         enable_llm_translation = False if enable_llm_translation_value == "false" \
             else bool(enable_llm_translation_value)
         llm_model = settings.value("llm_model", "")

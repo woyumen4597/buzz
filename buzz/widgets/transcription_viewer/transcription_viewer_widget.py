@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 import platform
 from typing import Optional
 from uuid import UUID
@@ -1297,8 +1297,17 @@ class TranscriptionViewerWidget(QWidget):
     ):
         self.transcription_options = transcription_options
 
+    def _translation_api_key(self):
+        return os.getenv("BUZZ_TRANSLATION_API_KEY") or self.openai_access_token
+
+    def _translation_model(self):
+        return self.transcription_options.llm_model or os.getenv(
+            "BUZZ_TRANSLATION_API_MODEL"
+        ) or Settings().value(Settings.Key.OPENAI_API_MODEL, "")
+
     def on_translate_button_clicked(self):
-        if len(self.openai_access_token) == 0:
+        if not self._translation_api_key():
+            logging.warning("Translation not started: API key is missing")
             QMessageBox.information(
                 self,
                 _("API Key Required"),
@@ -1307,10 +1316,12 @@ class TranscriptionViewerWidget(QWidget):
 
             return
 
-        translation_model = self.transcription_options.llm_model or Settings().value(
-            key=Settings.Key.OPENAI_API_MODEL, default_value=""
-        )
-        if translation_model == "" or self.transcription_options.llm_prompt == "":
+        translation_model = self._translation_model()
+        if not translation_model:
+            logging.warning("Translation not started: AI model is missing")
+        if not self.transcription_options.llm_prompt:
+            logging.warning("Translation not started: AI prompt is missing")
+        if not translation_model or not self.transcription_options.llm_prompt:
             self.transcription_options_dialog.accepted.connect(
                 self.run_translation)
             self.transcription_options_dialog.show()
@@ -1319,15 +1330,18 @@ class TranscriptionViewerWidget(QWidget):
         self.run_translation()
 
     def run_translation(self):
-        translation_model = self.transcription_options.llm_model or Settings().value(
-            key=Settings.Key.OPENAI_API_MODEL, default_value=""
-        )
-        if translation_model == "" or self.transcription_options.llm_prompt == "":
+        translation_model = self._translation_model()
+        if not translation_model:
+            logging.warning("Translation not started: AI model is missing")
+        if not self.transcription_options.llm_prompt:
+            logging.warning("Translation not started: AI prompt is missing")
+        if not translation_model or not self.transcription_options.llm_prompt:
             return
 
         segments = self.table_widget.segments()
         for segment in segments:
             self.translator.enqueue(segment.value("text"), segment.value("id"))
+        logging.info("Queued %d segments for translation", len(segments))
 
     def on_resize_button_clicked(self):
         self.transcription_resizer_dialog = TranscriptionResizerWidget(
