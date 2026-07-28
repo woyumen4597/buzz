@@ -2,6 +2,7 @@ import os
 import re
 import logging
 import queue
+from urllib.parse import urlparse
 
 from typing import Optional, List, Tuple
 import httpx
@@ -16,8 +17,11 @@ from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDi
 BATCH_SIZE = 10
 
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
+DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
 REQUEST_TIMEOUT = 180.0
+OPENAI_PROTOCOL = "openai"
+ANTHROPIC_PROTOCOL = "anthropic"
 
 
 def _messages_url(base_url: str) -> str:
@@ -26,6 +30,25 @@ def _messages_url(base_url: str) -> str:
     if base.endswith("/v1"):
         return base + "/messages"
     return base + "/v1/messages"
+
+
+def _chat_completions_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/chat/completions"
+    return base + "/v1/chat/completions"
+
+
+def _translation_api_protocol(base_url: str) -> str:
+    configured = os.getenv("BUZZ_TRANSLATION_API_PROTOCOL", "").strip().lower()
+    if configured in {OPENAI_PROTOCOL, ANTHROPIC_PROTOCOL}:
+        return configured
+
+    hostname = (urlparse(base_url).hostname or "").lower()
+    is_anthropic = hostname == "anthropic.com" or hostname.endswith(".anthropic.com")
+    return ANTHROPIC_PROTOCOL if is_anthropic else OPENAI_PROTOCOL
 
 
 class Translator(QObject):
@@ -54,10 +77,23 @@ class Translator(QObject):
         self.api_key = os.getenv(
             "BUZZ_TRANSLATION_API_KEY", get_password(Key.OPENAI_API_KEY)
         )
-        self.base_url = os.getenv(
-            "BUZZ_TRANSLATION_API_BASE_URl",
-            settings.value(Settings.Key.CUSTOM_OPENAI_BASE_URL, ""),
-        ) or DEFAULT_ANTHROPIC_BASE_URL
+        configured_base_url = os.getenv(
+            "BUZZ_TRANSLATION_API_BASE_URL",
+            os.getenv(
+                "BUZZ_TRANSLATION_API_BASE_URl",
+                settings.value(Settings.Key.CUSTOM_OPENAI_BASE_URL, ""),
+            ),
+        )
+        protocol_override = os.getenv(
+            "BUZZ_TRANSLATION_API_PROTOCOL", ""
+        ).strip().lower()
+        default_base_url = (
+            DEFAULT_OPENAI_BASE_URL
+            if protocol_override == OPENAI_PROTOCOL
+            else DEFAULT_ANTHROPIC_BASE_URL
+        )
+        self.base_url = configured_base_url or default_base_url
+        self.api_protocol = _translation_api_protocol(self.base_url)
 
         # ponytail: per-task llm_model wins, fall back to global preferences model.
         self.llm_model = self.transcription_options.llm_model or os.getenv(
@@ -66,21 +102,37 @@ class Translator(QObject):
         )
 
     def _messages(self, system: str, user_content: str) -> Optional[str]:
-        """Call Anthropic Messages API via httpx. Returns top text block or None on error."""
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": ANTHROPIC_VERSION,
-            "content-type": "application/json",
-        }
-        body = {
-            "model": self.llm_model,
-            "max_tokens": 4096,
-            "system": system,
-            "messages": [{"role": "user", "content": user_content}],
-        }
+        """Call the configured translation protocol and return its text response."""
+        if self.api_protocol == ANTHROPIC_PROTOCOL:
+            url = _messages_url(self.base_url)
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            }
+            body = {
+                "model": self.llm_model,
+                "max_tokens": 4096,
+                "system": system,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+        else:
+            url = _chat_completions_url(self.base_url)
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": self.llm_model,
+                "max_tokens": 4096,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            }
         try:
             resp = httpx.post(
-                _messages_url(self.base_url),
+                url,
                 headers=headers,
                 json=body,
                 timeout=REQUEST_TIMEOUT,
@@ -91,10 +143,24 @@ class Translator(QObject):
             logging.error(f"Translation error! Server response: {e}")
             return None
 
-        content = data.get("content", [])
-        if content and isinstance(content, list) and content[0].get("text"):
+        if self.api_protocol == ANTHROPIC_PROTOCOL:
+            content = data.get("content", [])
+            text = next(
+                (
+                    block.get("text")
+                    for block in content
+                    if isinstance(block, dict) and block.get("text")
+                ),
+                None,
+            )
+        else:
+            choices = data.get("choices", [])
+            message = choices[0].get("message", {}) if choices else {}
+            text = message.get("content") if isinstance(message, dict) else None
+
+        if isinstance(text, str) and text:
             logging.debug(f"Received translation response: {data}")
-            return content[0]["text"]
+            return text
         logging.error(f"Translation error! Unexpected response: {data}")
         return None
 

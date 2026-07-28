@@ -1,14 +1,12 @@
 import time
-import pytest
 from queue import Empty
-from unittest.mock import Mock, patch, create_autospec
+from unittest.mock import Mock, patch
 
 from PyQt6.QtCore import QThread
 
 from buzz.translator import Translator
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
-from buzz.locale import _
 
 
 class TestParseBatchResponse:
@@ -62,8 +60,55 @@ class TestParseBatchResponse:
 
 class TestTranslator:
     @patch('buzz.translator.httpx.post')
+    def test_openai_chat_completions(self, mock_post, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.delenv("BUZZ_TRANSLATION_API_PROTOCOL", raising=False)
+
+        mock_resp = Mock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": "AI Translated"}}]
+        }
+        mock_post.return_value = mock_resp
+
+        transcription_options = TranscriptionOptions(
+            enable_llm_translation=False,
+            llm_model="gpt-4o-mini",
+            llm_prompt="Translate this text:",
+        )
+        translator = Translator(
+            transcription_options,
+            AdvancedSettingsDialog(
+                transcription_options=transcription_options, parent=None
+            ),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        mock_post.assert_called_once_with(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": "Bearer openai-key",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "max_tokens": 4096,
+                "messages": [
+                    {"role": "system", "content": "Translate this text:"},
+                    {"role": "user", "content": "Hello"},
+                ],
+            },
+            timeout=180.0,
+        )
+
+    @patch('buzz.translator.httpx.post')
     @patch('buzz.translator.queue.Queue', autospec=True)
-    def test_start(self, mock_queue, mock_post, qtbot):
+    def test_start(self, mock_queue, mock_post, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
+
         def side_effect(*args, **kwargs):
             if side_effect.call_count <= 1:
                 side_effect.call_count += 1
@@ -104,7 +149,8 @@ class TestTranslator:
         translator.stop()
 
     @patch('buzz.translator.httpx.post')
-    def test_translator(self, mock_post, qtbot):
+    def test_translator(self, mock_post, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
 
         self.on_next_translation_called = False
 

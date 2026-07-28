@@ -30,10 +30,19 @@ class TestGeneralPreferencesWidget:
 
         assert test_button.isEnabled()
 
-    def test_should_test_openai_api_key(self, qtbot, mocker):
+    def test_should_test_openai_api_key(self, qtbot, mocker, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
         mocker.patch(
             "buzz.widgets.preferences_dialog.general_preferences_widget.get_password",
             return_value="wrong-api-key",
+        )
+        mock_response = mocker.Mock(status_code=401)
+        mock_response.json.return_value = {
+            "error": {"message": "Incorrect API key provided"}
+        }
+        mocker.patch(
+            "buzz.widgets.preferences_dialog.general_preferences_widget.httpx.post",
+            return_value=mock_response,
         )
 
         widget = GeneralPreferencesWidget()
@@ -52,8 +61,8 @@ class TestGeneralPreferencesWidget:
             assert message_box_warning_mock.call_args[0][1] == _("OpenAI API Key Test")
             assert (
                     message_box_warning_mock.call_args[0][2]
-                    == "Incorrect API key provided: wrong-ap*-key. You can find your "
-                       "API key at https://platform.openai.com/account/api-keys."
+                    == "Anthropic API key test failed (Incorrect API key provided). "
+                       "Check the API key, base URL and model name."
             )
 
         qtbot.waitUntil(mock_called)
@@ -113,9 +122,11 @@ class TestGeneralPreferencesWidget:
 class TestTestOpenAIApiKeyJob:
     # No error = success
     def test_run_success(self, mocker):
-        mock_client = mocker.Mock()
-        mock_client.models.list.return_value = None
-        mocker.patch('buzz.widgets.preferences_dialog.general_preferences_widget.OpenAI', return_value=mock_client)
+        mock_response = mocker.Mock(status_code=200)
+        mock_post = mocker.patch(
+            'buzz.widgets.preferences_dialog.general_preferences_widget.httpx.post',
+            return_value=mock_response,
+        )
         mocker.patch('buzz.settings.settings.Settings.value', return_value="") # No custom base URL
 
         job = ValidateOpenAIApiKeyJob(api_key="test_key")
@@ -128,16 +139,18 @@ class TestTestOpenAIApiKeyJob:
 
         mock_success.assert_called_once()
         mock_failed.assert_not_called()
-        mock_client.models.list.assert_called_once()
+        mock_post.assert_called_once()
 
     # Has error = failure
     def test_run_authentication_error(self, mocker):
-        from openai import AuthenticationError
-        mock_client = mocker.Mock()
-        mock_client.models.list.side_effect = AuthenticationError(
-            message="Incorrect API key provided", response=mocker.Mock(), body={"message": "Incorrect API key provided"}
+        mock_response = mocker.Mock(status_code=401)
+        mock_response.json.return_value = {
+            "error": {"message": "Incorrect API key provided"}
+        }
+        mock_post = mocker.patch(
+            'buzz.widgets.preferences_dialog.general_preferences_widget.httpx.post',
+            return_value=mock_response,
         )
-        mocker.patch('buzz.widgets.preferences_dialog.general_preferences_widget.OpenAI', return_value=mock_client)
         mocker.patch('buzz.settings.settings.Settings.value', return_value="") # No custom base URL
 
         job = ValidateOpenAIApiKeyJob(api_key="wrong_key")
@@ -149,5 +162,8 @@ class TestTestOpenAIApiKeyJob:
         job.run()
 
         mock_success.assert_not_called()
-        mock_failed.assert_called_once_with("Incorrect API key provided")
-        mock_client.models.list.assert_called_once()
+        mock_failed.assert_called_once_with(
+            "Anthropic API key test failed (Incorrect API key provided). "
+            "Check the API key, base URL and model name."
+        )
+        mock_post.assert_called_once()

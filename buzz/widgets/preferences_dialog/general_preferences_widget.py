@@ -1,5 +1,5 @@
+import os
 import re
-import logging
 import httpx
 from typing import Optional
 from platformdirs import user_documents_dir
@@ -27,6 +27,16 @@ from buzz.widgets.openai_api_key_line_edit import OpenAIAPIKeyLineEdit
 from buzz.locale import _
 from buzz.widgets.icon import INFO_ICON_PATH
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
+from buzz.translator import (
+    ANTHROPIC_PROTOCOL,
+    ANTHROPIC_VERSION,
+    DEFAULT_ANTHROPIC_BASE_URL,
+    DEFAULT_OPENAI_BASE_URL,
+    OPENAI_PROTOCOL,
+    _chat_completions_url,
+    _messages_url,
+    _translation_api_protocol,
+)
 
 BASE64_PATTERN = re.compile(r'^[A-Za-z0-9+/=_-]*$')
 
@@ -346,27 +356,50 @@ class ValidateOpenAIApiKeyJob(QRunnable):
 
     def run(self):
         settings = Settings()
-        base_url = settings.value(
-            key=Settings.Key.CUSTOM_OPENAI_BASE_URL, default_value=""
-        ) or "https://api.anthropic.com"
-        model = settings.value(
-            key=Settings.Key.OPENAI_API_MODEL, default_value=""
+        configured_base_url = os.getenv(
+            "BUZZ_TRANSLATION_API_BASE_URL",
+            os.getenv(
+                "BUZZ_TRANSLATION_API_BASE_URl",
+                settings.value(
+                    key=Settings.Key.CUSTOM_OPENAI_BASE_URL, default_value=""
+                ),
+            ),
         )
+        protocol_override = os.getenv(
+            "BUZZ_TRANSLATION_API_PROTOCOL", ""
+        ).strip().lower()
+        default_base_url = (
+            DEFAULT_OPENAI_BASE_URL
+            if protocol_override == OPENAI_PROTOCOL
+            else DEFAULT_ANTHROPIC_BASE_URL
+        )
+        base_url = configured_base_url or default_base_url
+        model = os.getenv(
+            "BUZZ_TRANSLATION_API_MODEL",
+            settings.value(
+                key=Settings.Key.OPENAI_API_MODEL, default_value=""
+            ),
+        )
+        protocol = _translation_api_protocol(base_url)
 
-        # ponytail: Anthropic has no /models list endpoint, so probe with a tiny
-        # /v1/messages call. 200 + content => key/url/model valid.
-        base = base_url.rstrip("/")
-        url = (base + "/messages") if base.endswith("/v1") else (base + "/v1/messages")
-        headers = {
-            "x-api-key": self.api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
         body = {
             "model": model,
             "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}],
         }
+        if protocol == ANTHROPIC_PROTOCOL:
+            url = _messages_url(base_url)
+            headers = {
+                "x-api-key": self.api_key,
+                "anthropic-version": ANTHROPIC_VERSION,
+                "content-type": "application/json",
+            }
+        else:
+            url = _chat_completions_url(base_url)
+            headers = {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            }
 
         try:
             resp = httpx.post(url, headers=headers, json=body, timeout=20)
@@ -388,5 +421,7 @@ class ValidateOpenAIApiKeyJob(QRunnable):
         except Exception:
             pass
         self.signals.failed.emit(
-            _("Anthropic API key test failed ({}). Check the API key, base URL and model name.").format(message)
+            _("{} API key test failed ({}). Check the API key, base URL and model name.").format(
+                "Anthropic" if protocol == ANTHROPIC_PROTOCOL else "OpenAI", message
+            )
         )
