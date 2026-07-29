@@ -129,18 +129,27 @@ class Translator(QObject):
                     {"role": "user", "content": user_content},
                 ],
             }
-        try:
-            resp = httpx.post(
-                url,
-                headers=headers,
-                json=body,
-                timeout=REQUEST_TIMEOUT,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            logging.error(f"Translation error! Server response: {e}")
-            return None
+        for attempt in range(4):
+            try:
+                resp = httpx.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=REQUEST_TIMEOUT,
+                )
+                if resp.status_code != 200:
+                    raise httpx.HTTPStatusError(
+                        f"Unexpected status code: {resp.status_code}",
+                        request=resp.request,
+                        response=resp,
+                    )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except Exception as e:
+                logging.error(f"Translation error! Server response: {e}")
+                if attempt == 3:
+                    return None
 
         if self.api_protocol == ANTHROPIC_PROTOCOL:
             content = data.get("content", [])

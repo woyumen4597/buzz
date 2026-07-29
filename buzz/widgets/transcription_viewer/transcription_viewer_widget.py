@@ -1338,7 +1338,10 @@ class TranscriptionViewerWidget(QWidget):
         if not translation_model or not self.transcription_options.llm_prompt:
             return
 
-        segments = self.table_widget.segments()
+        segments = [
+            segment for segment in self.table_widget.segments()
+            if not (segment.value("translation") or "").strip()
+        ]
         for segment in segments:
             self.translator.enqueue(segment.value("text"), segment.value("id"))
         logging.info("Queued %d segments for translation", len(segments))

@@ -778,8 +778,21 @@ class TestTranscriptionViewerWidgetAdditional:
 
         widget.close()
 
-    def test_run_translation(self, qtbot: QtBot, transcription, transcription_service, shortcuts):
+    def test_run_translation(
+        self,
+        qtbot: QtBot,
+        transcription,
+        transcription_segment_dao,
+        transcription_service,
+        shortcuts,
+    ):
         """Test run_translation method"""
+        segments = transcription_segment_dao.get_segments(transcription.id_as_uuid)
+        transcription_segment_dao.update_segment_translation(
+            segments[0].id, "Existing translation"
+        )
+        transcription_segment_dao.update_segment_translation(segments[1].id, "   ")
+
         widget = TranscriptionViewerWidget(
             transcription, transcription_service, shortcuts
         )
@@ -788,11 +801,14 @@ class TestTranscriptionViewerWidgetAdditional:
         # Set required options
         widget.transcription_options.llm_model = "gpt-4"
         widget.transcription_options.llm_prompt = "Translate"
+        widget.translator.enqueue = MagicMock()
 
         widget.run_translation()
 
-        # Should enqueue translation tasks
-        assert hasattr(widget, 'run_translation')
+        assert widget.translator.enqueue.call_args_list == [
+            ((segments[1].text, segments[1].id), {}),
+            ((segments[2].text, segments[2].id), {}),
+        ]
 
         widget.close()
 

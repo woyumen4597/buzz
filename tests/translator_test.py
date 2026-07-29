@@ -68,6 +68,7 @@ class TestTranslator:
         monkeypatch.delenv("BUZZ_TRANSLATION_API_PROTOCOL", raising=False)
 
         mock_resp = Mock()
+        mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.return_value = {
             "choices": [{"message": {"content": "AI Translated"}}]
@@ -122,6 +123,7 @@ class TestTranslator:
         mock_queue.get.side_effect = side_effect
         mock_queue.get_nowait.side_effect = Empty
         mock_resp = Mock()
+        mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.return_value = {
             "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
@@ -159,6 +161,7 @@ class TestTranslator:
             assert text.startswith("AI Translated:")
 
         mock_resp = Mock()
+        mock_resp.status_code = 200
         mock_resp.raise_for_status.return_value = None
         mock_resp.json.return_value = {
             "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
@@ -216,3 +219,37 @@ class TestTranslator:
 
         # Note: translator and translation_thread will be automatically deleted
         # via the deleteLater() connections set up earlier
+
+    @patch('buzz.translator.httpx.post')
+    def test_messages_retries_until_success(self, mock_post, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+
+        failed_resp = Mock(status_code=500)
+        success_resp = Mock(status_code=200)
+        success_resp.json.return_value = {
+            "choices": [{"message": {"content": "AI Translated"}}]
+        }
+        mock_post.side_effect = [failed_resp] * 3 + [success_resp]
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "AI Translated"
+        assert mock_post.call_count == 4
+
+    @patch('buzz.translator.httpx.post')
+    def test_messages_returns_none_after_four_failures(self, mock_post, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        mock_post.side_effect = [Exception("temporary failure")] * 4
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") is None
+        assert mock_post.call_count == 4
