@@ -26,7 +26,13 @@ from buzz.file_transcriber_queue_worker import FileTranscriberQueueWorker
 from buzz.locale import _
 from buzz.plugins.manager import PluginManager
 from buzz.plugins.post_processing import FnRunnable
-from buzz.settings.settings import APP_NAME, Settings
+from buzz.settings.settings import (
+    APP_NAME,
+    DEFAULT_TRANSCRIPTION_CONCURRENCY,
+    MAX_TRANSCRIPTION_CONCURRENCY,
+    MIN_TRANSCRIPTION_CONCURRENCY,
+    Settings,
+)
 from buzz.update_checker import UpdateChecker, UpdateInfo
 from buzz.widgets.update_dialog import UpdateDialog
 from buzz.settings.shortcuts import Shortcuts
@@ -141,9 +147,18 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(self.table_widget)
 
-        # ponytail: fixed two workers; increase only after measuring VRAM/throughput.
-        # Start two independent transcriber workers.
-        self.transcriber_threads = [QThread() for _ in range(2)]
+        transcriber_count = int(
+            self.settings.value(
+                Settings.Key.TRANSCRIPTION_CONCURRENCY,
+                DEFAULT_TRANSCRIPTION_CONCURRENCY,
+            )
+        )
+        # ponytail: cap at 8; each worker increases model memory usage.
+        transcriber_count = max(
+            MIN_TRANSCRIPTION_CONCURRENCY,
+            min(MAX_TRANSCRIPTION_CONCURRENCY, transcriber_count),
+        )
+        self.transcriber_threads = [QThread() for _ in range(transcriber_count)]
         self.transcriber_workers = [
             FileTranscriberQueueWorker() for _ in self.transcriber_threads
         ]

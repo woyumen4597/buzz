@@ -20,7 +20,12 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QIcon
 
-from buzz.settings.settings import Settings
+from buzz.settings.settings import (
+    DEFAULT_TRANSCRIPTION_CONCURRENCY,
+    MAX_TRANSCRIPTION_CONCURRENCY,
+    MIN_TRANSCRIPTION_CONCURRENCY,
+    Settings,
+)
 from buzz.store.keyring_store import get_password, Key
 from buzz.widgets.line_edit import LineEdit
 from buzz.widgets.openai_api_key_line_edit import OpenAIAPIKeyLineEdit
@@ -106,6 +111,25 @@ class GeneralPreferencesWidget(QWidget):
         self.font_size_spin_box.valueChanged.connect(self.on_font_size_changed)
 
         layout.addRow(_("Font Size"), self.font_size_spin_box)
+
+        self.transcription_concurrency_spin_box = QSpinBox(self)
+        self.transcription_concurrency_spin_box.setRange(
+            MIN_TRANSCRIPTION_CONCURRENCY, MAX_TRANSCRIPTION_CONCURRENCY
+        )
+        self.transcription_concurrency_spin_box.setValue(
+            self.settings.value(
+                Settings.Key.TRANSCRIPTION_CONCURRENCY,
+                DEFAULT_TRANSCRIPTION_CONCURRENCY,
+            )
+        )
+        self.transcription_concurrency_spin_box.setToolTip(_("Restart required!"))
+        self.transcription_concurrency_spin_box.valueChanged.connect(
+            self.on_transcription_concurrency_changed
+        )
+        layout.addRow(
+            _("Transcription concurrency"),
+            self.transcription_concurrency_spin_box,
+        )
 
         self.openai_api_key_line_edit = OpenAIAPIKeyLineEdit(self.openai_api_key, self)
         self.openai_api_key_line_edit.key_changed.connect(
@@ -319,6 +343,9 @@ class GeneralPreferencesWidget(QWidget):
         Application.instance().setFont(font)
 
         self.settings.set_value(Settings.Key.FONT_SIZE, value)
+
+    def on_transcription_concurrency_changed(self, value):
+        self.settings.set_value(Settings.Key.TRANSCRIPTION_CONCURRENCY, value)
 
     def on_recording_transcriber_mode_changed(self, value):
         self.settings.set_value(Settings.Key.RECORDING_TRANSCRIBER_MODE, value)

@@ -6,6 +6,9 @@ import uuid
 from PyQt6.QtCore import QSettings
 
 APP_NAME = "Buzz"
+DEFAULT_TRANSCRIPTION_CONCURRENCY = 2
+MIN_TRANSCRIPTION_CONCURRENCY = 1
+MAX_TRANSCRIPTION_CONCURRENCY = 8
 
 
 class Settings:
@@ -87,6 +90,7 @@ class Settings:
 
         FORCE_CPU = "force-cpu"
         REDUCE_GPU_MEMORY = "reduce-gpu-memory"
+        TRANSCRIPTION_CONCURRENCY = "transcriber/concurrency"
 
         LAST_UPDATE_CHECK = "update/last-check"
         UPDATE_AVAILABLE_VERSION = "update/available-version"

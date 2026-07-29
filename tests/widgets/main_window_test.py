@@ -20,6 +20,7 @@ from buzz.locale import _
 from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
+from buzz.settings.settings import Settings
 from buzz.transcriber.transcriber import Task, OutputFormat
 from buzz.widgets.main_window import MainWindow
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import FileTranscriptionPreferences
@@ -197,8 +198,17 @@ class TestMainWindow:
     def test_should_dispatch_tasks_across_transcriber_workers(
         self, qtbot, transcription_service, monkeypatch
     ):
+        original_settings_value = Settings.value
+
+        def configured_settings_value(settings, key, default_value, value_type=None):
+            if key == Settings.Key.TRANSCRIPTION_CONCURRENCY:
+                return 3
+            return original_settings_value(settings, key, default_value, value_type)
+
+        monkeypatch.setattr(Settings, "value", configured_settings_value)
+
         workers = []
-        for _ in range(2):
+        for _ in range(3):
             worker = Mock()
             for signal_name in (
                 "task_started",
@@ -221,15 +231,16 @@ class TestMainWindow:
         window.transcription_service.create_transcription = Mock()
         window.table_widget.refresh_all = Mock()
 
-        tasks = [Mock(), Mock(), Mock()]
+        tasks = [Mock(), Mock(), Mock(), Mock()]
         for task in tasks:
             window.add_task(task)
 
         assert [args[0] for args, _ in workers[0].add_task.call_args_list] == [
             tasks[0],
-            tasks[2],
+            tasks[3],
         ]
         assert [args[0] for args, _ in workers[1].add_task.call_args_list] == [tasks[1]]
+        assert [args[0] for args, _ in workers[2].add_task.call_args_list] == [tasks[2]]
 
         window.close()
 

@@ -2,13 +2,34 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QPushButton, QMessageBox, QLineEdit, QCheckBox
 
 from buzz.locale import _
-from buzz.settings.settings import Settings
+from buzz.settings.settings import DEFAULT_TRANSCRIPTION_CONCURRENCY, Settings
 from buzz.widgets.preferences_dialog.general_preferences_widget import (
     GeneralPreferencesWidget, ValidateOpenAIApiKeyJob
 )
 
 
 class TestGeneralPreferencesWidget:
+    def test_transcription_concurrency_preferences(self, qtbot):
+        settings = Settings()
+        key = Settings.Key.TRANSCRIPTION_CONCURRENCY
+        previous_value = settings.value(key, DEFAULT_TRANSCRIPTION_CONCURRENCY)
+        settings.set_value(key, DEFAULT_TRANSCRIPTION_CONCURRENCY)
+
+        try:
+            widget = GeneralPreferencesWidget()
+            qtbot.add_widget(widget)
+
+            assert (
+                widget.transcription_concurrency_spin_box.value()
+                == DEFAULT_TRANSCRIPTION_CONCURRENCY
+            )
+
+            widget.transcription_concurrency_spin_box.setValue(4)
+
+            assert settings.value(key, DEFAULT_TRANSCRIPTION_CONCURRENCY) == 4
+        finally:
+            settings.set_value(key, previous_value)
+
     def test_should_disable_test_button_if_no_api_key(self, qtbot, mocker):
         mocker.patch(
             "buzz.widgets.preferences_dialog.general_preferences_widget.get_password",
