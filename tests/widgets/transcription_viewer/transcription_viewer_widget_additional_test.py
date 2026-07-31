@@ -1253,11 +1253,17 @@ class TestTranscriptionViewerWidgetAdditional:
         )
         qtbot.add_widget(widget)
 
-        with patch(
-            'buzz.widgets.transcription_viewer.transcription_viewer_widget.TranscriptionResizerWidget'
-        ) as mock_resizer:
+        with patch.dict(
+            sys.modules,
+            {
+                "buzz.widgets.transcription_viewer.transcription_resizer_widget": MagicMock()
+            },
+        ) as mock_modules:
             widget.on_resize_button_clicked()
 
+            mock_resizer = mock_modules[
+                "buzz.widgets.transcription_viewer.transcription_resizer_widget"
+            ].TranscriptionResizerWidget
             mock_resizer.assert_called_once()
             widget.transcription_resizer_dialog.show.assert_called_once()
 
@@ -1276,11 +1282,17 @@ class TestTranscriptionViewerWidgetAdditional:
         )
         qtbot.add_widget(widget)
 
-        with patch(
-            'buzz.widgets.transcription_viewer.transcription_viewer_widget.SpeakerIdentificationWidget'
-        ) as mock_dialog:
+        with patch.dict(
+            sys.modules,
+            {
+                "buzz.widgets.transcription_viewer.speaker_identification_widget": MagicMock()
+            },
+        ) as mock_modules:
             widget.on_speaker_identification_button_clicked()
 
+            mock_dialog = mock_modules[
+                "buzz.widgets.transcription_viewer.speaker_identification_widget"
+            ].SpeakerIdentificationWidget
             mock_dialog.assert_called_once()
             widget.speaker_identification_dialog.show.assert_called_once()
 

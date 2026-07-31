@@ -10,6 +10,10 @@ class ConnWriter:
     def write(self, s: str):
         self.conn.send(s.strip())
 
+    def flush(self):
+        # Libraries (e.g. transformers) may assign handler.flush = sys.stderr.flush
+        pass
+
 
 @contextmanager
 def pipe_stderr(conn: Connection):

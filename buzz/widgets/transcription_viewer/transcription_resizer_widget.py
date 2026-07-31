@@ -1,7 +1,6 @@
 import re
 import os
 import logging
-import stable_whisper
 import srt
 from pathlib import Path
 from srt_equalizer import srt_equalizer
@@ -104,6 +103,7 @@ class TranscriptionWorker(QObject):
         # TODO - Fix VAD and Silence suppression that fails to work/download Vad model in compilded form on Mac and Windows
 
         try:
+            import stable_whisper
             result = stable_whisper.transcribe_any(
                 self.get_transcript,
                 audio = whisper_audio.load_audio(transcription_file),

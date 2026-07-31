@@ -11,10 +11,9 @@ import subprocess
 from typing import Optional
 from platformdirs import user_cache_dir
 
-# Preload CUDA libraries before importing torch
+# Preload CUDA libraries before importing torch (imported lazily on record start)
 from buzz import cuda_setup  # noqa: F401
 
-import torch
 import numpy as np
 import sounddevice
 from sounddevice import PortAudioError
@@ -27,11 +26,7 @@ from buzz.assets import APP_BASE_DIR
 from buzz.model_loader import ModelType, map_language_to_mms
 from buzz.settings.settings import Settings
 from buzz.transcriber.transcriber import TranscriptionOptions, Task, DEFAULT_WHISPER_TEMPERATURE
-from buzz.transformers_whisper import TransformersTranscriber
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
-
-import whisper
-import faster_whisper
 
 
 class RecordingTranscriber(QObject):
@@ -165,12 +160,16 @@ class RecordingTranscriber(QObject):
         model_path = self.model_path
 
         force_cpu = os.getenv("BUZZ_FORCE_CPU", "false")
-        use_cuda = torch.cuda.is_available() and force_cpu == "false"
-
-        if torch.cuda.is_available():
-            logging.debug(f"CUDA version detected: {torch.version.cuda}")
 
         if self.transcription_options.model.model_type == ModelType.WHISPER:
+            import torch
+            import whisper
+
+            use_cuda = torch.cuda.is_available() and force_cpu == "false"
+
+            if torch.cuda.is_available():
+                logging.debug(f"CUDA version detected: {torch.version.cuda}")
+
             device = "cuda" if use_cuda else "cpu"
             return whisper.load_model(model_path, device=device)
 
@@ -186,6 +185,9 @@ class RecordingTranscriber(QObject):
             return None
 
         if self.transcription_options.model.model_type == ModelType.FASTER_WHISPER:
+            import torch
+            import faster_whisper
+
             model_root_dir = user_cache_dir("Buzz")
             model_root_dir = os.path.join(model_root_dir, "models")
             model_root_dir = os.getenv("BUZZ_MODEL_ROOT", model_root_dir)
@@ -232,6 +234,8 @@ class RecordingTranscriber(QObject):
             )
             return None
 
+        from buzz.transformers_whisper import TransformersTranscriber
+
         return TransformersTranscriber(model_path)
 
     def _transcribe(self, samples, model, initial_prompt):
@@ -253,6 +257,8 @@ class RecordingTranscriber(QObject):
         return self._transcribe_via_api(samples, initial_prompt)
 
     def _transcribe_whisper(self, samples, model, initial_prompt):
+        import whisper
+
         assert isinstance(model, whisper.Whisper)
         return model.transcribe(
             audio=samples,
@@ -265,6 +271,8 @@ class RecordingTranscriber(QObject):
         )
 
     def _transcribe_faster_whisper(self, samples, model, initial_prompt):
+        import faster_whisper
+
         assert isinstance(model, faster_whisper.WhisperModel)
         segments, _ = model.transcribe(
             audio=samples,
@@ -283,6 +291,8 @@ class RecordingTranscriber(QObject):
         return {"text": " ".join(segment.text for segment in segments)}
 
     def _transcribe_hugging_face(self, samples, model):
+        from buzz.transformers_whisper import TransformersTranscriber
+
         assert isinstance(model, TransformersTranscriber)
         if model.is_mms_model:
             language = map_language_to_mms(
@@ -364,8 +374,12 @@ class RecordingTranscriber(QObject):
     def _cleanup_model(self, model):
         if model:
             del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except ImportError:
+            pass
 
         self.finished.emit()
 

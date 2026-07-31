@@ -1,4 +1,6 @@
+import sys
 import threading
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import numpy as np
@@ -9,6 +11,21 @@ from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.transcriber.recording_transcriber import RecordingTranscriber
 from buzz.transcriber.transcriber import TranscriptionOptions, Task
+
+
+@contextmanager
+def patch_import(module_name, **kwargs):
+    """Patch a module that recording_transcriber imports lazily inside functions."""
+    original = sys.modules.get(module_name)
+    mock = MagicMock(**kwargs)
+    sys.modules[module_name] = mock
+    try:
+        yield mock
+    finally:
+        if original is None:
+            sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = original
 
 
 def make_transcriber(
@@ -225,8 +242,8 @@ class TestStartWithSilence:
 
         transcriber.transcription.emit = stop_after_first
 
-        with patch("buzz.transcriber.recording_transcriber.whisper") as mock_whisper, \
-             patch("buzz.transcriber.recording_transcriber.torch") as mock_torch:
+        with patch_import("whisper") as mock_whisper, \
+             patch_import("torch") as mock_torch:
             mock_torch.cuda.is_available.return_value = False
             mock_whisper.load_model.return_value = mock_model
             mock_whisper.Whisper = type("Whisper", (), {})
@@ -261,8 +278,8 @@ class TestStartWithSilence:
 
         stopper = threading.Thread(target=stop_after_delay, daemon=True)
 
-        with patch("buzz.transcriber.recording_transcriber.whisper") as mock_whisper, \
-             patch("buzz.transcriber.recording_transcriber.torch") as mock_torch:
+        with patch_import("whisper") as mock_whisper, \
+             patch_import("torch") as mock_torch:
             mock_torch.cuda.is_available.return_value = False
             mock_whisper.load_model.return_value = MagicMock()
 
@@ -286,8 +303,8 @@ class TestStartPortAudioError:
         errors = []
         t.error.connect(lambda e: errors.append(e))
 
-        with patch("buzz.transcriber.recording_transcriber.whisper") as mock_whisper, \
-             patch("buzz.transcriber.recording_transcriber.torch") as mock_torch:
+        with patch_import("whisper") as mock_whisper, \
+             patch_import("torch") as mock_torch:
             mock_torch.cuda.is_available.return_value = False
             mock_whisper.load_model.return_value = MagicMock()
 
@@ -357,8 +374,8 @@ class TestModelBackends:
                 seg2.text = "world"
                 return [seg1, seg2], MagicMock()
 
-        with patch("buzz.transcriber.recording_transcriber.torch") as mock_torch, \
-             patch("buzz.transcriber.recording_transcriber.faster_whisper") as mock_fw:
+        with patch_import("torch") as mock_torch, \
+             patch_import("faster_whisper") as mock_fw:
             mock_torch.cuda.is_available.return_value = False
             mock_fw.WhisperModel = FakeWhisperModel
 
@@ -374,7 +391,7 @@ class TestModelBackends:
         transcript.model_extra = {}
         transcript.text = "api text"
 
-        with patch("buzz.transcriber.recording_transcriber.torch") as mock_torch, \
+        with patch_import("torch") as mock_torch, \
              patch("buzz.transcriber.recording_transcriber.OpenAI") as MockOpenAI:
             mock_torch.cuda.is_available.return_value = False
             client = MockOpenAI.return_value
@@ -397,9 +414,12 @@ class TestModelBackends:
             def transcribe(self, audio, language, task):
                 return {"text": "hf text"}
 
-        with patch("buzz.transcriber.recording_transcriber.torch") as mock_torch, \
-             patch(
-                 "buzz.transcriber.recording_transcriber.TransformersTranscriber",
+        import buzz.transformers_whisper as transformers_whisper_module
+
+        with patch_import("torch") as mock_torch, \
+             patch.object(
+                 transformers_whisper_module,
+                 "TransformersTranscriber",
                  FakeTransformers,
              ):
             mock_torch.cuda.is_available.return_value = False

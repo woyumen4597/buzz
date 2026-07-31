@@ -63,11 +63,10 @@ from buzz.widgets.transcription_viewer.transcription_view_mode_tool_button impor
     TranscriptionViewModeToolButton,
     ViewMode
 )
-from buzz.widgets.transcription_viewer.transcription_resizer_widget import TranscriptionResizerWidget
 
-# Underlying libs do not support intel Macs
-if not (platform.system() == "Darwin" and platform.machine() == "x86_64"):
-    from buzz.widgets.transcription_viewer.speaker_identification_widget import SpeakerIdentificationWidget
+# TranscriptionResizerWidget and SpeakerIdentificationWidget are imported lazily
+# on dialog open: they pull in stable-ts / faster-whisper / torch, which should
+# not load at app startup.
 
 
 class TranscriptionViewerWidget(QWidget):
@@ -1418,6 +1417,9 @@ class TranscriptionViewerWidget(QWidget):
                 self.translation_progress_label.setText("")
 
     def on_resize_button_clicked(self):
+        from buzz.widgets.transcription_viewer.transcription_resizer_widget import (
+            TranscriptionResizerWidget,
+        )
         self.transcription_resizer_dialog = TranscriptionResizerWidget(
             transcription=self.transcription,
             transcription_service=self.transcription_service,
@@ -1431,6 +1433,9 @@ class TranscriptionViewerWidget(QWidget):
     def on_speaker_identification_button_clicked(self):
         # Underlying libs do not support intel Macs
         if not (platform.system() == "Darwin" and platform.machine() == "x86_64"):
+            from buzz.widgets.transcription_viewer.speaker_identification_widget import (
+                SpeakerIdentificationWidget,
+            )
             self.speaker_identification_dialog = SpeakerIdentificationWidget(
                 transcription=self.transcription,
                 transcription_service=self.transcription_service,

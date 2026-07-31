@@ -263,10 +263,11 @@ class TestTranscriptionViewerWidget:
         mock_result = MagicMock()
         mock_result.segments = [mock_result_segment]
 
-        with patch('buzz.widgets.transcription_viewer.transcription_resizer_widget.stable_whisper.transcribe_any',
-                   return_value=mock_result) as mock_transcribe_any, \
+        with patch.dict(sys.modules, {"stable_whisper": MagicMock()}) as mock_modules, \
                 patch(
                     'buzz.widgets.transcription_viewer.transcription_resizer_widget.whisper_audio.load_audio') as mock_load_audio:
+            mock_transcribe_any = mock_modules["stable_whisper"].transcribe_any
+            mock_transcribe_any.return_value = mock_result
             finished_spy = MagicMock()
             worker.finished.connect(finished_spy)
 

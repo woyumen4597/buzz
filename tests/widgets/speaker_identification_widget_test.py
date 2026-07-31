@@ -427,21 +427,22 @@ class TestSpeakerIdentificationWidget:
 
     def test_get_transcript_data_joins_segments(self, transcription, transcription_service):
         """_get_transcript_data collapses whitespace and decodes the audio."""
+        import sys
         import numpy as np
+        from unittest.mock import MagicMock
         worker = IdentificationWorker(transcription, transcription_service)
 
         fake_waveform = np.zeros(10, dtype=np.float32)
-        with patch(
-            "buzz.widgets.transcription_viewer.speaker_identification_widget.faster_whisper.decode_audio",
-            return_value=fake_waveform,
-        ) as mock_decode:
+        fake_faster_whisper = MagicMock()
+        fake_faster_whisper.decode_audio.return_value = fake_waveform
+        with patch.dict(sys.modules, {"faster_whisper": fake_faster_whisper}):
             language, full_transcript, waveform = worker._get_transcript_data()
 
         # transcription fixture has no language set, so it falls back to "en"
         assert language == "en"
         assert full_transcript == "Bien venue dans"
         assert waveform is fake_waveform
-        mock_decode.assert_called_once_with(transcription.file)
+        fake_faster_whisper.decode_audio.assert_called_once_with(transcription.file)
 
     def test_setup_device_force_cpu(self, transcription, transcription_service, monkeypatch):
         """_setup_device honours BUZZ_FORCE_CPU regardless of CUDA availability."""

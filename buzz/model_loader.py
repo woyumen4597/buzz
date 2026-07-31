@@ -42,7 +42,6 @@ except ImportError:
     _certifi_ca_bundle = None
 
 import requests
-import whisper
 import huggingface_hub
 import zipfile
 from dataclasses import dataclass
@@ -545,7 +544,12 @@ class TranscriptionModel:
             return file_path
 
         if self.model_type == ModelType.WHISPER:
-            file_path = get_whisper_file_path(size=self.whisper_model_size)
+            try:
+                file_path = get_whisper_file_path(size=self.whisper_model_size)
+            except RuntimeError:
+                # Optional backend (openai-whisper) is not installed; treat the
+                # model as unavailable so the download flow can show the hint.
+                return None
             if not os.path.exists(file_path) or not os.path.isfile(file_path):
                 return None
             
@@ -673,6 +677,14 @@ def get_whisper_cpp_file_path(size: WhisperModelSize) -> str:
 
 
 def get_whisper_file_path(size: WhisperModelSize) -> str:
+    try:
+        import whisper
+    except ImportError as exc:
+        raise RuntimeError(
+            "Whisper is not installed. Install the optional backend with: "
+            'pip install "buzz-captions[whisper]"'
+        ) from exc
+
     root_dir = os.path.join(model_root_dir, "whisper")
 
     if size == WhisperModelSize.CUSTOM:
@@ -918,6 +930,15 @@ class ModelDownloader(QRunnable):
             model_path, f"ggml-{model_name}.bin"))
 
     def _download_whisper(self) -> None:
+        try:
+            import whisper
+        except ImportError:
+            self.signals.error.emit(
+                "Whisper is not installed. Install the optional backend with: "
+                'pip install "buzz-captions[whisper]"'
+            )
+            return
+
         url = whisper._MODELS[self.model.whisper_model_size.value]
         file_path = get_whisper_file_path(
             size=self.model.whisper_model_size)
