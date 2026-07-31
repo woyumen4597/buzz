@@ -21,7 +21,13 @@ from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.model_loader import TranscriptionModel, ModelType, WhisperModelSize
 from buzz.settings.settings import Settings
-from buzz.transcriber.transcriber import Task, OutputFormat
+from buzz.transcriber.transcriber import (
+    Task,
+    OutputFormat,
+    FileTranscriptionTask,
+    TranscriptionOptions,
+    FileTranscriptionOptions,
+)
 from buzz.widgets.main_window import MainWindow
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import FileTranscriptionPreferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
@@ -600,3 +606,75 @@ class TestMainWindow:
     def _get_toolbar_action(window: MainWindow, text: str):
         toolbar: QToolBar = window.findChild(QToolBar)
         return [action for action in toolbar.actions() if action.text() == text][0]
+
+
+def _make_progress_task() -> FileTranscriptionTask:
+    return FileTranscriptionTask(
+        transcription_options=TranscriptionOptions(
+            model=TranscriptionModel(
+                model_type=ModelType.WHISPER_CPP,
+                whisper_model_size=WhisperModelSize.TINY,
+            )
+        ),
+        file_transcription_options=FileTranscriptionOptions(),
+        file_path=get_test_asset("whisper-french.mp3"),
+        model_path="mock_path",
+    )
+
+
+class TestTaskProgressThrottling:
+    """Progress events are coalesced before hitting the DB / task table."""
+
+    def test_progress_within_one_percent_is_coalesced(
+        self, qtbot, transcription_service
+    ):
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        task = _make_progress_task()
+        window.transcription_service.update_transcription_progress = Mock()
+        window.table_widget.refresh_row = Mock()
+
+        window.on_task_progress(task, 0.0)
+        window.on_task_progress(task, 0.004)
+        window.on_task_progress(task, 0.009)
+        assert window.transcription_service.update_transcription_progress.call_count == 1
+
+        window.on_task_progress(task, 0.02)
+        assert window.transcription_service.update_transcription_progress.call_count == 2
+        window.transcription_service.update_transcription_progress.assert_called_with(
+            task.uid, 0.02
+        )
+
+    def test_completion_forces_final_progress_and_ignores_late_events(
+        self, qtbot, transcription_service
+    ):
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        task = _make_progress_task()
+        window.transcription_service.update_transcription_progress = Mock()
+        window.transcription_service.update_transcription_as_completed = Mock()
+        window.table_widget.refresh_row = Mock()
+
+        window.on_task_progress(task, 0.5)
+        window.on_task_completed(task, [])
+
+        window.transcription_service.update_transcription_progress.assert_called_with(
+            task.uid, 1.0
+        )
+        # A progress event arriving after completion must not regress the value.
+        window.on_task_progress(task, 0.55)
+        assert window.transcription_service.update_transcription_progress.call_count == 2
+
+    def test_error_ignores_late_progress_events(self, qtbot, transcription_service):
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        task = _make_progress_task()
+        window.transcription_service.update_transcription_progress = Mock()
+        window.transcription_service.update_transcription_as_failed = Mock()
+        window.table_widget.refresh_row = Mock()
+
+        window.on_task_progress(task, 0.3)
+        window.on_task_error(task, "boom")
+        window.on_task_progress(task, 0.4)
+
+        assert window.transcription_service.update_transcription_progress.call_count == 1

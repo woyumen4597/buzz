@@ -1,6 +1,7 @@
 import os
 import logging
-from typing import Tuple, List, Optional
+import time
+from typing import Dict, Tuple, List, Optional
 from uuid import UUID
 
 from PyQt6 import QtGui
@@ -61,6 +62,12 @@ from buzz.widgets.transcription_viewer.transcription_viewer_widget import (
     TranscriptionViewerWidget,
 )
 
+# Progress events are coalesced before hitting the database and the task table:
+# write at most every 250ms or when the value moved by 1%, whichever comes
+# first, so a long transcription does not hammer SQLite with per-segment I/O.
+PROGRESS_WRITE_MIN_INTERVAL_S = 0.25
+PROGRESS_WRITE_MIN_DELTA = 0.01
+
 
 class MainWindow(QMainWindow):
     table_widget: TranscriptionTasksTableWidget
@@ -73,6 +80,12 @@ class MainWindow(QMainWindow):
         self.setWindowIcon(QIcon(BUZZ_ICON_PATH))
 
         self.setAcceptDrops(True)
+
+        # Per-task (last written progress, monotonic time of that write) for
+        # coalescing progress events; see PROGRESS_WRITE_MIN_*.
+        self._progress_state: Dict[UUID, Tuple[float, float]] = {}
+        # Tasks that reached a terminal state; late progress events are ignored.
+        self._finished_tasks = set()
 
         self.settings = Settings()
 
@@ -458,11 +471,21 @@ class MainWindow(QMainWindow):
         self.table_widget.refresh_all()
 
     def on_task_started(self, task: FileTranscriptionTask):
+        self._finished_tasks.discard(task.uid)
+        self._progress_state.pop(task.uid, None)
         self.transcription_service.update_transcription_as_started(task.uid)
         self.table_widget.refresh_row(task.uid)
 
     def on_task_progress(self, task: FileTranscriptionTask, progress: float):
-        self.transcription_service.update_transcription_progress(task.uid, progress)
+        if task.uid in self._finished_tasks:
+            return
+        pct = max(0.0, min(1.0, progress))
+        now = time.monotonic()
+        last_pct, last_write = self._progress_state.get(task.uid, (-1.0, 0.0))
+        if pct - last_pct < PROGRESS_WRITE_MIN_DELTA and now - last_write < PROGRESS_WRITE_MIN_INTERVAL_S:
+            return
+        self._progress_state[task.uid] = (pct, now)
+        self.transcription_service.update_transcription_progress(task.uid, pct)
         self.table_widget.refresh_row(task.uid)
 
     def on_task_download_progress(
@@ -472,6 +495,12 @@ class MainWindow(QMainWindow):
         pass
 
     def on_task_completed(self, task: FileTranscriptionTask, segments: List[Segment]):
+        # Force the final 100% into the database: the completed marker does
+        # not carry a progress value, and the last coalesced write may be lower.
+        self._finished_tasks.add(task.uid)
+        self._progress_state.pop(task.uid, None)
+        self.transcription_service.update_transcription_progress(task.uid, 1.0)
+
         # Handle skipped tasks (e.g. plugin detected file already transcribed)
         if task.status == FileTranscriptionTask.Status.SKIPPED:
             self.transcription_service.update_transcription_as_skipped(task.uid, segments)
@@ -521,6 +550,8 @@ class MainWindow(QMainWindow):
 
 
     def on_task_error(self, task: FileTranscriptionTask, error: str):
+        self._finished_tasks.add(task.uid)
+        self._progress_state.pop(task.uid, None)
         self.transcription_service.update_transcription_as_failed(task.uid, error)
         self.table_widget.refresh_row(task.uid)
 

@@ -52,15 +52,27 @@ if sys.platform == "win32":
     subprocess.run = _patched_run
     subprocess.check_output = _patched_check_output
 
-from demucs import api as demucsApi
-
 from buzz.locale import _
+from buzz.transcriber.whisper_file_transcriber import backend_install_hint
+from buzz.transcriber.whisper_model_pool import WhisperModelPool
 
 
-def _speech_extraction_worker(conn, file_path: str, speech_path: str, device: str) -> None:
+def _speech_extraction_worker(conn, file_path: str, speech_path: str, force_cpu: bool) -> None:
     """Extract speech with demucs in a dedicated process.
+
+    demucs and torch are imported here (not at module level) so that the
+    application can start without them unless speech extraction is used.
     """
     try:
+        import torch
+        device = "cpu" if force_cpu else ("cuda" if torch.cuda.is_available() else "cpu")
+
+        try:
+            from demucs import api as demucsApi
+        except ImportError as exc:
+            conn.send(("error", backend_install_hint("Demucs", "demucs")))
+            return
+
         def callback(progress):
             try:
                 conn.send(
@@ -131,6 +143,9 @@ class FileTranscriberQueueWorker(QObject):
         # Use QueuedConnection to ensure run() is called in the correct thread context
         # and doesn't block signal handlers
         self.trigger_run.connect(self.run, Qt.ConnectionType.QueuedConnection)
+        # Persistent model workers: a loaded model is reused across tasks with
+        # the same model key instead of being reloaded for every file.
+        self.model_pool = WhisperModelPool()
 
     @pyqtSlot()
     def run(self):
@@ -170,33 +185,41 @@ class FileTranscriberQueueWorker(QObject):
 
     def _get_next_task(self) -> bool:
         while True:
-            self.current.task = self.tasks_queue.get()
-            if self.current.task is None:
-                return False
-            if self.current.task.uid in self.canceled_tasks:
+            try:
+                task = self.tasks_queue.get(timeout=2)
+            except queue.Empty:
+                # Queue is idle: release GPU workers so other queue workers are
+                # not starved of GPU slots while this one waits.
+                self.model_pool.release_idle()
                 continue
+            if task is None:
+                return False
+            if task.uid in self.canceled_tasks:
+                continue
+            self.current.task = task
             return True
 
     def _setup_speech_extraction(self) -> str:
         logging.debug("Will extract speech")
 
+        # Device detection happens inside the extraction process (it imports
+        # torch there), so the GUI never loads torch for this path.
         force_cpu = os.getenv("BUZZ_FORCE_CPU", "false").lower() == "true"
-        if force_cpu:
-            device = "cpu"
-        else:
-            import torch
-            device = "cuda" if torch.cuda.is_available() else "cpu"
 
         task_file_path = Path(self.current.task.file_path)
         speech_path = task_file_path.with_name(f"{task_file_path.stem}_speech.mp3")
 
-        status = self._extract_speech(str(task_file_path), str(speech_path), device)
+        status = self._extract_speech(str(task_file_path), str(speech_path), force_cpu)
 
         if status == "error":
-            self.task_error.emit(
-                self.current.task,
-                _("Speech extraction failed! Check your internet connection \u2014 a model may need to be downloaded."),
-            )
+            detail = getattr(self, "_speech_extraction_error", None)
+            if detail and ("pip install" in detail.lower()):
+                self.task_error.emit(self.current.task, detail)
+            else:
+                self.task_error.emit(
+                    self.current.task,
+                    _("Speech extraction failed! Check your internet connection \u2014 a model may need to be downloaded."),
+                )
         elif status == "ok":
             self.speech_path = speech_path
             if not self.current.task.original_file_path:
@@ -240,7 +263,9 @@ class FileTranscriberQueueWorker(QObject):
             or model_type == ModelType.WHISPER
             or model_type == ModelType.FASTER_WHISPER
         ):
-            self.current.transcriber = WhisperFileTranscriber(task=self.current.task)
+            self.current.transcriber = WhisperFileTranscriber(
+                task=self.current.task, model_pool=self.model_pool
+            )
         else:
             raise Exception(f"Unknown model type: {model_type}")
 
@@ -273,7 +298,7 @@ class FileTranscriberQueueWorker(QObject):
         self.task_started.emit(self.current.task)
         self.current.transcriber_thread.start()
 
-    def _extract_speech(self, file_path: str, speech_path: str, device: str) -> str:
+    def _extract_speech(self, file_path: str, speech_path: str, force_cpu: bool) -> str:
         """Run demucs speech extraction in a separate process.
 
         Returns one of ``"ok"``, ``"no_audio"`` or ``"error"``.
@@ -281,7 +306,7 @@ class FileTranscriberQueueWorker(QObject):
         recv_conn, send_conn = multiprocessing.Pipe(duplex=False)
         process = multiprocessing.Process(
             target=_speech_extraction_worker,
-            args=(send_conn, file_path, speech_path, device),
+            args=(send_conn, file_path, speech_path, force_cpu),
         )
         self.speech_extractor_process = process
         process.start()
@@ -333,6 +358,7 @@ class FileTranscriberQueueWorker(QObject):
 
         if status == "error":
             logging.error(f"Error during speech extraction: {error_detail}")
+            self._speech_extraction_error = error_detail
 
         return status
 
@@ -373,6 +399,12 @@ class FileTranscriberQueueWorker(QObject):
             self._terminate_speech_extractor_process()
 
             if self.current.transcriber is not None:
+                # Kill the pool worker process so a long-running transcription
+                # stops promptly (stop() itself keeps the worker hot).
+                pool = getattr(self.current.transcriber, "model_pool", None)
+                pool_key = getattr(self.current.transcriber, "pool_key", None)
+                if pool is not None and pool_key is not None:
+                    pool.abort_key(pool_key)
                 self.current.transcriber.stop()
 
             if self.current.transcriber_thread is not None:
@@ -422,3 +454,7 @@ class FileTranscriberQueueWorker(QObject):
 
         # Terminate the speech extraction process if one is still running.
         self._terminate_speech_extractor_process()
+
+        # Terminate persistent model workers; their pipes close and they exit
+        # on their own, but kill them explicitly on shutdown.
+        self.model_pool.abort()

@@ -9,33 +9,30 @@ import sys
 # Preload CUDA libraries before importing torch - required for subprocess contexts
 from buzz import cuda_setup  # noqa: F401
 
-import torch
 import platform
-import subprocess
 from platformdirs import user_cache_dir
 from multiprocessing.connection import Connection
 from threading import Thread
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
-import tqdm
 import psutil
 from PyQt6.QtCore import QObject
 
 from buzz import whisper_audio
 from buzz.conn import pipe_stderr
 from buzz.model_loader import ModelType, map_language_to_mms
-from buzz.transformers_whisper import TransformersTranscriber
 from buzz.transcriber.file_transcriber import FileTranscriber
 from buzz.transcriber.transcriber import FileTranscriptionTask, Segment, Task, DEFAULT_WHISPER_TEMPERATURE
-from buzz.transcriber.whisper_cpp import WhisperCpp
-
-import av
-import faster_whisper
-import whisper
-import stable_whisper
-from stable_whisper import WhisperResult
 
 PROGRESS_REGEX = re.compile(r"\d+(\.\d+)?%")
+
+
+def backend_install_hint(backend_name: str, extra: str) -> str:
+    """Human-readable hint when an optional backend package is missing."""
+    return (
+        f"{backend_name} is not installed. Install the optional backend with: "
+        f'pip install "buzz-captions[{extra}]"'
+    )
 
 
 def terminate_child_processes(pid: int, timeout: float = 5.0) -> None:
@@ -88,6 +85,10 @@ def check_file_has_audio_stream(file_path: str) -> None:
         ValueError: If the file has no audio streams.
     """
     try:
+        import av
+    except ImportError as exc:
+        raise ImportError(backend_install_hint("PyAV", "whisper")) from exc
+    try:
         with av.open(file_path) as container:
             if len(container.streams.audio) == 0:
                 raise ValueError("No audio streams found")
@@ -107,7 +108,10 @@ class WhisperFileTranscriber(FileTranscriber):
     READ_LINE_THREAD_STOP_TOKEN = "--STOP--"
 
     def __init__(
-        self, task: FileTranscriptionTask, parent: Optional["QObject"] = None
+        self,
+        task: FileTranscriptionTask,
+        parent: Optional["QObject"] = None,
+        model_pool=None,
     ) -> None:
         super().__init__(task, parent)
         self.segments = []
@@ -116,15 +120,32 @@ class WhisperFileTranscriber(FileTranscriber):
         self.recv_pipe = None
         self.send_pipe = None
         self.error_message = None
+        # Optional WhisperModelPool for model reuse across tasks. When set and
+        # the model type is poolable, transcribe() reuses a persistent worker
+        # process instead of spawning a fresh one per file.
+        self.model_pool = model_pool
+        self.pool_key = None
 
     def transcribe(self) -> List[Segment]:
+        if (
+            self.model_pool is not None
+            and self.transcription_task.transcription_options.model.model_type
+            != ModelType.WHISPER_CPP
+        ):
+            return self._transcribe_with_pool()
+
         time_started = datetime.datetime.now()
         logging.debug(
             "Starting whisper file transcription, task = %s", self.transcription_task
         )
 
-        if torch.cuda.is_available():
-            logging.debug(f"CUDA version detected: {torch.version.cuda}")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                logging.debug(f"CUDA version detected: {torch.version.cuda}")
+        except ImportError:
+            pass
 
         self.recv_pipe, self.send_pipe = multiprocessing.Pipe(duplex=False)
 
@@ -186,6 +207,18 @@ class WhisperFileTranscriber(FileTranscriber):
                 raise Exception(error)
 
         return self.segments
+
+    def _transcribe_with_pool(self) -> List[Segment]:
+        """Transcribe by reusing a persistent model worker process."""
+        check_file_has_audio_stream(self.transcription_task.file_path)
+
+        self.pool_key = self.model_pool.model_key(self.transcription_task)
+        return self.model_pool.transcribe(
+            self.transcription_task, self._emit_pool_progress
+        )
+
+    def _emit_pool_progress(self, progress: int) -> None:
+        self.progress.emit((progress, 100))
 
     @classmethod
     def transcribe_whisper(
@@ -255,10 +288,14 @@ class WhisperFileTranscriber(FileTranscriber):
 
     @classmethod
     def transcribe_whisper_cpp(cls, task: FileTranscriptionTask) -> List[Segment]:
+        from buzz.transcriber.whisper_cpp import WhisperCpp
+
         return WhisperCpp.transcribe(task)
 
     @classmethod
     def transcribe_hugging_face(cls, task: FileTranscriptionTask) -> List[Segment]:
+        from buzz.transformers_whisper import TransformersTranscriber
+
         if not task.model_path:
             raise FileNotFoundError(
                 "Hugging Face model is not available locally. "
@@ -266,7 +303,12 @@ class WhisperFileTranscriber(FileTranscriber):
             )
 
         model = TransformersTranscriber(task.model_path)
+        return cls.transcribe_hugging_face_with_model(model, task)
 
+    @classmethod
+    def transcribe_hugging_face_with_model(
+        cls, model, task: FileTranscriptionTask
+    ) -> List[Segment]:
         # Handle language - MMS uses ISO 639-3 codes, Whisper uses ISO 639-1
         if model.is_mms_model:
             language = map_language_to_mms(task.transcription_options.language or "eng")
@@ -301,20 +343,15 @@ class WhisperFileTranscriber(FileTranscriber):
             for segment in result.get("segments")
         ]
 
-    @classmethod
-    def transcribe_faster_whisper(cls, task: FileTranscriptionTask) -> List[Segment]:
-        # Use the already-resolved local model path so we never hit the network
-        model_size_or_path = task.model_path
-        if not model_size_or_path:
-            raise FileNotFoundError(
-                "Faster Whisper model is not available locally. "
-                "Check BUZZ_MODEL_ROOT and download the model into that cache first."
-            )
-            return []
+    @staticmethod
+    def faster_whisper_settings() -> Tuple[str, str]:
+        """Resolve the device/compute type for Faster Whisper from the environment.
 
-        model_root_dir = user_cache_dir("Buzz")
-        model_root_dir = os.path.join(model_root_dir, "models")
-        model_root_dir = os.getenv("BUZZ_MODEL_ROOT", model_root_dir)
+        Runs inside the worker process, so importing torch here does not cost
+        anything on the GUI side.
+        """
+        import torch
+
         force_cpu = os.getenv("BUZZ_FORCE_CPU", "false")
         if force_cpu != "false":
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -338,13 +375,34 @@ class WhisperFileTranscriber(FileTranscriber):
             compute_type = "int8" if device == "cpu" else "int8_float16"
             logging.debug(f"Using {compute_type} compute type for reduced memory usage")
 
-        model = faster_whisper.WhisperModel(
-            model_size_or_path=model_size_or_path,
+        return device, compute_type
+
+    @classmethod
+    def load_faster_whisper_model(
+        cls, task: FileTranscriptionTask, device: str = None, compute_type: str = None
+    ):
+        import faster_whisper
+
+        if device is None or compute_type is None:
+            device, compute_type = cls.faster_whisper_settings()
+
+        model_root_dir = user_cache_dir("Buzz")
+        model_root_dir = os.path.join(model_root_dir, "models")
+        model_root_dir = os.getenv("BUZZ_MODEL_ROOT", model_root_dir)
+
+        return faster_whisper.WhisperModel(
+            model_size_or_path=task.model_path,
             download_root=model_root_dir,
             device=device,
             compute_type=compute_type,
-            cpu_threads=(os.cpu_count() or 8)//2,
+            cpu_threads=(os.cpu_count() or 8) // 2,
         )
+
+    @classmethod
+    def transcribe_faster_whisper_with_model(
+        cls, model, task: FileTranscriptionTask, progress_callback=None
+    ) -> List[Segment]:
+        import faster_whisper
 
         audio = whisper_audio.load_audio(task.file_path)
 
@@ -360,6 +418,7 @@ class WhisperFileTranscriber(FileTranscriber):
             no_speech_threshold=0.4,
             log_progress=True,
         )
+        duration = getattr(info, "duration", 0) or 0
         segments = []
         for segment in whisper_segments:
             # Segment will contain words if word-level timings is True
@@ -382,11 +441,36 @@ class WhisperFileTranscriber(FileTranscriber):
                         translation=""
                     )
                 )
+            if progress_callback is not None and duration:
+                progress_callback(min(100, int(segment.end / duration * 100)))
+        if progress_callback is not None:
+            progress_callback(100)
 
         return segments
 
     @classmethod
-    def transcribe_openai_whisper(cls, task: FileTranscriptionTask) -> List[Segment]:
+    def transcribe_faster_whisper(cls, task: FileTranscriptionTask) -> List[Segment]:
+        # Use the already-resolved local model path so we never hit the network
+        model_size_or_path = task.model_path
+        if not model_size_or_path:
+            raise FileNotFoundError(
+                "Faster Whisper model is not available locally. "
+                "Check BUZZ_MODEL_ROOT and download the model into that cache first."
+            )
+
+        device, compute_type = cls.faster_whisper_settings()
+        model = cls.load_faster_whisper_model(task, device, compute_type)
+        return cls.transcribe_faster_whisper_with_model(model, task)
+
+    @staticmethod
+    def load_openai_whisper_model_for_path(
+        model_path: str, word_level_timings: bool
+    ):
+        """Load an OpenAI Whisper model. Returns the loaded (and, when word
+        timestamps are requested, stable-ts modified) model."""
+        import torch
+        import whisper
+
         force_cpu = os.getenv("BUZZ_FORCE_CPU", "false")
         if force_cpu != "false":
             os.environ["CUDA_VISIBLE_DEVICES"] = ""
@@ -404,12 +488,26 @@ class WhisperFileTranscriber(FileTranscriber):
 
         torch.load = patched_torch_load
         try:
-            model = whisper.load_model(task.model_path, device=device)
+            model = whisper.load_model(model_path, device=device)
         finally:
             torch.load = original_torch_load
 
-        if task.transcription_options.word_level_timings:
+        if word_level_timings:
+            import stable_whisper
             stable_whisper.modify_model(model)
+        return model
+
+    @staticmethod
+    def load_openai_whisper_model(task: FileTranscriptionTask):
+        return WhisperFileTranscriber.load_openai_whisper_model_for_path(
+            task.model_path, task.transcription_options.word_level_timings
+        )
+
+    @staticmethod
+    def transcribe_openai_whisper_with_model(model, task: FileTranscriptionTask) -> List[Segment]:
+        if task.transcription_options.word_level_timings:
+            from stable_whisper import WhisperResult
+
             result: WhisperResult = model.transcribe(
                 audio=whisper_audio.load_audio(task.file_path),
                 language=task.transcription_options.language,
@@ -450,8 +548,19 @@ class WhisperFileTranscriber(FileTranscriber):
             for segment in segments
         ]
 
+    @classmethod
+    def transcribe_openai_whisper(cls, task: FileTranscriptionTask) -> List[Segment]:
+        model = cls.load_openai_whisper_model(task)
+        return cls.transcribe_openai_whisper_with_model(model, task)
+
     def stop(self):
         self.stopped = True
+
+        # With the model pool the worker process is owned by the pool and stays
+        # hot for the next task; cancellation is handled by the queue worker via
+        # pool.abort_key(self.pool_key). Nothing to tear down here.
+        if self.model_pool is not None and self.pool_key is not None:
+            return
 
         if self.started_process:
             # Kill the whisper-cli subprocess the worker spawned first. The
