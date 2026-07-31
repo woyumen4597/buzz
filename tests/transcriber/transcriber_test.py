@@ -3,7 +3,12 @@ from types import SimpleNamespace
 
 import pytest
 
-from buzz.transcriber.file_transcriber import FileTranscriber, to_timestamp, write_output
+from buzz.transcriber.file_transcriber import (
+    FileTranscriber,
+    sanitize_segments,
+    to_timestamp,
+    write_output,
+)
 from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     OutputFormat,
@@ -44,6 +49,46 @@ def test_write_output(
     with open(output_file_path, encoding="utf-8") as output_file:
         assert output_text == output_file.read()
     assert not pathlib.Path(f"{output_file_path}.part").exists()
+
+
+def test_sanitize_segments_sorts_and_drops_invalid():
+    segments = [
+        Segment(500, 600, "second"),
+        Segment(-10, 50, "negative start"),
+        Segment(100, 100, "zero length"),
+        Segment(200, 100, "reversed"),
+        Segment(0, 100, "  first  "),
+    ]
+    valid = sanitize_segments(segments)
+
+    assert [(s.start, s.text) for s in valid] == [(0, "  first  "), (500, "second")]
+
+
+def test_sanitize_segments_uses_segment_key():
+    segments = [
+        Segment(0, 100, "text here", translation=""),
+        Segment(200, 300, "text here", translation="translated"),
+    ]
+    assert len(sanitize_segments(segments, "translation")) == 1
+    assert len(sanitize_segments(segments, "text")) == 2
+
+
+def test_write_output_sorts_and_skips_invalid_segments(tmp_path: pathlib.Path):
+    output_file_path = tmp_path / "whisper.srt"
+    segments = [
+        Segment(500, 600, "second"),
+        Segment(100, 100, "zero length"),
+        Segment(0, 100, "first"),
+    ]
+
+    write_output(
+        path=str(output_file_path), segments=segments, output_format=OutputFormat.SRT
+    )
+
+    with open(output_file_path, encoding="utf-8") as output_file:
+        content = output_file.read()
+    assert content.index("first") < content.index("second")
+    assert "zero length" not in content
 
 
 def test_write_output_removes_part_on_failure(tmp_path: pathlib.Path, monkeypatch):

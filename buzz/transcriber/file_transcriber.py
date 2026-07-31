@@ -1,9 +1,10 @@
+import glob
 import logging
 import os
 import sys
 import subprocess
 import shutil
-import tempfile
+import time
 from abc import abstractmethod
 from typing import Optional, List
 from pathlib import Path
@@ -98,9 +99,21 @@ class FileTranscriber(QObject):
         for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
             video_title = video_title.replace(char, '_')
 
-        temp_dir = tempfile.mkdtemp()
-        temp_output_path = os.path.join(temp_dir, video_title)
-        wav_file = temp_output_path + ".wav"
+        removed = cleanup_download_cache()
+        if removed:
+            logging.info(
+                "Removed %s expired url-download cache entr%s",
+                removed, "y" if removed == 1 else "ies",
+            )
+
+        # Downloads live in an app-managed cache dir (per-task subfolder) so the
+        # original video can be reused later for MP4 subtitle export and stale
+        # files can be cleaned up.
+        cache_dir = _download_cache_dir()
+        task_dir = os.path.join(cache_dir, str(self.transcription_task.uid))
+        os.makedirs(task_dir, exist_ok=True)
+        temp_output_path = os.path.join(task_dir, video_title)
+        wav_file = os.path.join(task_dir, video_title + ".wav")
         wav_file = str(Path(wav_file).resolve())
 
         options = {
@@ -113,21 +126,30 @@ class FileTranscriber(QObject):
         if cookiefile:
             options["cookiefile"] = cookiefile
 
-        ydl = YoutubeDL(options)
-
         try:
             logging.debug(f"Downloading audio file from URL: {self.transcription_task.url}")
-            ydl.download([self.transcription_task.url])
+            with YoutubeDL(options) as ydl:
+                ydl.download([self.transcription_task.url])
         except Exception as exc:
-            logging.debug(f"Error downloading audio: {exc.msg}")
-            self.error.emit(exc.msg)
+            logging.debug(f"Error downloading audio: {exc}")
+            self.error.emit(str(exc))
+            return False
+
+        downloaded = _find_downloaded_file(temp_output_path)
+        if downloaded is None:
+            message = (
+                f"Error downloading audio: no file was downloaded from "
+                f"{self.transcription_task.url}"
+            )
+            logging.debug(message)
+            self.error.emit(message)
             return False
 
         cmd = [
             "ffmpeg",
             "-nostdin",
             "-threads", "0",
-            "-i", temp_output_path,
+            "-i", downloaded,
             "-ac", "1",
             "-ar", str(whisper_audio.SAMPLE_RATE),
             "-acodec", "pcm_s16le",
@@ -149,9 +171,19 @@ class FileTranscriber(QObject):
         else:
             result = subprocess.run(cmd, capture_output=True)
 
-        if len(result.stderr):
-            logging.warning(f"Error processing downloaded audio. Error: {result.stderr.decode()}")
-            raise Exception(f"Error processing downloaded audio: {result.stderr.decode()}")
+        if result.returncode != 0 or not os.path.isfile(wav_file):
+            stderr = (
+                result.stderr.decode(errors="replace")[:2000]
+                if result.stderr
+                else ""
+            )
+            logging.warning(
+                "Error processing downloaded audio (returncode %s): %s",
+                result.returncode, stderr,
+            )
+            raise Exception(
+                f"Error processing downloaded audio: {stderr or 'unknown ffmpeg error'}"
+            )
 
         self.transcription_task.file_path = wav_file
         logging.debug(f"Downloaded audio to file: {self.transcription_task.file_path}")
@@ -187,6 +219,30 @@ class FileTranscriber(QObject):
         ...
 
 
+def sanitize_segments(
+    segments: List[Segment], segment_key: str = "text"
+) -> List[Segment]:
+    """Sort by start time and drop segments that would produce invalid
+    subtitle output: negative timestamps, zero-length ranges or empty text."""
+    valid: List[Segment] = []
+    for segment in segments:
+        start = segment.start
+        end = segment.end
+        if start is None or end is None or start < 0 or end <= start:
+            logging.warning(
+                "Skipping segment with invalid timestamps: %s -> %s", start, end
+            )
+            continue
+        if not (getattr(segment, segment_key) or "").strip():
+            logging.warning(
+                "Skipping segment with empty %s text", segment_key
+            )
+            continue
+        valid.append(segment)
+    valid.sort(key=lambda segment: (segment.start, segment.end))
+    return valid
+
+
 def write_output(
     path: str,
     segments: List[Segment],
@@ -199,6 +255,8 @@ def write_output(
         output_format,
         len(segments),
     )
+
+    segments = sanitize_segments(segments, segment_key)
 
     temp_path = f"{path}.part"
     try:
@@ -258,3 +316,91 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".m4v", ".webm", ".ogm", ".w
 
 def is_video_file(path: str) -> bool:
     return Path(path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+# URL imports keep their downloads (audio + on-demand video) in an app-managed
+# cache directory so the original video is still available for MP4 subtitle
+# export; entries expire after this many days.
+URL_CACHE_MAX_AGE_DAYS = 30
+
+
+def _download_cache_dir() -> str:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+        return os.path.join(base, "Buzz", "Cache", "url-downloads")
+    return os.path.join(os.path.expanduser("~"), ".cache", "buzz", "url-downloads")
+
+
+def cleanup_download_cache(max_age_days: int = URL_CACHE_MAX_AGE_DAYS) -> int:
+    """Delete url-download cache entries older than max_age_days; returns the
+    number of entries removed."""
+    cache_dir = _download_cache_dir()
+    if not os.path.isdir(cache_dir):
+        return 0
+    cutoff = time.time() - max_age_days * 24 * 60 * 60
+    removed = 0
+    for entry in os.listdir(cache_dir):
+        path = os.path.join(cache_dir, entry)
+        try:
+            if os.path.getmtime(path) >= cutoff:
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+            removed += 1
+        except OSError:
+            logging.debug("Failed to clean download cache entry: %s", path, exc_info=True)
+    return removed
+
+
+def _find_downloaded_file(outtmpl: str) -> Optional[str]:
+    if os.path.isfile(outtmpl):
+        return outtmpl
+    for path in sorted(glob.glob(outtmpl + ".*")):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def find_cached_video(audio_wav_path: str) -> Optional[str]:
+    """Locate the original video kept next to the URL-downloaded audio file."""
+    title = os.path.splitext(os.path.basename(audio_wav_path))[0]
+    directory = os.path.dirname(audio_wav_path)
+    for ext in sorted(VIDEO_EXTENSIONS, key=len, reverse=True):
+        candidate = os.path.join(directory, f"{title}{ext}")
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def download_video_to_cache(url: str, audio_wav_path: str) -> str:
+    """Download the original video for a URL transcription into the same cache
+    directory as its audio file; returns the video file path."""
+    cached = find_cached_video(audio_wav_path)
+    if cached:
+        return cached
+
+    directory = os.path.dirname(audio_wav_path)
+    os.makedirs(directory, exist_ok=True)
+    title = os.path.splitext(os.path.basename(audio_wav_path))[0]
+    options = {
+        "format": "bestvideo+bestaudio/best",
+        "merge_output_format": "mp4",
+        "outtmpl": os.path.join(directory, title),
+        "logger": logging.getLogger(),
+    }
+    cookiefile = os.getenv("BUZZ_DOWNLOAD_COOKIEFILE")
+    if cookiefile:
+        options["cookiefile"] = cookiefile
+
+    try:
+        with YoutubeDL(options) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        raise Exception(f"Error downloading video: {exc}") from exc
+
+    cached = find_cached_video(audio_wav_path)
+    if cached is None:
+        raise Exception("Video download produced no playable file")
+    return cached

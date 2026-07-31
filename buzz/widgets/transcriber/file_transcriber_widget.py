@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QWidget,
     QVBoxLayout,
     QPushButton,
+    QLabel,
 )
 
 from buzz.dialogs import show_model_download_error_dialog
@@ -86,6 +87,14 @@ class FileTranscriberWidget(QWidget):
         self.run_button.clicked.connect(self.on_click_run)
 
         layout.addWidget(self.form_widget)
+        if url is not None:
+            hint = QLabel(
+                _("Only the audio is downloaded for transcription. The original "
+                  "video is downloaded on demand (cached under the app cache "
+                  "directory) when you export MP4 subtitles.")
+            )
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
         layout.addWidget(self.run_button, 0, Qt.AlignmentFlag.AlignRight)
 
         self.setLayout(layout)

@@ -346,3 +346,24 @@ class TestTranscriptionServiceTransactions:
             transcription.id_as_uuid
         )
         assert [(s.start_time, s.text) for s in persisted] == [(0, "old")]
+
+    def test_get_segments_returns_ordered_by_start_time(
+        self, transcription, transcription_service, transcription_segment_dao
+    ):
+        from buzz.db.entity.transcription_segment import TranscriptionSegment
+
+        for start, text in [(500, "third"), (0, "first"), (200, "second")]:
+            transcription_segment_dao.insert(
+                TranscriptionSegment(
+                    start_time=start,
+                    end_time=start + 100,
+                    text=text,
+                    translation="",
+                    transcription_id=transcription.id,
+                )
+            )
+
+        persisted = transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        )
+        assert [s.text for s in persisted] == ["first", "second", "third"]

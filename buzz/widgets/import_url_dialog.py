@@ -1,7 +1,14 @@
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QRegularExpression
-from PyQt6.QtWidgets import QDialog, QWidget, QDialogButtonBox, QMessageBox, QFormLayout
+from PyQt6.QtWidgets import (
+    QDialog,
+    QWidget,
+    QDialogButtonBox,
+    QLabel,
+    QMessageBox,
+    QFormLayout,
+)
 
 from buzz.locale import _
 from buzz.widgets.line_edit import LineEdit
@@ -30,8 +37,16 @@ class ImportURLDialog(QDialog):
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
 
+        hint = QLabel(
+            _("Only the audio is downloaded for transcription. The original "
+              "video is downloaded on demand (cached under the app cache "
+              "directory) when you export MP4 subtitles.")
+        )
+        hint.setWordWrap(True)
+
         self.layout = QFormLayout()
         self.layout.addRow(_("URL:"), self.line_edit)
+        self.layout.addWidget(hint)
         self.layout.addWidget(self.button_box)
         self.setLayout(self.layout)
 

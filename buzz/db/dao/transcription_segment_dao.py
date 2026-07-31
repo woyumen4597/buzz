@@ -20,6 +20,7 @@ class TranscriptionSegmentDAO(DAO[TranscriptionSegment]):
             f"""
             SELECT * FROM {self.table}
             WHERE transcription_id = :transcription_id
+            ORDER BY start_time, id
         """
         )
         query.bindValue(":transcription_id", str(transcription_id))
