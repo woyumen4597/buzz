@@ -63,8 +63,18 @@ def _translation_api_protocol(base_url: str) -> str:
     return ANTHROPIC_PROTOCOL if is_anthropic else OPENAI_PROTOCOL
 
 
+# Queue marker that cancels the current run without stopping the worker:
+# pending items are drained and the loop keeps running for the next run.
+_CANCEL = object()
+
+
 class Translator(QObject):
+    # Only non-empty results are emitted on `translation`; failures (including
+    # empty responses) are emitted on `translation_failed` so the UI can show
+    # progress and keep the segment pending for retry.
     translation = pyqtSignal(str, int)
+    translation_failed = pyqtSignal(int)
+    batch_completed = pyqtSignal()
     finished = pyqtSignal()
 
     def __init__(
@@ -86,6 +96,7 @@ class Translator(QObject):
         self.queue = queue.Queue()
         self._client_instance: Optional[httpx.Client] = None
         self._stopping = False
+        self._cancelled = False
 
         settings = Settings()
         self.api_key = os.getenv("BUZZ_TRANSLATION_API_KEY") or get_password(
@@ -227,6 +238,7 @@ class Translator(QObject):
                 )
                 if (
                     self._stopping
+                    or self._cancelled
                     or attempt == MAX_ATTEMPTS - 1
                     or not self._is_retryable_status(status)
                 ):
@@ -234,7 +246,7 @@ class Translator(QObject):
                 self._backoff(attempt, e.response)
             except httpx.TransportError as e:
                 logging.error(f"Translation error! Network failure: {e}")
-                if self._stopping or attempt == MAX_ATTEMPTS - 1:
+                if self._stopping or self._cancelled or attempt == MAX_ATTEMPTS - 1:
                     return None
                 self._backoff(attempt)
             except Exception as e:
@@ -376,6 +388,12 @@ class Translator(QObject):
                 logging.debug("Translation queue received stop signal")
                 break
 
+            if item is _CANCEL:
+                # A previous cancel() drained the queue; run is over, keep the
+                # worker alive for future runs.
+                self._cancelled = False
+                continue
+
             # Collect a batch: start with the first item, then wait briefly for
             # more instead of racing get_nowait() into single-item requests.
             batch = [item]
@@ -392,17 +410,33 @@ class Translator(QObject):
                 if next_item is None:
                     stop_after_batch = True
                     break
+                if next_item is _CANCEL:
+                    # Cancel drops already-collected items; they stay
+                    # untranslated and can be re-queued later.
+                    self._cancelled = False
+                    batch = []
+                    break
                 batch.append(next_item)
 
             for sub_batch in self._split_batches(batch):
                 if len(sub_batch) == 1:
                     translation, tid = self._translate_single(*sub_batch[0])
-                    self.translation.emit(translation, tid)
+                    if not self._cancelled:
+                        if translation:
+                            self.translation.emit(translation, tid)
+                        else:
+                            self.translation_failed.emit(tid)
                 else:
                     logging.debug(f"Translating batch of {len(sub_batch)} in single request")
                     results = self._translate_batch(sub_batch)
+                    if self._cancelled:
+                        continue
                     for translation, tid in results:
-                        self.translation.emit(translation, tid)
+                        if translation:
+                            self.translation.emit(translation, tid)
+                        else:
+                            self.translation_failed.emit(tid)
+            self.batch_completed.emit()
 
             if stop_after_batch or self._stopping:
                 logging.debug("Translation queue received stop signal")
@@ -431,3 +465,14 @@ class Translator(QObject):
         # worker so it exits after the current batch without draining the queue.
         self._stopping = True
         self.queue.put(None)
+
+    def cancel(self):
+        """Cancel the current run: drop queued items and discard in-flight
+        results. The worker thread stays alive for the next run."""
+        self._cancelled = True
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.queue.put(_CANCEL)

@@ -34,7 +34,9 @@ from buzz.widgets.application import Application
 
 
 @pytest.fixture()
-def db() -> QSqlDatabase:
+def db(qtbot) -> QSqlDatabase:
+    # qtbot ensures a QCoreApplication exists; QSqlDatabase.addDatabase()
+    # segfaults without one.
     db = setup_test_db()
     yield db
     db.close()

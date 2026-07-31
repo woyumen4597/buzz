@@ -12,6 +12,7 @@ from buzz.transcriber.transcriber import Task
 from buzz.widgets.transcription_viewer.export_transcription_menu import (
     ExportTranscriptionMenu,
     MP4_BURNED,
+    MP4_SOFT,
 )
 from tests.audio import test_audio_path
 
@@ -165,6 +166,8 @@ class TestExportTranscriptionMenu:
             output_path=str(output_path),
             srt_path=str(srt_path),
             dialog=mocker.Mock(),
+            try_copy=False,
+            transcode_cmd=None,
         )
 
         widget._on_ffmpeg_finished(proc, 0, None)
@@ -181,3 +184,158 @@ class TestExportTranscriptionMenu:
         assert not part_path.exists()
         assert not srt_path.exists()
         critical.assert_called_once()
+
+    def test_soft_subtitle_copy_command_uses_copy_for_compatible_codecs(
+        self,
+        tmp_path: pathlib.Path,
+        qtbot: QtBot,
+        transcription,
+        transcription_service,
+        mocker,
+    ):
+        source_path = tmp_path / "movie.mp4"
+        source_path.touch()
+        transcription.file = str(source_path)
+        translation_signal = TranslationSignal()
+        widget = ExportTranscriptionMenu(
+            transcription,
+            transcription_service,
+            False,
+            translation_signal.translation,
+        )
+        qtbot.add_widget(widget)
+        mocker.patch.object(widget, "_get_segments", return_value=[])
+        mocker.patch.object(
+            widget, "_probe_info",
+            return_value={
+                "duration_ms": 1000,
+                "video_codec": "h264",
+                "audio_codec": "aac",
+            },
+        )
+        start_ffmpeg = mocker.patch.object(widget, "_start_ffmpeg")
+        mocker.patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(tmp_path / "out.mp4"), ""),
+        )
+
+        widget._export_video(MP4_SOFT, "text")
+
+        assert start_ffmpeg.call_args.kwargs == {
+            "copy_video": True, "copy_audio": True,
+        }
+        widget._cleanup_srt(start_ffmpeg.call_args.args[3])
+
+    def test_soft_subtitle_command_transcodes_incompatible_codecs(
+        self,
+        tmp_path: pathlib.Path,
+        qtbot: QtBot,
+        transcription,
+        transcription_service,
+        mocker,
+    ):
+        source_path = tmp_path / "movie.mkv"
+        source_path.touch()
+        transcription.file = str(source_path)
+        translation_signal = TranslationSignal()
+        widget = ExportTranscriptionMenu(
+            transcription,
+            transcription_service,
+            False,
+            translation_signal.translation,
+        )
+        qtbot.add_widget(widget)
+        mocker.patch.object(widget, "_get_segments", return_value=[])
+        mocker.patch.object(
+            widget, "_probe_info",
+            return_value={
+                "duration_ms": 1000,
+                "video_codec": "av1",
+                "audio_codec": "flac",
+            },
+        )
+        start_ffmpeg = mocker.patch.object(widget, "_start_ffmpeg")
+        mocker.patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(tmp_path / "out.mp4"), ""),
+        )
+
+        widget._export_video(MP4_SOFT, "text")
+
+        assert start_ffmpeg.call_args.kwargs == {
+            "copy_video": False, "copy_audio": False,
+        }
+        widget._cleanup_srt(start_ffmpeg.call_args.args[3])
+
+    def test_soft_subtitle_cmd_builds_copy_and_transcode_variants(
+        self, tmp_path: pathlib.Path, qtbot: QtBot, transcription, transcription_service, mocker
+    ):
+        translation_signal = TranslationSignal()
+        widget = ExportTranscriptionMenu(
+            transcription,
+            transcription_service,
+            False,
+            translation_signal.translation,
+        )
+        qtbot.add_widget(widget)
+        proc = mocker.Mock()
+        media = str(tmp_path / "in.mp4")
+        srt = str(tmp_path / "subs.srt")
+        out = str(tmp_path / "out.mp4")
+
+        # Compatible source: stream copy, no re-encode.
+        widget._start_ffmpeg(
+            proc, MP4_SOFT, media, srt, out,
+            copy_video=True, copy_audio=True,
+        )
+        assert proc.try_copy is True
+        copy_cmd = proc.start.call_args.args[1]
+        assert copy_cmd[copy_cmd.index("-c:v") + 1] == "copy"
+        assert "libx264" not in copy_cmd
+        assert copy_cmd[copy_cmd.index("-c:a") + 1] == "copy"
+
+        # Incompatible source: H.264 + AAC transcode.
+        proc.start.reset_mock()
+        widget._start_ffmpeg(
+            proc, MP4_SOFT, media, srt, out,
+            copy_video=False, copy_audio=False,
+        )
+        assert proc.try_copy is False
+        transcode_cmd = proc.start.call_args.args[1]
+        assert "libx264" in transcode_cmd
+        assert "aac" in transcode_cmd
+        assert proc.transcode_cmd[1:] == transcode_cmd
+
+    def test_soft_subtitle_copy_failure_falls_back_to_transcode(
+        self, tmp_path: pathlib.Path, qtbot: QtBot, transcription, transcription_service, mocker
+    ):
+        translation_signal = TranslationSignal()
+        widget = ExportTranscriptionMenu(
+            transcription,
+            transcription_service,
+            False,
+            translation_signal.translation,
+        )
+        qtbot.add_widget(widget)
+        srt_path = tmp_path / "movie.srt"
+        srt_path.write_text("1", encoding="utf-8")
+        part_path = tmp_path / "out.mp4.part"
+        part_path.write_bytes(b"partial")
+        transcode_cmd = ["ffmpeg", "-y", "-i", "in.mp4", "-c:v", "libx264"]
+        proc = mocker.Mock(
+            part_path=str(part_path),
+            output_path=str(tmp_path / "out.mp4"),
+            srt_path=str(srt_path),
+            dialog=mocker.Mock(),
+            try_copy=True,
+            transcode_cmd=transcode_cmd,
+        )
+
+        widget._on_ffmpeg_finished(proc, 1, None)
+
+        proc.start.assert_called_once_with("ffmpeg", transcode_cmd[1:])
+        assert proc.try_copy is False
+        # The temp SRT stays alive for the transcode retry
+        assert srt_path.exists()
+        assert not part_path.exists()
+        proc.dialog.close.assert_not_called()

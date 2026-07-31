@@ -437,13 +437,66 @@ class TestTranscriptionSegmentsEditorWidget:
         # Update translation
         widget.update_translation("Test translation", segment_id)
 
-        # Submit changes to ensure they're written to database
-        widget.model().submitAll()
+        # Flush the pending batch to write it to the model and database
+        widget._flush_translations()
 
         # Check that translation was updated
         updated_segment = widget.model().record(0)
         translation = updated_segment.value("translation")
         assert translation == "Test translation"
+
+    def test_update_translation_ignores_empty_results(
+        self, qtbot: QtBot, transcription, translator
+    ):
+        """Empty/failed translations must not count as available or be written"""
+        from PyQt6.QtWidgets import QWidget
+        parent = QWidget()
+        parent.resize(800, 600)
+        qtbot.add_widget(parent)
+
+        widget = TranscriptionSegmentsEditorWidget(
+            transcription_id=uuid.UUID(hex=transcription.id),
+            translator=translator,
+            parent=parent
+        )
+
+        first_segment = widget.model().record(0)
+        segment_id = first_segment.value("id")
+
+        widget.update_translation("", segment_id)
+        widget.update_translation("   ", segment_id)
+        widget._flush_translations()
+
+        assert not widget.has_translations
+        assert widget.model().record(0).value("translation") == ""
+
+    def test_translation_flush_batches_pending_results(
+        self, qtbot: QtBot, transcription, translator, transcription_segment_dao
+    ):
+        """Multiple results are flushed in one submit; pending stays for retry"""
+        from PyQt6.QtWidgets import QWidget
+        parent = QWidget()
+        parent.resize(800, 600)
+        qtbot.add_widget(parent)
+
+        widget = TranscriptionSegmentsEditorWidget(
+            transcription_id=uuid.UUID(hex=transcription.id),
+            translator=translator,
+            parent=parent
+        )
+
+        segments = widget.segments()
+        widget.update_translation("uno", segments[0].value("id"))
+        widget.update_translation("dos", segments[1].value("id"))
+        widget._flush_translations()
+
+        persisted = transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        )
+        by_id = {s.id: s.translation for s in persisted}
+        assert by_id[segments[0].value("id")] == "uno"
+        assert by_id[segments[1].value("id")] == "dos"
+        assert widget._pending_translations == {}
 
     def test_segment_selected_signal(self, qtbot: QtBot, transcription, translator):
         """Test that segment_selected signal is emitted"""

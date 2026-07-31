@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Optional
 from uuid import UUID
 
-from PyQt6.QtCore import pyqtSignal, Qt, QModelIndex, QItemSelection, QEvent, QRegularExpression, QObject
+from PyQt6.QtCore import pyqtSignal, Qt, QModelIndex, QItemSelection, QEvent, QRegularExpression, QObject, QTimer
 from PyQt6.QtGui import QRegularExpressionValidator
 from PyQt6.QtSql import QSqlTableModel, QSqlRecord
 from PyQt6.QtGui import QFontMetrics, QTextOption
@@ -264,6 +264,13 @@ class TranscriptionSegmentsEditorWidget(QTableView):
         self._last_highlighted_row = -1
         self.translator = translator
         self.translator.translation.connect(self.update_translation)
+        self.translator.batch_completed.connect(self._flush_translations)
+
+        self._pending_translations: dict[int, str] = {}
+        self._row_cache: dict[int, int] = {}
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self._flush_translations)
 
         model = TranscriptionSegmentModel(transcription_id=transcription_id)
         self.setModel(model)
@@ -307,8 +314,11 @@ class TranscriptionSegmentsEditorWidget(QTableView):
         self.selectionModel().selectionChanged.connect(self.on_selection_changed)
         model.select()
         model.rowsInserted.connect(self.init_row_height)
+        model.rowsInserted.connect(self._invalidate_row_cache)
+        model.rowsRemoved.connect(self._invalidate_row_cache)
         model.dataChanged.connect(self._invalidate_segments_cache)
         model.modelReset.connect(self._invalidate_segments_cache)
+        model.modelReset.connect(self._invalidate_row_cache)
 
         self.has_translations = self.has_non_empty_translation()
 
@@ -354,13 +364,68 @@ class TranscriptionSegmentsEditorWidget(QTableView):
         self.setColumnWidth(Column.TRANSLATION.value, text_column_width)
 
     def update_translation(self, translation: str, segment_id: Optional[int] = None):
-        self.has_translations = True
-        self.resizeEvent(None)
+        # Empty/failed results never count as available translations; the
+        # segment stays pending and can be retried by re-running translation.
+        if segment_id is None or not translation.strip():
+            return
+        if not self.has_translations:
+            self.has_translations = True
+            self.resizeEvent(None)
+        self._pending_translations[segment_id] = translation
+        # batch_completed from the translator flushes per batch; the timer is a
+        # fallback so pending results are never stranded.
+        self._flush_timer.start(50)
 
-        for row in range(self.model().rowCount()):
-            if self.model().record(row).value("id") == segment_id:
-                self.model().setData(self.model().index(row, Column.TRANSLATION.value), translation)
-                break
+    def _invalidate_row_cache(self):
+        self._row_cache = {}
+
+    def _row_for_segment_id(self, segment_id: int) -> int:
+        """Model row for a segment id, or -1. The cache is rebuilt once if a
+        segment misses (rows may have shifted)."""
+        rows = self._row_cache
+        if not rows:
+            rows = {
+                seg.value("id"): i for i, seg in enumerate(self.segments())
+            }
+            self._row_cache = rows
+        row = rows.get(segment_id)
+        if row is None:
+            rows = {
+                seg.value("id"): i for i, seg in enumerate(self.segments())
+            }
+            self._row_cache = rows
+            row = rows.get(segment_id)
+        return row if row is not None else -1
+
+    def _flush_translations(self):
+        self._flush_timer.stop()
+        if not self._pending_translations:
+            return
+        pending = self._pending_translations
+        self._pending_translations = {}
+
+        model = self.model()
+        previous_strategy = model.editStrategy()
+        # Batch all translation writes into one submitAll() (one transaction)
+        # instead of OnFieldChange writing each row to SQLite separately.
+        model.setEditStrategy(QSqlTableModel.EditStrategy.OnManualSubmit)
+        try:
+            for segment_id, translation in pending.items():
+                row = self._row_for_segment_id(segment_id)
+                if row == -1:
+                    continue
+                model.setData(
+                    model.index(row, Column.TRANSLATION.value), translation
+                )
+            if not model.submitAll():
+                logging.error(
+                    "Failed to persist translations: %s", model.lastError().text()
+                )
+                model.revertAll()
+                self._pending_translations.update(pending)
+                self._flush_timer.start(200)
+        finally:
+            model.setEditStrategy(previous_strategy)
 
     def on_selection_changed(
         self, selected: QItemSelection, _deselected: QItemSelection

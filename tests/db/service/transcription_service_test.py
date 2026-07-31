@@ -4,6 +4,7 @@ from uuid import UUID, uuid4
 
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.db.entity.transcription import Transcription
+from buzz.transcriber.transcriber import Segment
 
 
 @pytest.fixture
@@ -219,3 +220,129 @@ class TestTranscriptionService:
         
         # Verify the DAO method was called with unicode string
         mock_transcription_dao.update_transcription_notes.assert_called_once_with(transcription_id, unicode_notes)
+
+
+class TestTranscriptionServiceTransactions:
+    """Real-DAO tests: completion/segments and replace are atomic."""
+
+    @pytest.fixture()
+    def transcription_service(
+        self, transcription_dao, transcription_segment_dao
+    ) -> TranscriptionService:
+        return TranscriptionService(transcription_dao, transcription_segment_dao)
+
+    @pytest.fixture()
+    def transcription(self, transcription_dao) -> Transcription:
+        id = uuid4()
+        transcription_dao.insert(
+            Transcription(
+                id=str(id),
+                status="in_progress",
+                file="/tmp/test.mp3",
+                task="TRANSCRIBE",
+                model_type="WHISPER",
+            )
+        )
+        return transcription_dao.find_by_id(str(id))
+
+    def test_completed_inserts_segments_then_marks_completed(
+        self, transcription, transcription_service, transcription_segment_dao
+    ):
+        segments = [
+            Segment(start=0, end=100, text="one"),
+            Segment(start=100, end=200, text="two"),
+        ]
+
+        transcription_service.update_transcription_as_completed(
+            transcription.id_as_uuid, segments
+        )
+
+        from PyQt6.QtSql import QSqlQuery
+        query = QSqlQuery(transcription_segment_dao.db)
+        query.prepare("SELECT status FROM transcription WHERE id = :id")
+        query.bindValue(":id", transcription.id)
+        assert query.exec() and query.next()
+        assert query.value(0) == "completed"
+
+        persisted = transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        )
+        assert [(s.start_time, s.end_time, s.text) for s in persisted] == [
+            (0, 100, "one"),
+            (100, 200, "two"),
+        ]
+
+    def test_completed_rolls_back_status_when_segment_insert_fails(
+        self, transcription, transcription_service, transcription_segment_dao
+    ):
+        from buzz.db.dao.transcription_segment_dao import TranscriptionSegmentDAO
+
+        with patch.object(
+            TranscriptionSegmentDAO,
+            "insert",
+            side_effect=Exception("disk full"),
+        ):
+            with pytest.raises(Exception, match="disk full"):
+                transcription_service.update_transcription_as_completed(
+                    transcription.id_as_uuid,
+                    [Segment(start=0, end=100, text="one")],
+                )
+
+        # Neither the status nor the segments were committed.
+        from PyQt6.QtSql import QSqlQuery
+        query = QSqlQuery(transcription_segment_dao.db)
+        query.prepare("SELECT status FROM transcription WHERE id = :id")
+        query.bindValue(":id", transcription.id)
+        assert query.exec() and query.next()
+        assert query.value(0) == "in_progress"
+        assert transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        ) == []
+
+    def test_replace_segments_is_atomic(
+        self, transcription, transcription_service, transcription_segment_dao
+    ):
+        transcription_service.update_transcription_as_completed(
+            transcription.id_as_uuid,
+            [Segment(start=0, end=100, text="old")],
+        )
+
+        transcription_service.replace_transcription_segments(
+            transcription.id_as_uuid,
+            [Segment(start=0, end=50, text="new1"),
+             Segment(start=50, end=100, text="new2")],
+        )
+
+        persisted = transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        )
+        assert [(s.start_time, s.text) for s in persisted] == [
+            (0, "new1"), (50, "new2"),
+        ]
+
+    def test_replace_rolls_back_on_failure(
+        self, transcription, transcription_service, transcription_segment_dao
+    ):
+        transcription_service.update_transcription_as_completed(
+            transcription.id_as_uuid,
+            [Segment(start=0, end=100, text="old")],
+        )
+
+        from buzz.db.dao.transcription_segment_dao import TranscriptionSegmentDAO
+
+        with patch.object(
+            TranscriptionSegmentDAO,
+            "insert",
+            side_effect=Exception("disk full"),
+        ):
+            with pytest.raises(Exception, match="disk full"):
+                transcription_service.replace_transcription_segments(
+                    transcription.id_as_uuid,
+                    [Segment(start=0, end=50, text="new1")],
+                )
+
+        # The delete was rolled back: the old segments are still there.
+        persisted = transcription_segment_dao.get_segments(
+            transcription.id_as_uuid
+        )
+        assert [(s.start_time, s.text) for s in persisted] == [(0, "old")]

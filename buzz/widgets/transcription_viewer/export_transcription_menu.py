@@ -25,6 +25,11 @@ VIDEO_MODES = {
     MP4_SOFT: (_("MP4 - Soft Subtitles"), "mp4"),
 }
 
+# Codecs the MP4 muxer accepts with stream copy; anything else must be
+# transcoded (libx264 video / AAC audio) to stay playable.
+_COPY_VIDEO_CODECS = {"h264", "avc1", "hevc", "h265"}
+_COPY_AUDIO_CODECS = {"aac", "mp3", "ac3", "alac", "opus"}
+
 
 class ExportTranscriptionMenu(QMenu):
     def __init__(
@@ -208,7 +213,14 @@ class ExportTranscriptionMenu(QMenu):
             )
             return
 
-        duration_ms = self._probe_duration_ms(media_file)
+        info = self._probe_info(media_file)
+        duration_ms = info.get("duration_ms") or 0
+        video_codec = (info.get("video_codec") or "").lower()
+        audio_codec = (info.get("audio_codec") or "").lower()
+        # Known-incompatible codecs (e.g. AV1) transcode directly; unknown
+        # codecs (probe failed) try stream copy and fall back on failure.
+        copy_video = video_codec in _COPY_VIDEO_CODECS if video_codec else True
+        copy_audio = audio_codec in _COPY_AUDIO_CODECS if audio_codec else True
 
         prog = QProgressDialog(
             _("Exporting video with subtitles..."), _("Cancel"), 0, 100, self
@@ -233,11 +245,20 @@ class ExportTranscriptionMenu(QMenu):
             lambda err: self._on_ffmpeg_error(proc, err)
         )
 
-        self._start_ffmpeg(proc, mode, media_file, srt_path, output_file_path)
+        self._start_ffmpeg(
+            proc, mode, media_file, srt_path, output_file_path,
+            copy_video=copy_video, copy_audio=copy_audio,
+        )
 
     @staticmethod
     def _start_ffmpeg(
-        proc: QProcess, mode: str, media_file: str, srt_path: str, output_path: str
+        proc: QProcess,
+        mode: str,
+        media_file: str,
+        srt_path: str,
+        output_path: str,
+        copy_video: bool = False,
+        copy_audio: bool = False,
     ):
         ffmpeg = _find_ffmpeg()
         # Escape backslashes/colons so the subtitles filter parses the path.
@@ -260,19 +281,48 @@ class ExportTranscriptionMenu(QMenu):
                 part_path,
             ]
         else:  # MP4_SOFT
-            # ponytail: transcode video to H.264 (don't copy) so QuickTime can play it —
-            # source codecs like AV1 leave QuickTime showing audio only. Upgrade: keep
-            # -c:v copy behind a "fast export" option if QT codec support ever broadens.
-            cmd = [
-                ffmpeg, "-y", "-i", media_file, "-i", srt_path,
-                "-map", "0", "-map", "1",
-                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast",
-                "-c:a", "copy", "-c:s", "mov_text",
-                "-metadata:s:s:0", "language=chi",
-                "-progress", "pipe:1", "-nostats",
-                part_path,
-            ]
+            # Prefer stream copy (no re-encode) when the source codecs are MP4
+            # compatible; fall back to H.264/AAC transcoding when they are not.
+            copy_cmd = ExportTranscriptionMenu._soft_subtitle_cmd(
+                ffmpeg, media_file, srt_path, part_path,
+                copy_video=True, copy_audio=True,
+            )
+            transcode_cmd = ExportTranscriptionMenu._soft_subtitle_cmd(
+                ffmpeg, media_file, srt_path, part_path,
+                copy_video=False, copy_audio=False,
+            )
+            proc.copy_cmd = copy_cmd
+            proc.transcode_cmd = transcode_cmd
+            proc.try_copy = copy_video
+            cmd = copy_cmd if copy_video else transcode_cmd
         proc.start(cmd[0], cmd[1:])
+
+    @staticmethod
+    def _soft_subtitle_cmd(
+        ffmpeg: str,
+        media_file: str,
+        srt_path: str,
+        part_path: str,
+        copy_video: bool,
+        copy_audio: bool,
+    ) -> list:
+        cmd = [
+            ffmpeg, "-y", "-i", media_file, "-i", srt_path,
+            "-map", "0", "-map", "1",
+            "-c:s", "mov_text",
+            "-metadata:s:s:0", "language=chi",
+            "-progress", "pipe:1", "-nostats",
+            part_path,
+        ]
+        if copy_video:
+            cmd += ["-c:v", "copy"]
+        else:
+            cmd += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "veryfast"]
+        if copy_audio:
+            cmd += ["-c:a", "copy"]
+        else:
+            cmd += ["-c:a", "aac", "-b:a", "192k"]
+        return cmd
 
     def _on_ffmpeg_output(self, proc: QProcess):
         data = bytes(proc.readAll()).decode("utf-8", errors="replace")
@@ -291,9 +341,9 @@ class ExportTranscriptionMenu(QMenu):
                 proc.dialog.setValue(100)
 
     def _on_ffmpeg_finished(self, proc: QProcess, exit_code: int, _exit_status):
-        self._cleanup_srt(proc.srt_path)
         part_path = getattr(proc, "part_path", f"{proc.output_path}.part")
         if exit_code == 0 and os.path.isfile(part_path):
+            self._cleanup_srt(proc.srt_path)
             try:
                 os.replace(part_path, proc.output_path)
             except OSError:
@@ -306,6 +356,23 @@ class ExportTranscriptionMenu(QMenu):
                 )
                 return
 
+        # A failed stream-copy attempt usually fails fast (incompatible muxer
+        # combination); retry once with full transcoding instead of giving up.
+        if (
+            exit_code != 0
+            and getattr(proc, "try_copy", False)
+            and getattr(proc, "transcode_cmd", None)
+        ):
+            logging.warning(
+                "Soft subtitle stream copy failed (exit %s), falling back to "
+                "transcoding", exit_code,
+            )
+            self._cleanup_part(part_path)
+            proc.try_copy = False
+            proc.start(proc.transcode_cmd[0], proc.transcode_cmd[1:])
+            return
+
+        self._cleanup_srt(proc.srt_path)
         self._cleanup_part(part_path)
         proc.dialog.close()
         QMessageBox.critical(
@@ -337,9 +404,8 @@ class ExportTranscriptionMenu(QMenu):
             pass
 
     @staticmethod
-    def _probe_duration_ms(media_file: str) -> int:
+    def _probe_info(media_file: str) -> dict:
         try:
-            info = probe_video(media_file)
-            return int(info.get("duration_ms") or 0)
+            return probe_video(media_file)
         except Exception:
-            return 0
+            return {}

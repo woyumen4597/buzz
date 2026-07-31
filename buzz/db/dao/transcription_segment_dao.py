@@ -37,6 +37,11 @@ class TranscriptionSegmentDAO(DAO[TranscriptionSegment]):
         if not query.exec():
             raise Exception(query.lastError().text())
 
+    def bulk_insert(self, segments: List[TranscriptionSegment]):
+        """Insert many segments; the caller decides the transaction scope."""
+        for segment in segments:
+            self.insert(segment)
+
     def update_segment_translation(self, segment_id: int, translation: str):
         query = self._create_query()
         query.prepare(

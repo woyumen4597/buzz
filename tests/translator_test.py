@@ -263,6 +263,100 @@ class TestTranslator:
 
         translator.stop()
 
+    @patch('buzz.translator.queue.Queue', autospec=True)
+    def test_start_emits_success_only_for_non_empty_and_failure_signal(
+        self, mock_queue, qtbot
+    ):
+        mock_queue.get.side_effect = [("Hello", 1), ("World", 2), None]
+
+        transcription_options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:",
+        )
+        translator = Translator(
+            transcription_options,
+            AdvancedSettingsDialog(
+                transcription_options=transcription_options, parent=None
+            ),
+        )
+        translator.queue = mock_queue
+        successes = []
+        failures = []
+        batches = []
+        translator.translation.connect(
+            lambda text, tid: successes.append((text, tid))
+        )
+        translator.translation_failed.connect(failures.append)
+        translator.batch_completed.connect(lambda: batches.append(True))
+
+        with patch.object(
+            translator,
+            "_translate_batch",
+            return_value=[("AI Translated", 1), ("", 2)],
+        ):
+            translator.start()
+
+        # Empty results are not emitted as translations; they go to the
+        # failure signal so the segment stays pending for retry.
+        assert successes == [("AI Translated", 1)]
+        assert failures == [2]
+        assert batches == [True]
+
+    @patch('buzz.translator.queue.Queue', autospec=True)
+    def test_cancel_drops_collected_and_queued_items_but_keeps_worker_alive(
+        self, mock_queue, qtbot
+    ):
+        from buzz.translator import _CANCEL
+
+        # Item 1 is collected, then the cancel marker drops it; item 2 starts
+        # a fresh run and the stop sentinel ends the worker.
+        mock_queue.get.side_effect = [
+            ("Hello", 1), _CANCEL, ("World", 2), None,
+        ]
+
+        transcription_options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:",
+        )
+        translator = Translator(
+            transcription_options,
+            AdvancedSettingsDialog(
+                transcription_options=transcription_options, parent=None
+            ),
+        )
+        translator.queue = mock_queue
+        successes = []
+        translator.translation.connect(
+            lambda text, tid: successes.append((text, tid))
+        )
+
+        with patch.object(
+            translator,
+            "_translate_single",
+            side_effect=lambda text, tid: ("translated", tid),
+        ):
+            translator.start()
+
+        # The cancelled item is dropped; the post-cancel run still works.
+        assert successes == [("translated", 2)]
+
+    def test_cancel_drains_pending_queue(self, qtbot):
+        transcription_options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:",
+        )
+        translator = Translator(
+            transcription_options,
+            AdvancedSettingsDialog(
+                transcription_options=transcription_options, parent=None
+            ),
+        )
+        translator.enqueue("a", 1)
+        translator.enqueue("b", 2)
+
+        translator.cancel()
+
+        from buzz.translator import _CANCEL
+        assert translator.queue.qsize() == 1
+        assert translator.queue.get() is _CANCEL
+
     @patch('buzz.translator.httpx.Client')
     def test_translator(self, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")

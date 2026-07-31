@@ -100,6 +100,10 @@ class TranscriptionViewerWidget(QWidget):
         self.translation_thread = None
         self.translator = None
         self.view_mode = ViewMode.TIMESTAMPS
+        self._translation_active = False
+        self._translation_total = 0
+        self._translation_done = 0
+        self._translation_failed = 0
 
         self._init_search_debounce()
         self._load_segments_and_settings()
@@ -153,6 +157,8 @@ class TranscriptionViewerWidget(QWidget):
             self.transcription_options,
             self.transcription_options_dialog,
         )
+        self.translator.translation.connect(self._on_translation_success)
+        self.translator.translation_failed.connect(self._on_translation_failed)
         self.translation_thread = QThread()
         self.translator.moveToThread(self.translation_thread)
         self.translation_thread.started.connect(self.translator.start)
@@ -273,6 +279,11 @@ class TranscriptionViewerWidget(QWidget):
         )
         translate_button.clicked.connect(self.on_translate_button_clicked)
         toolbar.addWidget(translate_button)
+        self.translate_button = translate_button
+
+        self.translation_progress_label = QLabel("")
+        self.translation_progress_label.setStyleSheet("color: #666;")
+        toolbar.addWidget(self.translation_progress_label)
 
         resize_button = QToolButton()
         resize_button.setText(_("Resize"))
@@ -1306,6 +1317,10 @@ class TranscriptionViewerWidget(QWidget):
         ) or Settings().value(Settings.Key.OPENAI_API_MODEL, "")
 
     def on_translate_button_clicked(self):
+        if self._translation_active:
+            self.cancel_translation()
+            return
+
         if not self._translation_api_key():
             logging.warning("Translation not started: API key is missing")
             QMessageBox.information(
@@ -1330,6 +1345,8 @@ class TranscriptionViewerWidget(QWidget):
         self.run_translation()
 
     def run_translation(self):
+        if self._translation_active:
+            return
         translation_model = self._translation_model()
         if not translation_model:
             logging.warning("Translation not started: AI model is missing")
@@ -1342,9 +1359,63 @@ class TranscriptionViewerWidget(QWidget):
             segment for segment in self.table_widget.segments()
             if not (segment.value("translation") or "").strip()
         ]
+        if not segments:
+            return
+        self._translation_active = True
+        self._translation_total = len(segments)
+        self._translation_done = 0
+        self._translation_failed = 0
+        self.translate_button.setText(_("Cancel"))
+        self.translation_progress_label.setText(
+            _("Translated {0}/{1}").format(0, len(segments))
+        )
         for segment in segments:
             self.translator.enqueue(segment.value("text"), segment.value("id"))
         logging.info("Queued %d segments for translation", len(segments))
+
+    def cancel_translation(self):
+        self.translator.cancel()
+        self._translation_active = False
+        self.translate_button.setText(_("Translate"))
+        self.translation_progress_label.setText(
+            _("Translation canceled, {0} segments left for retry").format(
+                self._translation_total - self._translation_done
+            )
+        )
+
+    def _on_translation_success(self, _translation: str, _segment_id: int):
+        if not self._translation_active:
+            return
+        self._translation_done += 1
+        self._update_translation_progress()
+
+    def _on_translation_failed(self, _segment_id: int):
+        if not self._translation_active:
+            return
+        self._translation_done += 1
+        self._translation_failed += 1
+        self._update_translation_progress()
+
+    def _update_translation_progress(self):
+        label = _("Translated {0}/{1}").format(
+            self._translation_done, self._translation_total
+        )
+        if self._translation_failed:
+            label += _(", {0} failed").format(self._translation_failed)
+        self.translation_progress_label.setText(label)
+
+        if self._translation_done >= self._translation_total:
+            self._translation_active = False
+            self.translate_button.setText(_("Translate"))
+            if self._translation_failed:
+                self.translation_progress_label.setText(
+                    _("Done: {0} translated, {1} failed (retry to continue)").format(
+                        self._translation_done - self._translation_failed,
+                        self._translation_failed,
+                    )
+                )
+            else:
+                self.translation_progress_label.setText("")
 
     def on_resize_button_clicked(self):
         self.transcription_resizer_dialog = TranscriptionResizerWidget(

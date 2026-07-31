@@ -37,7 +37,8 @@ def _find_ffprobe() -> str:
 
 
 def probe_video(file_path: str) -> dict:
-    """Returns dict with duration_ms, fps, width, height, has_video."""
+    """Returns dict with duration_ms, fps, width, height, has_video,
+    video_codec, audio_codec."""
     ffprobe = _find_ffprobe()
     result = subprocess.run(
         [ffprobe, "-v", "quiet", "-print_format", "json",
@@ -50,9 +51,12 @@ def probe_video(file_path: str) -> dict:
     width = height = 0
     fps = 25.0
     has_video = False
+    video_codec = audio_codec = None
 
     for stream in info.get("streams", []):
         if stream.get("codec_type") == "video":
+            if video_codec is None:
+                video_codec = stream.get("codec_name")
             has_video = True
             width = int(stream.get("width", 0))
             height = int(stream.get("height", 0))
@@ -64,7 +68,8 @@ def probe_video(file_path: str) -> dict:
                 fps = 25.0
             if not duration_s:
                 duration_s = float(stream.get("duration", 0) or 0)
-            break
+        elif stream.get("codec_type") == "audio" and audio_codec is None:
+            audio_codec = stream.get("codec_name")
 
     return {
         "duration_ms": int(duration_s * 1000),
@@ -72,6 +77,8 @@ def probe_video(file_path: str) -> dict:
         "width": width,
         "height": height,
         "has_video": has_video,
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
     }
 
 

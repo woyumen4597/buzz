@@ -35,17 +35,50 @@ class TranscriptionService:
         self.transcription_dao.update_transcription_progress(id, progress)
 
     def update_transcription_as_completed(self, id: UUID, segments: List[Segment]):
-        self.transcription_dao.update_transcription_as_completed(id)
-        for segment in segments:
-            self.transcription_segment_dao.insert(
-                TranscriptionSegment(
-                    start_time=segment.start,
-                    end_time=segment.end,
-                    text=segment.text,
-                    translation='',
-                    transcription_id=str(id),
-                )
+        self._with_transaction(
+            lambda: self._insert_segments_and_mark(
+                id, segments, self.transcription_dao.update_transcription_as_completed
             )
+        )
+
+    def update_transcription_as_skipped(self, id: UUID, segments: List[Segment]):
+        self._with_transaction(
+            lambda: self._insert_segments_and_mark(
+                id, segments, self.transcription_dao.update_transcription_as_skipped
+            )
+        )
+
+    def _insert_segments_and_mark(self, id: UUID, segments: List[Segment], mark):
+        # Insert segments before marking the status so a completed/skipped
+        # transcription is never visible with missing segments.
+        self.transcription_segment_dao.bulk_insert(
+            self._to_segment_entities(id, segments)
+        )
+        mark(id)
+
+    @staticmethod
+    def _to_segment_entities(id: UUID, segments: List[Segment]):
+        return [
+            TranscriptionSegment(
+                start_time=segment.start,
+                end_time=segment.end,
+                text=segment.text,
+                translation='',
+                transcription_id=str(id),
+            )
+            for segment in segments
+        ]
+
+    def _with_transaction(self, fn):
+        db = self.transcription_segment_dao.db
+        db.transaction()
+        try:
+            result = fn()
+            db.commit()
+            return result
+        except Exception:
+            db.rollback()
+            raise
 
     def update_transcription_file_and_name(self, id: UUID, file_path: str, name: str | None = None):
         self.transcription_dao.update_transcription_file_and_name(id, file_path, name)
@@ -59,19 +92,6 @@ class TranscriptionService:
     def update_transcription_language(self, id: UUID, language: str):
         self.transcription_dao.update_transcription_language(id, language)
 
-    def update_transcription_as_skipped(self, id: UUID, segments: List[Segment]):
-        self.transcription_dao.update_transcription_as_skipped(id)
-        for segment in segments:
-            self.transcription_segment_dao.insert(
-                TranscriptionSegment(
-                    start_time=segment.start,
-                    end_time=segment.end,
-                    text=segment.text,
-                    translation='',
-                    transcription_id=str(id),
-                )
-            )
-
     def find_completed_transcription_by_filename(self, filename: str):
         return self.transcription_dao.find_completed_transcription_by_filename(filename)
 
@@ -79,17 +99,13 @@ class TranscriptionService:
         self.transcription_dao.reset_transcription_for_restart(id)
 
     def replace_transcription_segments(self, id: UUID, segments: List[Segment]):
-        self.transcription_segment_dao.delete_segments(id)
-        for segment in segments:
-            self.transcription_segment_dao.insert(
-                TranscriptionSegment(
-                    start_time=segment.start,
-                    end_time=segment.end,
-                    text=segment.text,
-                    translation='',
-                    transcription_id=str(id),
-                )
+        def _replace():
+            self.transcription_segment_dao.delete_segments(id)
+            self.transcription_segment_dao.bulk_insert(
+                self._to_segment_entities(id, segments)
             )
+
+        self._with_transaction(_replace)
 
     def get_transcription_segments(self, transcription_id: UUID):
         return self.transcription_segment_dao.get_segments(transcription_id)
