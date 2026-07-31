@@ -1,7 +1,9 @@
+import json
 import os
 import re
 import logging
 import queue
+import time
 from urllib.parse import urlparse
 
 from typing import Optional, List, Tuple
@@ -14,12 +16,22 @@ from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 
 
+# Max items per batch and max combined chars per batch. The char budget keeps
+# the prompt and the expected translation output within max_tokens.
 BATCH_SIZE = 10
+MAX_BATCH_CHARS = 3000
+# After the first item arrives, wait briefly for more items so a burst of
+# enqueues becomes a few deterministic batch requests instead of racing
+# get_nowait() into per-item requests.
+BATCH_WINDOW_SECONDS = 0.1
+MAX_ATTEMPTS = 4
 
 DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 ANTHROPIC_VERSION = "2023-06-01"
-REQUEST_TIMEOUT = 180.0
+# Must stay below the viewer's graceful shutdown wait so closing the window
+# never has to terminate the worker thread mid-request.
+REQUEST_TIMEOUT = 30.0
 OPENAI_PROTOCOL = "openai"
 ANTHROPIC_PROTOCOL = "anthropic"
 
@@ -72,6 +84,8 @@ class Translator(QObject):
         )
 
         self.queue = queue.Queue()
+        self._client_instance: Optional[httpx.Client] = None
+        self._stopping = False
 
         settings = Settings()
         self.api_key = os.getenv("BUZZ_TRANSLATION_API_KEY") or get_password(
@@ -100,8 +114,14 @@ class Translator(QObject):
             "BUZZ_TRANSLATION_API_MODEL"
         ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
-    def _messages(self, system: str, user_content: str) -> Optional[str]:
-        """Call the configured translation protocol and return its text response."""
+    def _client(self) -> httpx.Client:
+        if self._client_instance is None:
+            self._client_instance = httpx.Client(timeout=REQUEST_TIMEOUT)
+        return self._client_instance
+
+    def _build_request(
+        self, system: str, user_content: str, json_mode: bool
+    ) -> Tuple[str, dict, dict]:
         if self.api_protocol == ANTHROPIC_PROTOCOL:
             url = _messages_url(self.base_url)
             headers = {
@@ -129,28 +149,11 @@ class Translator(QObject):
                     {"role": "user", "content": user_content},
                 ],
             }
-        for attempt in range(4):
-            try:
-                resp = httpx.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=REQUEST_TIMEOUT,
-                )
-                if resp.status_code != 200:
-                    raise httpx.HTTPStatusError(
-                        f"Unexpected status code: {resp.status_code}",
-                        request=resp.request,
-                        response=resp,
-                    )
-                resp.raise_for_status()
-                data = resp.json()
-                break
-            except Exception as e:
-                logging.error(f"Translation error! Server response: {e}")
-                if attempt == 3:
-                    return None
+            if json_mode:
+                body["response_format"] = {"type": "json_object"}
+        return url, headers, body
 
+    def _extract_text(self, data: dict) -> Optional[str]:
         if self.api_protocol == ANTHROPIC_PROTOCOL:
             content = data.get("content", [])
             text = next(
@@ -172,6 +175,73 @@ class Translator(QObject):
         logging.error(f"Translation error! Unexpected response: {data}")
         return None
 
+    @staticmethod
+    def _is_retryable_status(status: int) -> bool:
+        # 4xx errors are permanent (bad key, bad request, quota...); only
+        # retry 408/429/5xx and network failures.
+        return status == 408 or status == 429 or status >= 500
+
+    @staticmethod
+    def _retry_after_seconds(response: Optional[httpx.Response]) -> Optional[float]:
+        if response is None:
+            return None
+        try:
+            value = response.headers.get("Retry-After")
+        except Exception:
+            return None
+        if not value:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _sleep(self, seconds: float) -> None:
+        # Sleep in small slices so stop() can interrupt a backoff wait.
+        while seconds > 0 and not self._stopping:
+            slice_ = min(seconds, 0.5)
+            time.sleep(slice_)
+            seconds -= slice_
+
+    def _backoff(self, attempt: int, response: Optional[httpx.Response] = None) -> None:
+        delay = min(2 ** attempt, 8.0)
+        retry_after = self._retry_after_seconds(response)
+        if retry_after is not None:
+            delay = max(delay, min(retry_after, 30.0))
+        self._sleep(delay)
+
+    def _messages(
+        self, system: str, user_content: str, json_mode: bool = False
+    ) -> Optional[str]:
+        """Call the configured translation protocol and return its text response."""
+        url, headers, body = self._build_request(system, user_content, json_mode)
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                resp = self._client().post(url, headers=headers, json=body)
+                resp.raise_for_status()
+                return self._extract_text(resp.json())
+            except httpx.HTTPStatusError as e:
+                status = e.response.status_code
+                logging.error(
+                    f"Translation error! HTTP {status}: {e.response.text[:300]}"
+                )
+                if (
+                    self._stopping
+                    or attempt == MAX_ATTEMPTS - 1
+                    or not self._is_retryable_status(status)
+                ):
+                    return None
+                self._backoff(attempt, e.response)
+            except httpx.TransportError as e:
+                logging.error(f"Translation error! Network failure: {e}")
+                if self._stopping or attempt == MAX_ATTEMPTS - 1:
+                    return None
+                self._backoff(attempt)
+            except Exception as e:
+                logging.error(f"Translation error! {e}")
+                return None
+        return None
+
     def _translate_single(self, transcript: str, transcript_id: int) -> Tuple[str, int]:
         """Translate a single transcript via the API. Returns (translation, transcript_id)."""
         translation = self._messages(
@@ -191,24 +261,78 @@ class Translator(QObject):
             f"{self.transcription_options.llm_prompt}\n\n"
             f"You will receive {len(items)} numbered texts. "
             f"Process each one separately according to the instruction above "
-            f"and return them in the exact same numbered format, e.g.:\n"
-            f"[1] processed text\n[2] processed text"
+            f"and return a JSON object mapping each number to its processed text, "
+            f'e.g. {{"translations": {{"1": "processed text 1", "2": "processed text 2"}}}}. '
+            f"Respond with only that JSON object and nothing else."
         )
 
-        response_text = self._messages(system=batch_prompt, user_content=combined)
+        response_text = self._messages(
+            system=batch_prompt, user_content=combined, json_mode=True
+        )
         if not response_text:
             return [("", tid) for _, tid in items]
 
         translations = self._parse_batch_response(response_text, len(items))
-        return [
-            (translations[i], items[i][1]) if i < len(translations) else ("", items[i][1])
-            for i in range(len(items))
-        ]
+        missing = []
+        by_id = {}
+        for translation, (transcript, tid) in zip(translations, items):
+            if translation:
+                by_id[tid] = translation
+            else:
+                missing.append((transcript, tid))
+
+        if missing:
+            # A malformed/missing entry must not lose the whole batch; re-request
+            # only the failed items individually.
+            logging.debug(
+                f"Batch response incomplete ({len(missing)} missing), "
+                "retrying individually"
+            )
+            for transcript, tid in missing:
+                by_id[tid] = self._translate_single(transcript, tid)[0]
+
+        return [(by_id.get(tid, ""), tid) for _, tid in items]
+
+    @staticmethod
+    def _try_parse_json_mapping(response: str) -> Optional[dict]:
+        """Parse a JSON batch response into {int index: text}, or None."""
+        text = response.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text).strip()
+        try:
+            data = json.loads(text)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        mapping = None
+        if isinstance(data, dict):
+            candidate = data.get("translations")
+            if isinstance(candidate, dict):
+                mapping = candidate
+            elif data and all(
+                isinstance(k, (str, int)) and isinstance(v, str)
+                for k, v in data.items()
+            ):
+                mapping = data
+        if not mapping:
+            return None
+        translations = {}
+        for key, value in mapping.items():
+            try:
+                translations[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+        return translations or None
 
     @staticmethod
     def _parse_batch_response(response: str, expected_count: int) -> List[str]:
-        """Parse a numbered batch response like '[1] text\\n[2] text' into a list of strings."""
-        # Split on [N] markers — re.split with a group returns: [before, group1, after1, group2, after2, ...]
+        """Parse a batch response into a list of strings.
+        Accepts a JSON object mapping numbers to texts, or numbered '[N] text' lines."""
+        mapping = Translator._try_parse_json_mapping(response)
+        if mapping is not None:
+            return [mapping.get(i, "") for i in range(1, expected_count + 1)]
+
+        # Fallback: split on [N] markers — re.split with a group returns:
+        # [before, group1, after1, group2, after2, ...]
         parts = re.split(r'\[(\d+)\]\s*', response)
 
         translations = {}
@@ -222,8 +346,27 @@ class Translator(QObject):
             for i in range(1, expected_count + 1)
         ]
 
+    @staticmethod
+    def _split_batches(items: List[Tuple[str, int]]) -> List[List[Tuple[str, int]]]:
+        """Split items into sub-batches that fit the character budget."""
+        batches = []
+        current: List[Tuple[str, int]] = []
+        current_chars = 0
+        for item in items:
+            chars = len(item[0])
+            if current and current_chars + chars > MAX_BATCH_CHARS:
+                batches.append(current)
+                current = []
+                current_chars = 0
+            current.append(item)
+            current_chars += chars
+        if current:
+            batches.append(current)
+        return batches
+
     def start(self):
         logging.debug("Starting translation queue")
+        self._stopping = False
 
         while True:
             item = self.queue.get()  # Block until item available
@@ -233,30 +376,35 @@ class Translator(QObject):
                 logging.debug("Translation queue received stop signal")
                 break
 
-            # Collect a batch: start with the first item, then drain more
+            # Collect a batch: start with the first item, then wait briefly for
+            # more instead of racing get_nowait() into single-item requests.
             batch = [item]
             stop_after_batch = False
+            deadline = time.monotonic() + BATCH_WINDOW_SECONDS
             while len(batch) < BATCH_SIZE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    next_item = self.queue.get_nowait()
-                    if next_item is None:
-                        stop_after_batch = True
-                        break
-                    batch.append(next_item)
+                    next_item = self.queue.get(timeout=remaining)
                 except queue.Empty:
                     break
+                if next_item is None:
+                    stop_after_batch = True
+                    break
+                batch.append(next_item)
 
-            if len(batch) == 1:
-                transcript, transcript_id = batch[0]
-                translation, tid = self._translate_single(transcript, transcript_id)
-                self.translation.emit(translation, tid)
-            else:
-                logging.debug(f"Translating batch of {len(batch)} in single request")
-                results = self._translate_batch(batch)
-                for translation, tid in results:
+            for sub_batch in self._split_batches(batch):
+                if len(sub_batch) == 1:
+                    translation, tid = self._translate_single(*sub_batch[0])
                     self.translation.emit(translation, tid)
+                else:
+                    logging.debug(f"Translating batch of {len(sub_batch)} in single request")
+                    results = self._translate_batch(sub_batch)
+                    for translation, tid in results:
+                        self.translation.emit(translation, tid)
 
-            if stop_after_batch:
+            if stop_after_batch or self._stopping:
                 logging.debug("Translation queue received stop signal")
                 break
 
@@ -279,5 +427,7 @@ class Translator(QObject):
         self.queue.put((transcript, transcript_id))
 
     def stop(self):
-        # Send sentinel value to unblock and stop the worker thread
+        # Flag stops retries/backoff immediately; the sentinel unblocks the
+        # worker so it exits after the current batch without draining the queue.
+        self._stopping = True
         self.queue.put(None)

@@ -1,12 +1,29 @@
 import time
-from queue import Empty
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
+import httpx
 from PyQt6.QtCore import QThread
 
 from buzz.translator import Translator
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
+
+
+def _failing_response(status_code, retry_after=None):
+    resp = Mock(status_code=status_code)
+    resp.raise_for_status.side_effect = httpx.HTTPStatusError(
+        f"HTTP {status_code}", request=Mock(), response=resp
+    )
+    resp.headers = {"Retry-After": retry_after} if retry_after else {}
+    resp.text = f"error {status_code}"
+    return resp
+
+
+def _success_response(content):
+    resp = Mock(status_code=200)
+    resp.raise_for_status.return_value = None
+    resp.json.return_value = content
+    return resp
 
 
 class TestParseBatchResponse:
@@ -57,23 +74,99 @@ class TestParseBatchResponse:
         assert result[0] == "First"
         assert result[1] == "Second"
 
+    def test_json_object_response(self):
+        response = '{"translations": {"1": "Hello", "2": "World"}}'
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["Hello", "World"]
+
+    def test_json_flat_mapping_response(self):
+        response = '{"1": "Hello", "2": "World"}'
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["Hello", "World"]
+
+    def test_json_response_with_missing_entry(self):
+        response = '{"translations": {"1": "Hello"}}'
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["Hello", ""]
+
+    def test_json_fenced_response(self):
+        response = '```json\n{"translations": {"1": "Hello"}}\n```'
+        result = Translator._parse_batch_response(response, 1)
+        assert result == ["Hello"]
+
+    def test_json_response_with_numbering_in_text(self):
+        # JSON output is immune to '[N]' appearing inside the text itself.
+        response = '{"translations": {"1": "see [2] for details", "2": "done"}}'
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["see [2] for details", "done"]
+
+
+class TestSplitBatches:
+    def test_splits_on_char_budget(self):
+        items = [("a" * 1500, 1), ("b" * 1500, 2), ("c" * 100, 3)]
+        batches = Translator._split_batches(items)
+        assert batches == [[items[0], items[1]], [items[2]]]
+
+    def test_single_oversized_item_goes_alone(self):
+        items = [("a" * 5000, 1)]
+        batches = Translator._split_batches(items)
+        assert batches == [[items[0]]]
+
+
+class TestBatchRecovery:
+    def _make_translator(self):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        return Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+    def test_parse_failure_retries_missing_as_singles(self, qtbot):
+        translator = self._make_translator()
+        with patch.object(translator, "_messages", return_value="I cannot do that"), \
+                patch.object(
+                    translator,
+                    "_translate_single",
+                    side_effect=lambda text, tid: (f"single-{tid}", tid),
+                ):
+            results = translator._translate_batch([("a", 1), ("b", 2)])
+        assert results == [("single-1", 1), ("single-2", 2)]
+
+    def test_partial_batch_keeps_parsed_and_retries_missing(self, qtbot):
+        translator = self._make_translator()
+        with patch.object(
+                translator,
+                "_messages",
+                return_value='{"translations": {"1": "parsed"}}'), \
+                patch.object(
+                    translator,
+                    "_translate_single",
+                    side_effect=lambda text, tid: (f"single-{tid}", tid),
+                ):
+            results = translator._translate_batch([("a", 1), ("b", 2)])
+        assert results == [("parsed", 1), ("single-2", 2)]
+
+    def test_api_failure_leaves_empties_for_retry(self, qtbot):
+        translator = self._make_translator()
+        with patch.object(translator, "_messages", return_value=None):
+            results = translator._translate_batch([("a", 1), ("b", 2)])
+        assert results == [("", 1), ("", 2)]
+
 
 class TestTranslator:
-    @patch('buzz.translator.httpx.post')
-    def test_openai_chat_completions(self, mock_post, qtbot, monkeypatch):
+    @patch('buzz.translator.httpx.Client')
+    def test_openai_chat_completions(self, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv(
             "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
         )
         monkeypatch.delenv("BUZZ_TRANSLATION_API_PROTOCOL", raising=False)
 
-        mock_resp = Mock()
-        mock_resp.status_code = 200
-        mock_resp.raise_for_status.return_value = None
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": "AI Translated"}}]
-        }
-        mock_post.return_value = mock_resp
+        mock_client = Mock()
+        mock_client.post.return_value = _success_response(
+            {"choices": [{"message": {"content": "AI Translated"}}]}
+        )
+        mock_client_class.return_value = mock_client
 
         transcription_options = TranscriptionOptions(
             enable_llm_translation=False,
@@ -88,7 +181,8 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate this text:", "Hello") == "AI Translated"
-        mock_post.assert_called_once_with(
+        mock_client_class.assert_called_once_with(timeout=30.0)
+        mock_client.post.assert_called_once_with(
             "https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": "Bearer openai-key",
@@ -102,12 +196,34 @@ class TestTranslator:
                     {"role": "user", "content": "Hello"},
                 ],
             },
-            timeout=180.0,
         )
 
-    @patch('buzz.translator.httpx.post')
+    @patch('buzz.translator.httpx.Client')
+    def test_batch_request_uses_json_mode(self, mock_client_class, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+
+        mock_client = Mock()
+        mock_client.post.return_value = _success_response(
+            {"choices": [{"message": {"content": '{"translations": {}}'}}]}
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        translator._messages("Translate:", "Hello", json_mode=True)
+        request_body = mock_client.post.call_args.kwargs["json"]
+        assert request_body["response_format"] == {"type": "json_object"}
+
+    @patch('buzz.translator.httpx.Client')
     @patch('buzz.translator.queue.Queue', autospec=True)
-    def test_start(self, mock_queue, mock_post, qtbot, monkeypatch):
+    def test_start(self, mock_queue, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
 
         def side_effect(*args, **kwargs):
@@ -121,14 +237,11 @@ class TestTranslator:
         side_effect.call_count = 0
 
         mock_queue.get.side_effect = side_effect
-        mock_queue.get_nowait.side_effect = Empty
-        mock_resp = Mock()
-        mock_resp.status_code = 200
-        mock_resp.raise_for_status.return_value = None
-        mock_resp.json.return_value = {
-            "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
-        }
-        mock_post.return_value = mock_resp
+        mock_client = Mock()
+        mock_client.post.return_value = _success_response(
+            {"content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]}
+        )
+        mock_client_class.return_value = mock_client
 
         transcription_options = TranscriptionOptions(
             enable_llm_translation=False,
@@ -146,12 +259,12 @@ class TestTranslator:
         translator.start()
 
         mock_queue.get.assert_called()
-        mock_post.assert_called()
+        mock_client.post.assert_called()
 
         translator.stop()
 
-    @patch('buzz.translator.httpx.post')
-    def test_translator(self, mock_post, qtbot, monkeypatch):
+    @patch('buzz.translator.httpx.Client')
+    def test_translator(self, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
 
         self.on_next_translation_called = False
@@ -160,13 +273,11 @@ class TestTranslator:
             self.on_next_translation_called = True
             assert text.startswith("AI Translated:")
 
-        mock_resp = Mock()
-        mock_resp.status_code = 200
-        mock_resp.raise_for_status.return_value = None
-        mock_resp.json.return_value = {
-            "content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]
-        }
-        mock_post.return_value = mock_resp
+        mock_client = Mock()
+        mock_client.post.return_value = _success_response(
+            {"content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]}
+        )
+        mock_client_class.return_value = mock_client
 
         self.translation_thread = QThread()
         self.transcription_options = TranscriptionOptions(
@@ -220,17 +331,19 @@ class TestTranslator:
         # Note: translator and translation_thread will be automatically deleted
         # via the deleteLater() connections set up earlier
 
-    @patch('buzz.translator.httpx.post')
-    def test_messages_retries_until_success(self, mock_post, qtbot, monkeypatch):
+    @patch('buzz.translator.time.sleep')
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_retries_until_success(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch
+    ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
 
-        failed_resp = Mock(status_code=500)
-        success_resp = Mock(status_code=200)
-        success_resp.json.return_value = {
-            "choices": [{"message": {"content": "AI Translated"}}]
-        }
-        mock_post.side_effect = [failed_resp] * 3 + [success_resp]
+        mock_client = Mock()
+        mock_client.post.side_effect = [_failing_response(500)] * 3 + [
+            _success_response({"choices": [{"message": {"content": "AI Translated"}}]})
+        ]
+        mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
         translator = Translator(
             options,
@@ -238,13 +351,68 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") == "AI Translated"
-        assert mock_post.call_count == 4
+        assert mock_client.post.call_count == 4
 
-    @patch('buzz.translator.httpx.post')
-    def test_messages_returns_none_after_four_failures(self, mock_post, qtbot, monkeypatch):
+    @patch('buzz.translator.time.sleep')
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_retries_429_with_retry_after(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch
+    ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
-        mock_post.side_effect = [Exception("temporary failure")] * 4
+
+        mock_client = Mock()
+        mock_client.post.side_effect = [
+            _failing_response(429, retry_after="2"),
+            _success_response({"choices": [{"message": {"content": "AI Translated"}}]}),
+        ]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "AI Translated"
+        assert mock_client.post.call_count == 2
+        # delay = max(2**0, min(2, 30)) = 2.0s, slept in 0.5s slices
+        assert mock_sleep.call_count == 4
+        mock_sleep.assert_has_calls([call(0.5)] * 4)
+
+    @patch('buzz.translator.time.sleep')
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_retries_transient_network_errors(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+
+        mock_client = Mock()
+        mock_client.post.side_effect = [
+            httpx.ConnectError("connection refused"),
+            httpx.ConnectError("connection refused"),
+            _success_response({"choices": [{"message": {"content": "AI Translated"}}]}),
+        ]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "AI Translated"
+        assert mock_client.post.call_count == 3
+
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_does_not_retry_auth_error(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+
+        mock_client = Mock()
+        mock_client.post.side_effect = [_failing_response(401)]
+        mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
         translator = Translator(
             options,
@@ -252,4 +420,23 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") is None
-        assert mock_post.call_count == 4
+        assert mock_client.post.call_count == 1
+
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_does_not_retry_unexpected_errors(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+
+        mock_client = Mock()
+        mock_client.post.side_effect = [Exception("temporary failure")]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") is None
+        assert mock_client.post.call_count == 1

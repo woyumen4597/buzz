@@ -434,11 +434,25 @@ class MainWindow(QMainWindow):
     def add_task(self, task: FileTranscriptionTask):
         self.transcription_service.create_transcription(task)
         self.table_widget.refresh_all()
-        worker = self.transcriber_workers[self._next_transcriber_worker]
-        self._next_transcriber_worker = (self._next_transcriber_worker + 1) % len(
-            self.transcriber_workers
-        )
+        worker = self._pick_transcriber_worker()
         worker.add_task(task)
+
+    def _pick_transcriber_worker(self):
+        """Prefer an idle worker; otherwise the least-loaded queue.
+
+        Round-robin scanning among idle workers keeps batch dispatch fair, and
+        falls back to queue size so a long video occupying one worker doesn't
+        stall short tasks that could run on an idle sibling.
+        """
+        workers = self.transcriber_workers
+        n = len(workers)
+        for offset in range(n):
+            idx = (self._next_transcriber_worker + offset) % n
+            if not workers[idx].is_running:
+                self._next_transcriber_worker = (idx + 1) % n
+                return workers[idx]
+        # All workers busy: dispatch to the least-loaded queue.
+        return min(workers, key=lambda worker: worker.tasks_queue.qsize())
 
     def on_transcriptions_updated(self):
         self.table_widget.refresh_all()

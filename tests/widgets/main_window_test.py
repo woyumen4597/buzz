@@ -219,6 +219,8 @@ class TestMainWindow:
                 "completed",
             ):
                 setattr(worker, signal_name, Mock())
+            worker.is_running = False
+            worker.tasks_queue = Mock()
             workers.append(worker)
 
         monkeypatch.setattr(
@@ -241,6 +243,61 @@ class TestMainWindow:
         ]
         assert [args[0] for args, _ in workers[1].add_task.call_args_list] == [tasks[1]]
         assert [args[0] for args, _ in workers[2].add_task.call_args_list] == [tasks[2]]
+
+        window.close()
+
+    def test_should_dispatch_to_idle_worker_over_busy_ones(
+        self, qtbot, transcription_service, monkeypatch
+    ):
+        original_settings_value = Settings.value
+
+        def configured_settings_value(settings, key, default_value, value_type=None):
+            if key == Settings.Key.TRANSCRIPTION_CONCURRENCY:
+                return 3
+            return original_settings_value(settings, key, default_value, value_type)
+
+        monkeypatch.setattr(Settings, "value", configured_settings_value)
+
+        def make_worker():
+            worker = Mock()
+            for signal_name in (
+                "task_started",
+                "task_progress",
+                "task_download_progress",
+                "task_error",
+                "task_completed",
+                "completed",
+            ):
+                setattr(worker, signal_name, Mock())
+            worker.tasks_queue = Mock()
+            return worker
+
+        workers = [make_worker(), make_worker(), make_worker()]
+        # Workers 0 and 1 are busy; worker 2 is idle.
+        workers[0].is_running = True
+        workers[0].tasks_queue.qsize.return_value = 5
+        workers[1].is_running = True
+        workers[1].tasks_queue.qsize.return_value = 2
+        workers[2].is_running = False
+
+        monkeypatch.setattr(
+            "buzz.widgets.main_window.FileTranscriberQueueWorker",
+            Mock(side_effect=workers),
+        )
+
+        window = MainWindow(transcription_service)
+        qtbot.add_widget(window)
+        window.transcription_service.create_transcription = Mock()
+        window.table_widget.refresh_all = Mock()
+
+        window.add_task(Mock())
+        workers[2].add_task.assert_called_once()
+
+        # Now all workers busy: the task must go to the least-loaded queue.
+        workers[2].is_running = True
+        workers[2].tasks_queue.qsize.return_value = 7
+        window.add_task(Mock())
+        workers[1].add_task.assert_called_once()
 
         window.close()
 
