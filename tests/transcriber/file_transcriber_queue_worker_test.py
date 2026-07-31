@@ -322,6 +322,7 @@ class TestFileTranscriberQueueWorkerRun:
     def test_run_speech_extraction_failure_emits_error(self, simple_worker, qapp):
         task = self._make_task(extract_speech=True)
         simple_worker.tasks_queue.put(task)
+        simple_worker.tasks_queue.put(None)
 
         error_spy = unittest.mock.Mock()
         simple_worker.task_error.connect(error_spy)
@@ -335,6 +336,32 @@ class TestFileTranscriberQueueWorkerRun:
         args = error_spy.call_args[0]
         assert args[0] == task
         assert simple_worker.is_running is False
+
+    def test_run_speech_extraction_error_starts_next_task(self, simple_worker, qapp):
+        failed_task = self._make_task(extract_speech=True)
+        next_task = self._make_task(extract_speech=False)
+        simple_worker.tasks_queue.put(failed_task)
+        simple_worker.tasks_queue.put(next_task)
+
+        error_spy = unittest.mock.Mock()
+        simple_worker.task_error.connect(error_spy)
+
+        with unittest.mock.patch.object(
+            FileTranscriberQueueWorker, '_extract_speech', return_value="error"
+        ) as extract_speech, unittest.mock.patch.object(
+            FileTranscriberQueueWorker, '_create_transcriber'
+        ) as create_transcriber, unittest.mock.patch.object(
+            FileTranscriberQueueWorker, '_setup_transcriber_thread'
+        ) as setup_transcriber_thread:
+            simple_worker.run()
+            qapp.processEvents()
+
+        error_spy.assert_called_once()
+        assert error_spy.call_args[0][0] == failed_task
+        extract_speech.assert_called_once()
+        create_transcriber.assert_called_once_with()
+        setup_transcriber_thread.assert_called_once_with()
+        assert simple_worker.current.task == next_task
 
     def _run_extract_speech(self, simple_worker, messages, exitcode=0):
         """Drive _extract_speech with a scripted sequence of pipe messages."""

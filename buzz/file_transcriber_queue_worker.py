@@ -151,7 +151,7 @@ class FileTranscriberQueueWorker(QObject):
         if self.current.task.transcription_options.extract_speech:
             status = self._setup_speech_extraction()
             if status == "error":
-                self.is_running = False
+                self._on_task_finished()
                 return
 
         if not self._run_plugins():

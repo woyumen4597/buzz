@@ -10,7 +10,7 @@ from buzz.db.entity.transcription import Transcription
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.ffmpeg_video_player import _find_ffmpeg, probe_video
 from buzz.locale import _
-from buzz.transcriber.file_transcriber import write_output
+from buzz.transcriber.file_transcriber import is_video_file, write_output
 from buzz.transcriber.transcriber import (
     OutputFormat,
     Segment,
@@ -66,6 +66,8 @@ class ExportTranscriptionMenu(QMenu):
             parent=self,
         )
         self.video_burned_action.setData({"mode": MP4_BURNED, "segment_key": "translation" if has_translation else "text"})
+        is_video = is_video_file(self.transcription.file) if self.transcription.file else False
+        self.video_burned_action.setVisible(is_video)
         self.video_soft_action = QAction(
             text=f"{VIDEO_MODES[MP4_SOFT][0]} - {translation_label}"
             if has_translation
@@ -73,6 +75,7 @@ class ExportTranscriptionMenu(QMenu):
             parent=self,
         )
         self.video_soft_action.setData({"mode": MP4_SOFT, "segment_key": "translation" if has_translation else "text"})
+        self.video_soft_action.setVisible(is_video)
 
         actions = (
             self.text_actions
@@ -161,14 +164,29 @@ class ExportTranscriptionMenu(QMenu):
 
         label, ext = VIDEO_MODES[mode]
         base = os.path.splitext(os.path.basename(media_file))[0]
+        name = "translated" if segment_key == "translation" else "subtitled"
         default_path = os.path.join(
-            os.path.dirname(media_file), f"{base}.{ext}"
+            os.path.dirname(media_file), f"{base}.{name}.{ext}"
         )
         filter_str = f"{_('Video files')} (*.{ext})"
         output_file_path, _ignored = QFileDialog.getSaveFileName(
             self, _("Save File"), default_path, filter_str
         )
         if output_file_path == "":
+            return
+
+        try:
+            same_output = os.path.samefile(media_file, output_file_path)
+        except OSError:
+            same_output = (
+                os.path.normcase(os.path.realpath(media_file))
+                == os.path.normcase(os.path.realpath(output_file_path))
+            )
+        if same_output:
+            QMessageBox.critical(
+                self, _("Export Video"),
+                _("The output path must differ from the source file."),
+            )
             return
 
         segments = self._get_segments()
@@ -204,6 +222,7 @@ class ExportTranscriptionMenu(QMenu):
         proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         proc.srt_path = srt_path
         proc.output_path = output_file_path
+        proc.part_path = f"{output_file_path}.part"
         proc.duration_ms = duration_ms
         proc.dialog = prog
         prog.canceled.connect(proc.kill)
@@ -228,6 +247,9 @@ class ExportTranscriptionMenu(QMenu):
             srt_escaped = srt_path.replace(chr(92), "/" + chr(92))
             srt_filter_arg = srt_escaped
 
+        part_path = f"{output_path}.part"
+        proc.part_path = part_path
+
         if mode == MP4_BURNED:
             cmd = [
                 ffmpeg, "-y", "-i", media_file,
@@ -235,7 +257,7 @@ class ExportTranscriptionMenu(QMenu):
                 "-c:a", "copy",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
                 "-progress", "pipe:1", "-nostats",
-                output_path,
+                part_path,
             ]
         else:  # MP4_SOFT
             # ponytail: transcode video to H.264 (don't copy) so QuickTime can play it —
@@ -248,7 +270,7 @@ class ExportTranscriptionMenu(QMenu):
                 "-c:a", "copy", "-c:s", "mov_text",
                 "-metadata:s:s:0", "language=chi",
                 "-progress", "pipe:1", "-nostats",
-                output_path,
+                part_path,
             ]
         proc.start(cmd[0], cmd[1:])
 
@@ -270,21 +292,30 @@ class ExportTranscriptionMenu(QMenu):
 
     def _on_ffmpeg_finished(self, proc: QProcess, exit_code: int, _exit_status):
         self._cleanup_srt(proc.srt_path)
-        if exit_code == 0 and os.path.isfile(proc.output_path):
-            proc.dialog.close()
-            QMessageBox.information(
-                self, _("Export Video"),
-                _("Saved: {}").format(proc.output_path),
-            )
-        else:
-            proc.dialog.close()
-            QMessageBox.critical(
-                self, _("Export Video"),
-                _("ffmpeg failed (exit code {}). Check that ffmpeg is installed and the output path is writable.").format(exit_code),
-            )
+        part_path = getattr(proc, "part_path", f"{proc.output_path}.part")
+        if exit_code == 0 and os.path.isfile(part_path):
+            try:
+                os.replace(part_path, proc.output_path)
+            except OSError:
+                pass
+            else:
+                proc.dialog.close()
+                QMessageBox.information(
+                    self, _("Export Video"),
+                    _("Saved: {}").format(proc.output_path),
+                )
+                return
+
+        self._cleanup_part(part_path)
+        proc.dialog.close()
+        QMessageBox.critical(
+            self, _("Export Video"),
+            _("ffmpeg failed (exit code {}). Check that ffmpeg is installed and the output path is writable.").format(exit_code),
+        )
 
     def _on_ffmpeg_error(self, proc: QProcess, _err):
         self._cleanup_srt(proc.srt_path)
+        self._cleanup_part(getattr(proc, "part_path", f"{proc.output_path}.part"))
         proc.dialog.close()
         QMessageBox.critical(
             self, _("Export Video"),
@@ -295,6 +326,13 @@ class ExportTranscriptionMenu(QMenu):
     def _cleanup_srt(srt_path):
         try:
             os.remove(srt_path)
+        except OSError:
+            pass
+
+    @staticmethod
+    def _cleanup_part(part_path):
+        try:
+            os.remove(part_path)
         except OSError:
             pass
 

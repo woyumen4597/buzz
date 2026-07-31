@@ -51,26 +51,31 @@ class FileTranscriber(QObject):
         for segment in segments:
             segment.text = segment.text.strip()
 
+        try:
+            for (
+                output_format
+            ) in self.transcription_task.file_transcription_options.output_formats:
+                default_path = get_output_file_path(
+                    file_path=self.transcription_task.file_path,
+                    output_format=output_format,
+                    language=self.transcription_task.transcription_options.language,
+                    output_directory=self.transcription_task.output_directory,
+                    model=self.transcription_task.transcription_options.model,
+                    task=self.transcription_task.transcription_options.task,
+                )
+
+                write_output(
+                    path=default_path, segments=segments, output_format=output_format
+                )
+
+            if self.transcription_task.source == FileTranscriptionTask.Source.FOLDER_WATCH:
+                self._handle_folder_watch()
+        except Exception as exc:
+            logging.exception("")
+            self.error.emit(str(exc))
+            return
+
         self.completed.emit(segments)
-
-        for (
-            output_format
-        ) in self.transcription_task.file_transcription_options.output_formats:
-            default_path = get_output_file_path(
-                file_path=self.transcription_task.file_path,
-                output_format=output_format,
-                language=self.transcription_task.transcription_options.language,
-                output_directory=self.transcription_task.output_directory,
-                model=self.transcription_task.transcription_options.model,
-                task=self.transcription_task.transcription_options.task,
-            )
-
-            write_output(
-                path=default_path, segments=segments, output_format=output_format
-            )
-
-        if self.transcription_task.source == FileTranscriptionTask.Source.FOLDER_WATCH:
-            self._handle_folder_watch()
 
     def _download_from_url(self) -> bool:
         cookiefile = os.getenv("BUZZ_DOWNLOAD_COOKIEFILE")
@@ -195,36 +200,46 @@ def write_output(
         len(segments),
     )
 
-    with open(os.fsencode(path), "w", encoding="utf-8") as file:
-        if output_format == OutputFormat.TXT:
-            combined_text = ""
-            previous_end_time = None
+    temp_path = f"{path}.part"
+    try:
+        with open(os.fsencode(temp_path), "w", encoding="utf-8") as file:
+            if output_format == OutputFormat.TXT:
+                combined_text = ""
+                previous_end_time = None
 
-            paragraph_split_time = int(os.getenv("BUZZ_PARAGRAPH_SPLIT_TIME", "2000"))
-            
-            for segment in segments:
-                if previous_end_time is not None and (segment.start - previous_end_time) >= paragraph_split_time:
-                    combined_text += "\n\n"
-                combined_text += getattr(segment, segment_key).strip() + " "
-                previous_end_time = segment.end
+                paragraph_split_time = int(os.getenv("BUZZ_PARAGRAPH_SPLIT_TIME", "2000"))
 
-            file.write(combined_text)
+                for segment in segments:
+                    if previous_end_time is not None and (segment.start - previous_end_time) >= paragraph_split_time:
+                        combined_text += "\n\n"
+                    combined_text += getattr(segment, segment_key).strip() + " "
+                    previous_end_time = segment.end
 
-        elif output_format == OutputFormat.VTT:
-            file.write("WEBVTT\n\n")
-            for segment in segments:
-                file.write(
-                    f"{to_timestamp(segment.start)} --> {to_timestamp(segment.end)}\n"
-                )
-                file.write(f"{getattr(segment, segment_key)}\n\n")
+                file.write(combined_text)
 
-        elif output_format == OutputFormat.SRT:
-            for i, segment in enumerate(segments):
-                file.write(f"{i + 1}\n")
-                file.write(
-                    f'{to_timestamp(segment.start, ms_separator=",")} --> {to_timestamp(segment.end, ms_separator=",")}\n'
-                )
-                file.write(f"{getattr(segment, segment_key)}\n\n")
+            elif output_format == OutputFormat.VTT:
+                file.write("WEBVTT\n\n")
+                for segment in segments:
+                    file.write(
+                        f"{to_timestamp(segment.start)} --> {to_timestamp(segment.end)}\n"
+                    )
+                    file.write(f"{getattr(segment, segment_key)}\n\n")
+
+            elif output_format == OutputFormat.SRT:
+                for i, segment in enumerate(segments):
+                    file.write(f"{i + 1}\n")
+                    file.write(
+                        f'{to_timestamp(segment.start, ms_separator=",")} --> {to_timestamp(segment.end, ms_separator=",")}\n'
+                    )
+                    file.write(f"{getattr(segment, segment_key)}\n\n")
+
+        os.replace(temp_path, path)
+    except Exception:
+        try:
+            os.remove(temp_path)
+        except OSError:
+            pass
+        raise
 
     logging.debug("Written transcription output")
 
