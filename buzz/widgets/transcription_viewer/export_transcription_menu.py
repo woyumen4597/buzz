@@ -40,6 +40,48 @@ _COPY_VIDEO_CODECS = {"h264", "avc1", "hevc", "h265"}
 _COPY_AUDIO_CODECS = {"aac", "mp3", "ac3", "alac", "opus"}
 
 
+class TranslateExportMenu(QMenu):
+    """Dropdown for the "Translate & Export" button. Each option picks a
+    subtitle format (SRT/TXT/VTT, original or translation) or an MP4 mode and
+    hands it back to the viewer, which runs translation first when needed."""
+
+    option_selected = pyqtSignal(str, str)  # (format value or MP4 mode, segment_key)
+
+    def __init__(self, has_translation: bool, parent: QWidget | None = None):
+        super().__init__(parent)
+
+        for output_format in OutputFormat:
+            self._add_action(
+                f"{output_format.value.upper()} - {_('Translation')}",
+                output_format.value,
+                "translation",
+            )
+        for output_format in OutputFormat:
+            self._add_action(
+                f"{output_format.value.upper()} - {_('Text')}",
+                output_format.value,
+                "text",
+            )
+        for mode, (label, _ext) in VIDEO_MODES.items():
+            segment_key = "translation" if has_translation else "text"
+            self._add_action(
+                f"{label} - {_('Translation') if has_translation else _('Text')}",
+                mode,
+                segment_key,
+            )
+        self.triggered.connect(self._on_triggered)
+
+    def _add_action(self, text: str, format_or_mode: str, segment_key: str):
+        action = QAction(text, self)
+        action.setData({"format_or_mode": format_or_mode, "segment_key": segment_key})
+        self.addAction(action)
+
+    def _on_triggered(self, action: QAction):
+        data = action.data()
+        if isinstance(data, dict):
+            self.option_selected.emit(data["format_or_mode"], data["segment_key"])
+
+
 class ExportTranscriptionMenu(QMenu):
     def __init__(
         self,

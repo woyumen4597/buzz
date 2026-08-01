@@ -23,7 +23,8 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
-    QSplitter
+    QSplitter,
+    QFileDialog,
 )
 
 from buzz.locale import _
@@ -34,7 +35,7 @@ from buzz.settings.shortcuts import Shortcuts
 from buzz.settings.shortcut import Shortcut
 from buzz.settings.settings import Settings
 from buzz.store.keyring_store import get_password, Key
-from buzz.transcriber.file_transcriber import is_video_file
+from buzz.transcriber.file_transcriber import is_video_file, write_output
 from buzz.widgets.audio_player import AudioPlayer
 from buzz.widgets.video_player import VideoPlayer
 from buzz.widgets.icon import (
@@ -48,10 +49,16 @@ from buzz.widgets.icon import (
 from buzz.translator import Translator
 from buzz.widgets.text_display_box import TextDisplayBox
 from buzz.widgets.toolbar import ToolBar
-from buzz.transcriber.transcriber import TranscriptionOptions, Segment
+from buzz.transcriber.transcriber import (
+    TranscriptionOptions,
+    Segment,
+    OutputFormat,
+)
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 from buzz.widgets.transcription_viewer.export_transcription_menu import (
     ExportTranscriptionMenu,
+    TranslateExportMenu,
+    VIDEO_MODES,
 )
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
     FileTranscriptionPreferences,
@@ -103,6 +110,7 @@ class TranscriptionViewerWidget(QWidget):
         self._translation_total = 0
         self._translation_done = 0
         self._translation_failed = 0
+        self._translate_export_pending = None
 
         self._init_search_debounce()
         self._load_segments_and_settings()
@@ -264,6 +272,7 @@ class TranscriptionViewerWidget(QWidget):
             self.translator.translation,
             self
         )
+        self.export_menu = export_transcription_menu
         export_tool_button.setMenu(export_transcription_menu)
         export_tool_button.setPopupMode(
             QToolButton.ToolButtonPopupMode.MenuButtonPopup)
@@ -279,6 +288,29 @@ class TranscriptionViewerWidget(QWidget):
         translate_button.clicked.connect(self.on_translate_button_clicked)
         toolbar.addWidget(translate_button)
         self.translate_button = translate_button
+
+        translate_export_button = QToolButton()
+        translate_export_button.setText(_("Translate & Export"))
+        translate_export_button.setIcon(FileDownloadIcon(self))
+        translate_export_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        translate_export_button.setMinimumWidth(170)
+        translate_export_menu = TranslateExportMenu(
+            self.has_translations, self
+        )
+        translate_export_menu.option_selected.connect(
+            self.start_translate_export
+        )
+        translate_export_button.setMenu(translate_export_menu)
+        translate_export_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.MenuButtonPopup
+        )
+        translate_export_button.clicked.connect(
+            self.on_translate_export_button_clicked
+        )
+        toolbar.addWidget(translate_export_button)
+        self.translate_export_button = translate_export_button
 
         self.translation_progress_label = QLabel("")
         self.translation_progress_label.setStyleSheet("color: #666;")
@@ -1375,11 +1407,119 @@ class TranscriptionViewerWidget(QWidget):
     def cancel_translation(self):
         self.translator.cancel()
         self._translation_active = False
+        self._translate_export_pending = None
         self.translate_button.setText(_("Translate"))
         self.translation_progress_label.setText(
             _("Translation canceled, {0} segments left for retry").format(
                 self._translation_total - self._translation_done
             )
+        )
+
+    def on_translate_export_button_clicked(self):
+        format_value = self.settings.value(
+            Settings.Key.TRANSLATE_EXPORT_FORMAT, OutputFormat.SRT.value
+        )
+        self.start_translate_export(format_value, "translation")
+
+    def start_translate_export(self, format_or_mode: str, segment_key: str):
+        """Run the translate-then-export closed loop for the chosen output."""
+        if segment_key == "text":
+            self._run_export(format_or_mode, segment_key)
+            return
+        if self._translation_active:
+            self._translate_export_pending = (format_or_mode, segment_key)
+            QMessageBox.information(
+                self, _("Translate & Export"),
+                _("Translation is in progress; the export will run when it "
+                  "finishes."),
+            )
+            return
+        self._translate_export_pending = (format_or_mode, segment_key)
+        segments = self.table_widget.segments()
+        missing = [
+            segment for segment in segments
+            if not (segment.value("translation") or "").strip()
+        ]
+        if missing:
+            self.on_translate_button_clicked()
+        else:
+            self._translate_export_pending = None
+            self._run_export(format_or_mode, segment_key)
+
+    def _complete_translate_export(self, format_or_mode: str, segment_key: str):
+        if self._translation_failed:
+            answer = QMessageBox.question(
+                self, _("Translate & Export"),
+                _("{0} of {1} segments failed to translate. "
+                  "Export the successful ones?").format(
+                    self._translation_failed, self._translation_total
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._run_export(format_or_mode, segment_key)
+
+    def _run_export(self, format_or_mode: str, segment_key: str):
+        if format_or_mode in VIDEO_MODES:
+            self.settings.set_value(
+                Settings.Key.TRANSLATE_EXPORT_FORMAT, format_or_mode
+            )
+            self.export_menu._export_video(format_or_mode, segment_key)
+            return
+
+        output_format = OutputFormat(format_or_mode)
+        self.table_widget.flush_translations()
+        segments = [
+            Segment(
+                start=segment.start_time,
+                end=segment.end_time,
+                text=segment.text,
+                translation=segment.translation)
+            for segment in self.transcription_service.get_transcription_segments(
+                transcription_id=self.transcription.id_as_uuid
+            )
+        ]
+        directory = self.settings.value(
+            Settings.Key.TRANSLATE_EXPORT_DIRECTORY, ""
+        ) or (os.path.dirname(self.transcription.file)
+              if self.transcription.file else "")
+        variant = "translated" if segment_key == "translation" else ""
+        default_path = self.transcription.get_output_file_path(
+            output_format, directory, variant=variant
+        )
+        output_file_path, _nil = QFileDialog.getSaveFileName(
+            self,
+            _("Save File"),
+            default_path,
+            _("Text files") + f" (*.{output_format.value})",
+        )
+        if output_file_path == "":
+            return
+        try:
+            write_output(
+                path=output_file_path,
+                segments=segments,
+                output_format=output_format,
+                segment_key=segment_key,
+            )
+        except Exception as exc:
+            logging.exception("Failed to write %s export", output_format.value)
+            QMessageBox.critical(
+                self, _("Export"),
+                _("Failed to write {}: {}").format(output_file_path, exc),
+            )
+            return
+        self.settings.set_value(
+            Settings.Key.TRANSLATE_EXPORT_FORMAT, output_format.value
+        )
+        self.settings.set_value(
+            Settings.Key.TRANSLATE_EXPORT_DIRECTORY,
+            os.path.dirname(output_file_path),
+        )
+        QMessageBox.information(
+            self, _("Export"), _("Saved: {}").format(output_file_path)
         )
 
     def _on_translation_success(self, _translation: str, _segment_id: int):
@@ -1415,6 +1555,10 @@ class TranscriptionViewerWidget(QWidget):
                 )
             else:
                 self.translation_progress_label.setText("")
+            pending = self._translate_export_pending
+            self._translate_export_pending = None
+            if pending is not None:
+                self._complete_translate_export(*pending)
 
     def on_resize_button_clicked(self):
         from buzz.widgets.transcription_viewer.transcription_resizer_widget import (

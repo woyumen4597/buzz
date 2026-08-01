@@ -5,13 +5,19 @@ from unittest.mock import MagicMock, patch
 import pytest
 from pytestqt.qtbot import QtBot
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QFrame
+from PyQt6.QtWidgets import QFrame, QMessageBox
 
 from buzz.locale import _
 from buzz.db.entity.transcription import Transcription
 from buzz.db.entity.transcription_segment import TranscriptionSegment
 from buzz.model_loader import ModelType, WhisperModelSize
+from buzz.settings.settings import Settings
 from buzz.transcriber.transcriber import Task
+from buzz.widgets.transcription_viewer.export_transcription_menu import (
+    MP4_BURNED,
+    MP4_SOFT,
+    TranslateExportMenu,
+)
 from buzz.widgets.transcription_viewer.transcription_view_mode_tool_button import (
     TranscriptionViewModeToolButton,
     ViewMode
@@ -1448,3 +1454,213 @@ class TestTranscriptionViewerWidget:
         assert menu_bar is not None
 
         widget.close()
+
+
+class TestTranslateAndExport:
+    @pytest.fixture()
+    def transcription(
+            self, transcription_dao, transcription_segment_dao
+    ) -> Transcription:
+        id = uuid.uuid4()
+        transcription_dao.insert(
+            Transcription(
+                id=str(id),
+                status="completed",
+                file=test_audio_path,
+                task=Task.TRANSCRIBE.value,
+                model_type=ModelType.WHISPER.value,
+                whisper_model_size=WhisperModelSize.TINY.value,
+            )
+        )
+        transcription_segment_dao.insert(TranscriptionSegment(40, 299, "Bien", "", str(id)))
+        transcription_segment_dao.insert(
+            TranscriptionSegment(299, 329, "venue dans", "", str(id))
+        )
+
+        return transcription_dao.find_by_id(str(id))
+
+    def _transcription_with_translations(
+        self, transcription_dao, transcription_segment_dao
+    ):
+        id = uuid.uuid4()
+        transcription_dao.insert(
+            Transcription(
+                id=str(id),
+                status="completed",
+                file=test_audio_path,
+                task=Task.TRANSCRIBE.value,
+                model_type=ModelType.WHISPER.value,
+                whisper_model_size=WhisperModelSize.TINY.value,
+            )
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(40, 299, "Bien", "Bueno", str(id))
+        )
+        transcription_segment_dao.insert(
+            TranscriptionSegment(299, 329, "venue dans", "venido en", str(id))
+        )
+        return transcription_dao.find_by_id(str(id))
+
+    def test_exports_translation_when_all_segments_translated(
+        self,
+        qtbot: QtBot,
+        transcription_dao,
+        transcription_segment_dao,
+        transcription_service,
+        shortcuts,
+        mocker,
+        tmp_path,
+    ):
+        transcription = self._transcription_with_translations(
+            transcription_dao, transcription_segment_dao
+        )
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        output_file = tmp_path / "out.srt"
+        mocker.patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(output_file), ""),
+        )
+        information = mocker.patch(
+            "PyQt6.QtWidgets.QMessageBox.information"
+        )
+
+        widget.start_translate_export("srt", "translation")
+
+        content = output_file.read_text(encoding="utf-8")
+        assert "Bueno" in content
+        assert "venido en" in content
+        assert "Bien" not in content
+        information.assert_called_once()
+        assert (
+            widget.settings.value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+            == "srt"
+        )
+        assert (
+            widget.settings.value(Settings.Key.TRANSLATE_EXPORT_DIRECTORY, "")
+            == str(tmp_path)
+        )
+
+        widget.settings.set_value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+        widget.settings.set_value(Settings.Key.TRANSLATE_EXPORT_DIRECTORY, "")
+        widget.close()
+
+    def test_exports_text_variant_without_translation(
+        self,
+        qtbot: QtBot,
+        transcription,
+        transcription_service,
+        shortcuts,
+        mocker,
+        tmp_path,
+    ):
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        output_file = tmp_path / "out.txt"
+        mocker.patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(output_file), ""),
+        )
+        mocker.patch("PyQt6.QtWidgets.QMessageBox.information")
+
+        widget.start_translate_export("txt", "text")
+
+        content = output_file.read_text(encoding="utf-8")
+        assert "Bien" in content
+        assert "venue dans" in content
+        widget.close()
+
+    def test_queues_translation_when_segments_missing(
+        self, qtbot: QtBot, transcription, transcription_service, shortcuts, mocker
+    ):
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        mocker.patch.object(widget, "on_translate_button_clicked")
+
+        widget.start_translate_export("srt", "translation")
+
+        widget.on_translate_button_clicked.assert_called_once()
+        assert widget._translate_export_pending == ("srt", "translation")
+        widget.close()
+
+    def test_partial_failure_requires_confirmation(
+        self, qtbot: QtBot, transcription, transcription_service, shortcuts, mocker
+    ):
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget._translation_total = 2
+        widget._translation_done = 2
+        widget._translation_failed = 1
+        run_export = mocker.patch.object(widget, "_run_export")
+        question = mocker.patch(
+            "PyQt6.QtWidgets.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        )
+
+        widget._complete_translate_export("srt", "translation")
+
+        run_export.assert_called_once_with("srt", "translation")
+
+        question.return_value = QMessageBox.StandardButton.No
+        run_export.reset_mock()
+        widget._complete_translate_export("srt", "translation")
+        run_export.assert_not_called()
+        widget.close()
+
+    def test_mp4_delegates_to_export_menu(
+        self, qtbot: QtBot, transcription, transcription_service, shortcuts, mocker
+    ):
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        export_video = mocker.patch.object(widget.export_menu, "_export_video")
+
+        widget._run_export(MP4_SOFT, "translation")
+
+        export_video.assert_called_once_with(MP4_SOFT, "translation")
+        assert (
+            widget.settings.value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+            == MP4_SOFT
+        )
+        widget.settings.set_value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+        widget.close()
+
+    def test_menu_offers_formats_and_emits_selection(self, qtbot: QtBot):
+        menu = TranslateExportMenu(has_translation=True)
+        qtbot.add_widget(menu)
+        selected = []
+        menu.option_selected.connect(
+            lambda fmt, key: selected.append((fmt, key))
+        )
+
+        assert len(menu.actions()) == 8
+        menu.actions()[0].trigger()
+        menu.actions()[6].trigger()
+        menu.actions()[7].trigger()
+
+        assert selected == [
+            ("txt", "translation"),
+            (MP4_BURNED, "translation"),
+            (MP4_SOFT, "translation"),
+        ]
+
+    def test_menu_mp4_uses_text_when_no_translation(self, qtbot: QtBot):
+        menu = TranslateExportMenu(has_translation=False)
+        qtbot.add_widget(menu)
+        selected = []
+        menu.option_selected.connect(
+            lambda fmt, key: selected.append((fmt, key))
+        )
+
+        menu.actions()[7].trigger()
+
+        assert selected == [(MP4_SOFT, "text")]

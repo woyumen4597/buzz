@@ -397,6 +397,10 @@ class TranscriptionSegmentsEditorWidget(QTableView):
             row = rows.get(segment_id)
         return row if row is not None else -1
 
+    def flush_translations(self):
+        """Persist any pending translation cells to the database now."""
+        self._flush_translations()
+
     def _flush_translations(self):
         self._flush_timer.stop()
         if not self._pending_translations:

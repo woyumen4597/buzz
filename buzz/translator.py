@@ -80,7 +80,7 @@ class Translator(QObject):
     def __init__(
         self,
         transcription_options: TranscriptionOptions,
-        advanced_settings_dialog: AdvancedSettingsDialog,
+        advanced_settings_dialog: Optional[AdvancedSettingsDialog] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
@@ -89,9 +89,10 @@ class Translator(QObject):
 
         self.transcription_options = transcription_options
         self.advanced_settings_dialog = advanced_settings_dialog
-        self.advanced_settings_dialog.transcription_options_changed.connect(
-            self.on_transcription_options_changed
-        )
+        if advanced_settings_dialog is not None:
+            advanced_settings_dialog.transcription_options_changed.connect(
+                self.on_transcription_options_changed
+            )
 
         self.queue = queue.Queue()
         self._client_instance: Optional[httpx.Client] = None
@@ -375,6 +376,17 @@ class Translator(QObject):
         if current:
             batches.append(current)
         return batches
+
+    def translate_items_sync(
+        self, items: List[Tuple[str, int]]
+    ) -> List[Tuple[str, int]]:
+        """Translate all items now, without the queue/worker thread (used by
+        CLI automation). Returns (translation, id) pairs in input order;
+        failures come back as empty strings."""
+        results: List[Tuple[str, int]] = []
+        for sub_batch in self._split_batches(items):
+            results.extend(self._translate_batch(sub_batch))
+        return results
 
     def start(self):
         logging.debug("Starting translation queue")

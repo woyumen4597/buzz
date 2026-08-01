@@ -1,4 +1,5 @@
 import enum
+import os
 import sys
 import typing
 import urllib.parse
@@ -11,6 +12,7 @@ from buzz.model_loader import (
     TranscriptionModel,
     ModelDownloader,
 )
+from buzz.settings.settings import Settings
 from buzz.store.keyring_store import get_password, Key
 from buzz.transcriber.transcriber import (
     Task,
@@ -96,9 +98,19 @@ def _add_command_options(parser: QCommandLineParser):
     output_directory_option = QCommandLineOption(
         ["d", "output-directory"], "Output directory", "directory"
     )
-    srt_option = QCommandLineOption(["srt"], "Output result in an SRT file.")
+    srt_option = QCommandLineOption(
+        ["srt"],
+        "Output result in an SRT file. Default when no output format is given.",
+    )
     vtt_option = QCommandLineOption(["vtt"], "Output result in a VTT file.")
     txt_option = QCommandLineOption("txt", "Output result in a TXT file.")
+    translate_option = QCommandLineOption(
+        ["translate"],
+        "Export the LLM translation instead of the original text. Requires the "
+        "API key, model and prompt (env BUZZ_TRANSLATION_API_KEY / "
+        "BUZZ_TRANSLATION_API_MODEL / BUZZ_TRANSLATION_API_PROMPT, or the "
+        "translation settings saved in the app).",
+    )
     hide_gui_option = QCommandLineOption("hide-gui", "Hide the main application window.")
 
     parser.addOptions(
@@ -116,6 +128,7 @@ def _add_command_options(parser: QCommandLineParser):
             srt_option,
             vtt_option,
             txt_option,
+            translate_option,
             hide_gui_option,
         ]
     )
@@ -134,6 +147,7 @@ def _add_command_options(parser: QCommandLineParser):
         "srt": srt_option,
         "vtt": vtt_option,
         "txt": txt_option,
+        "translate": translate_option,
         "hide_gui": hide_gui_option,
     }
 
@@ -166,6 +180,7 @@ def _add_transcription_tasks(
     transcription_options: TranscriptionOptions,
     output_formats: typing.Set[OutputFormat],
     output_directory: str = "",
+    translate: bool = False,
 ):
     for file_path in file_paths:
         path_is_url = is_url(file_path)
@@ -173,6 +188,7 @@ def _add_transcription_tasks(
             file_paths=[file_path] if not path_is_url else None,
             url=file_path if path_is_url else None,
             output_formats=output_formats,
+            translate=translate,
         )
         transcription_task = FileTranscriptionTask(
             file_path=file_path if not path_is_url else None,
@@ -196,12 +212,53 @@ def _process_add_output_formats(parser, opts) -> typing.Set[OutputFormat]:
         output_formats.add(OutputFormat.VTT)
     if parser.isSet(opts["txt"]):
         output_formats.add(OutputFormat.TXT)
+    if not output_formats:
+        # A CLI run must never succeed without producing any artifact.
+        output_formats.add(OutputFormat.SRT)
     return output_formats
+
+
+def _resolve_translation_settings() -> typing.Tuple[str, str, str]:
+    """Return (api_key, model, prompt) for CLI translation, or raise a
+    CommandLineError with the exact setting that is missing."""
+    api_key = os.getenv("BUZZ_TRANSLATION_API_KEY") or get_password(
+        Key.OPENAI_API_KEY
+    )
+    if not api_key:
+        raise CommandLineError(
+            "--translate requires an API key: set BUZZ_TRANSLATION_API_KEY or "
+            "save the OpenAI key in the app"
+        )
+    settings = Settings()
+    model = (
+        os.getenv("BUZZ_TRANSLATION_API_MODEL")
+        or settings.value(Settings.Key.FILE_TRANSCRIBER_LLM_MODEL, "")
+        or settings.value(Settings.Key.OPENAI_API_MODEL, "")
+    )
+    if not model:
+        raise CommandLineError(
+            "--translate requires a translation model: set "
+            "BUZZ_TRANSLATION_API_MODEL or set it in the app preferences"
+        )
+    prompt = os.getenv("BUZZ_TRANSLATION_API_PROMPT") or settings.value(
+        Settings.Key.FILE_TRANSCRIBER_LLM_PROMPT, ""
+    )
+    if not prompt:
+        raise CommandLineError(
+            "--translate requires a translation prompt: set "
+            "BUZZ_TRANSLATION_API_PROMPT or set it in the app preferences"
+        )
+    return api_key, model, prompt
 
 
 def _handle_add_command(app: Application, parser: QCommandLineParser):
     parser.clearPositionalArguments()
     parser.addPositionalArgument("files", "Input file paths", "[file file file...]")
+
+    parser.setApplicationDescription(
+        "Transcribe audio/video files with Whisper models.\n"
+        "MP4 subtitle export (burned/soft) is only available in the GUI."
+    )
 
     opts = _add_command_options(parser)
     parser.addHelpOption()
@@ -228,6 +285,9 @@ def _handle_add_command(app: Application, parser: QCommandLineParser):
 
     output_formats = _process_add_output_formats(parser, opts)
 
+    translate = parser.isSet(opts["translate"])
+    translation_settings = _resolve_translation_settings() if translate else None
+
     openai_access_token = parser.value(opts["openai_token"])
     if model.model_type == ModelType.OPEN_AI_WHISPER_API and openai_access_token == "":
         openai_access_token = get_password(key=Key.OPENAI_API_KEY)
@@ -243,6 +303,11 @@ def _handle_add_command(app: Application, parser: QCommandLineParser):
         extract_speech=parser.isSet(opts["extract_speech"]),
         openai_access_token=openai_access_token,
     )
+    if translation_settings is not None:
+        _api_key, model_name, prompt = translation_settings
+        transcription_options.enable_llm_translation = True
+        transcription_options.llm_model = model_name
+        transcription_options.llm_prompt = prompt
 
     _add_transcription_tasks(
         app,
@@ -251,6 +316,7 @@ def _handle_add_command(app: Application, parser: QCommandLineParser):
         transcription_options,
         output_formats,
         parser.value(opts["output_directory"]),
+        translate,
     )
 
     if parser.isSet(opts["hide_gui"]):

@@ -45,6 +45,7 @@ class Transcription(Entity):
         self,
         output_format: OutputFormat,
         output_directory: str | None = None,
+        variant: str = "",
     ):
         input_file_name = os.path.splitext(os.path.basename(self.file))[0]
 
@@ -59,6 +60,7 @@ class Transcription(Entity):
             .replace("{{ model_type }}", self.model_type)
             .replace("{{ model_size }}", self.whisper_model_size or "")
             .replace("{{ date_time }}", date_time_now)
+            + (f".{variant}" if variant else "")
             + f".{output_format.value}"
         )
 

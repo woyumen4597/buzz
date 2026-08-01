@@ -86,6 +86,9 @@ class Settings:
         MAIN_WINDOW = "main-window"
         TRANSCRIPTION_VIEWER = "transcription-viewer"
 
+        TRANSLATE_EXPORT_FORMAT = "transcription-viewer/translate-export-format"
+        TRANSLATE_EXPORT_DIRECTORY = "transcription-viewer/translate-export-directory"
+
         AUDIO_PLAYBACK_RATE = "audio/playback-rate"
 
         FORCE_CPU = "force-cpu"

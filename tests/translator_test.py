@@ -113,6 +113,52 @@ class TestSplitBatches:
         assert batches == [[items[0]]]
 
 
+class TestTranslateItemsSync:
+    def test_returns_results_in_input_order(self, qtbot):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+
+        with patch.object(
+            translator,
+            "_translate_batch",
+            side_effect=lambda batch: [(f"t-{tid}", tid) for _, tid in batch],
+        ):
+            results = translator.translate_items_sync(
+                [("a", 1), ("b", 2), ("c", 3)]
+            )
+
+        assert results == [("t-1", 1), ("t-2", 2), ("t-3", 3)]
+
+    def test_failures_come_back_empty_for_retry(self, qtbot):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+
+        with patch.object(
+            translator,
+            "_translate_batch",
+            return_value=[("ok", 1), ("", 2)],
+        ):
+            results = translator.translate_items_sync([("a", 1), ("b", 2)])
+
+        assert results == [("ok", 1), ("", 2)]
+
+    def test_splits_oversized_items_into_multiple_batches(self, qtbot):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        batches = []
+        with patch.object(
+            translator,
+            "_translate_batch",
+            side_effect=lambda batch: (batches.append(batch) or
+                                       [(f"t-{tid}", tid) for _, tid in batch]),
+        ):
+            translator.translate_items_sync(
+                [("a" * 1500, 1), ("b" * 1500, 2), ("c" * 100, 3)]
+            )
+
+        assert len(batches) == 2
+
+
 class TestBatchRecovery:
     def _make_translator(self):
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")

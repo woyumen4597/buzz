@@ -126,7 +126,7 @@ def test_completed_emits_after_output_and_folder_watch(
     output_file_path = tmp_path / "whisper.txt"
     task = SimpleNamespace(
         source=FileTranscriptionTask.Source.FOLDER_WATCH,
-        file_transcription_options=SimpleNamespace(output_formats=[OutputFormat.TXT]),
+        file_transcription_options=SimpleNamespace(output_formats=[OutputFormat.TXT], translate=False),
         transcription_options=SimpleNamespace(model=None, language=None, task=None),
         file_path=str(tmp_path / "input.wav"),
         output_directory=str(tmp_path),
@@ -156,7 +156,7 @@ def test_output_failure_emits_error_without_completed(
 ):
     task = SimpleNamespace(
         source=FileTranscriptionTask.Source.FILE_IMPORT,
-        file_transcription_options=SimpleNamespace(output_formats=[OutputFormat.TXT]),
+        file_transcription_options=SimpleNamespace(output_formats=[OutputFormat.TXT], translate=False),
         transcription_options=SimpleNamespace(model=None, language=None, task=None),
         file_path=str(tmp_path / "input.wav"),
         output_directory=str(tmp_path),

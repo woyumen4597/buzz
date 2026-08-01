@@ -170,6 +170,7 @@ class FileTranscriptionOptions:
     file_paths: Optional[List[str]] = None
     url: Optional[str] = None
     output_formats: Set["OutputFormat"] = field(default_factory=set)
+    translate: bool = False
 
 
 @dataclass_json
@@ -238,6 +239,7 @@ def get_output_file_path(
     output_format: OutputFormat,
     output_directory: str | None = None,
     export_file_name_template: str | None = None,
+    variant: str = "",
 ):
     input_file_name = os.path.splitext(os.path.basename(file_path))[0]
     # Remove "_speech" suffix from extracted speech files
@@ -263,6 +265,7 @@ def get_output_file_path(
             else "",
         )
         .replace("{{ date_time }}", date_time_now)
+        + (f".{variant}" if variant else "")
         + f".{output_format.value}"
     )
 

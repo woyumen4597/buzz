@@ -20,6 +20,7 @@ from buzz.transcriber.transcriber import (
     Segment,
     OutputFormat,
 )
+from buzz.translator import Translator
 
 app_env = os.environ.copy()
 app_env['PATH'] = os.pathsep.join([os.path.join(APP_BASE_DIR, "_internal")] + [app_env['PATH']])
@@ -53,6 +54,18 @@ class FileTranscriber(QObject):
             segment.text = segment.text.strip()
 
         try:
+            segment_key = "text"
+            if self.transcription_task.file_transcription_options.translate:
+                translator = Translator(
+                    self.transcription_task.transcription_options
+                )
+                results = translator.translate_items_sync(
+                    [(segment.text, i) for i, segment in enumerate(segments)]
+                )
+                for index, (translation, _tid) in enumerate(results):
+                    segments[index].translation = translation
+                segment_key = "translation"
+
             for (
                 output_format
             ) in self.transcription_task.file_transcription_options.output_formats:
@@ -63,10 +76,16 @@ class FileTranscriber(QObject):
                     output_directory=self.transcription_task.output_directory,
                     model=self.transcription_task.transcription_options.model,
                     task=self.transcription_task.transcription_options.task,
+                    variant="translated"
+                    if segment_key == "translation"
+                    else "",
                 )
 
                 write_output(
-                    path=default_path, segments=segments, output_format=output_format
+                    path=default_path,
+                    segments=segments,
+                    output_format=output_format,
+                    segment_key=segment_key,
                 )
 
             if self.transcription_task.source == FileTranscriptionTask.Source.FOLDER_WATCH:
