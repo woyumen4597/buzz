@@ -1,3 +1,4 @@
+import threading
 import time
 from unittest.mock import Mock, call, patch
 
@@ -157,6 +158,36 @@ class TestTranslateItemsSync:
             )
 
         assert len(batches) == 2
+
+    def test_runs_two_batches_concurrently_and_preserves_order(self, qtbot):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        barrier = threading.Barrier(2, timeout=2)
+        lock = threading.Lock()
+        state = {"active": 0, "max_active": 0, "broken": False, "sizes": []}
+
+        def translate(batch):
+            with lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+                state["sizes"].append(len(batch))
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                state["broken"] = True
+            finally:
+                with lock:
+                    state["active"] -= 1
+            return [(f"t-{tid}", tid) for _, tid in batch]
+
+        items = [("text", tid) for tid in range(40)]
+        with patch.object(translator, "_translate_batch", side_effect=translate):
+            results = translator.translate_items_sync(items)
+
+        assert state["broken"] is False
+        assert state["max_active"] == 2
+        assert sorted(state["sizes"]) == [20, 20]
+        assert [tid for _, tid in results] == list(range(40))
 
 
 class TestBatchRecovery:

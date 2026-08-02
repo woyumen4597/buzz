@@ -5,6 +5,7 @@ import logging
 import queue
 import time
 from urllib.parse import urlparse
+from concurrent.futures import ThreadPoolExecutor
 
 from typing import Optional, List, Tuple
 import httpx
@@ -18,8 +19,9 @@ from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDi
 
 # Max items per batch and max combined chars per batch. The char budget keeps
 # the prompt and the expected translation output within max_tokens.
-BATCH_SIZE = 10
+BATCH_SIZE = 20
 MAX_BATCH_CHARS = 3000
+MAX_CONCURRENT_REQUESTS = 2
 # After the first item arrives, wait briefly for more items so a burst of
 # enqueues becomes a few deterministic batch requests instead of racing
 # get_nowait() into per-item requests.
@@ -367,7 +369,10 @@ class Translator(QObject):
         current_chars = 0
         for item in items:
             chars = len(item[0])
-            if current and current_chars + chars > MAX_BATCH_CHARS:
+            if current and (
+                len(current) >= BATCH_SIZE
+                or current_chars + chars > MAX_BATCH_CHARS
+            ):
                 batches.append(current)
                 current = []
                 current_chars = 0
@@ -380,79 +385,141 @@ class Translator(QObject):
     def translate_items_sync(
         self, items: List[Tuple[str, int]]
     ) -> List[Tuple[str, int]]:
-        """Translate all items now, without the queue/worker thread (used by
-        CLI automation). Returns (translation, id) pairs in input order;
-        failures come back as empty strings."""
+        """Translate items concurrently while returning results in input order."""
+        results: List[Tuple[str, int]] = []
+        batches = self._split_batches(items)
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+            futures = [
+                executor.submit(self._translate_batch, batch)
+                for batch in batches
+            ]
+            for batch, future in zip(batches, futures):
+                try:
+                    results.extend(future.result())
+                except Exception:
+                    logging.exception("Translation batch failed")
+                    results.extend(("", tid) for _, tid in batch)
+        return results
+
+    def _translate_batch_group(
+        self, items: List[Tuple[str, int]]
+    ) -> List[Tuple[str, int]]:
         results: List[Tuple[str, int]] = []
         for sub_batch in self._split_batches(items):
-            results.extend(self._translate_batch(sub_batch))
+            if self._cancelled:
+                break
+            if len(sub_batch) == 1:
+                results.append(self._translate_single(*sub_batch[0]))
+            else:
+                logging.debug(
+                    f"Translating batch of {len(sub_batch)} in single request"
+                )
+                results.extend(self._translate_batch(sub_batch))
         return results
+
+    def _emit_batch_result(
+        self,
+        results: List[Tuple[str, int]],
+    ) -> None:
+        if not self._cancelled:
+            for translation, tid in results:
+                if translation:
+                    self.translation.emit(translation, tid)
+                else:
+                    self.translation_failed.emit(tid)
+        self.batch_completed.emit()
 
     def start(self):
         logging.debug("Starting translation queue")
         self._stopping = False
 
-        while True:
-            item = self.queue.get()  # Block until item available
+        pending = []
+        stop_after_pending = False
+        cancel_seen = False
+        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+            while True:
+                while (
+                    len(pending) < MAX_CONCURRENT_REQUESTS
+                    and not stop_after_pending
+                    and not cancel_seen
+                ):
+                    try:
+                        item = self.queue.get(
+                            timeout=BATCH_WINDOW_SECONDS if pending else None
+                        )
+                    except queue.Empty:
+                        break
 
-            # Check for sentinel value (None means stop)
-            if item is None:
-                logging.debug("Translation queue received stop signal")
-                break
+                    if item is None:
+                        stop_after_pending = True
+                        break
 
-            if item is _CANCEL:
-                # A previous cancel() drained the queue; run is over, keep the
-                # worker alive for future runs.
-                self._cancelled = False
-                continue
+                    if item is _CANCEL:
+                        cancel_seen = True
+                        break
 
-            # Collect a batch: start with the first item, then wait briefly for
-            # more instead of racing get_nowait() into single-item requests.
-            batch = [item]
-            stop_after_batch = False
-            deadline = time.monotonic() + BATCH_WINDOW_SECONDS
-            while len(batch) < BATCH_SIZE:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                try:
-                    next_item = self.queue.get(timeout=remaining)
-                except queue.Empty:
-                    break
-                if next_item is None:
-                    stop_after_batch = True
-                    break
-                if next_item is _CANCEL:
-                    # Cancel drops already-collected items; they stay
-                    # untranslated and can be re-queued later.
+                    # Collect a batch: start with the first item, then wait
+                    # briefly for more instead of racing get_nowait() into
+                    # single-item requests.
+                    batch = [item]
+                    batch_window_expired = False
+                    deadline = time.monotonic() + BATCH_WINDOW_SECONDS
+                    while len(batch) < BATCH_SIZE:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            batch_window_expired = True
+                            break
+                        try:
+                            next_item = self.queue.get(timeout=remaining)
+                        except queue.Empty:
+                            batch_window_expired = True
+                            break
+                        if next_item is None:
+                            stop_after_pending = True
+                            break
+                        if next_item is _CANCEL:
+                            # Cancel drops already-collected items; they stay
+                            # untranslated and can be re-queued later.
+                            cancel_seen = True
+                            batch = []
+                            break
+                        batch.append(next_item)
+
+                    if batch:
+                        if not pending and batch_window_expired:
+                            try:
+                                results = self._translate_batch_group(batch)
+                            except Exception:
+                                logging.exception("Translation batch failed")
+                                results = [("", tid) for _, tid in batch]
+                            self._emit_batch_result(results)
+                        else:
+                            future = executor.submit(
+                                self._translate_batch_group, batch
+                            )
+                            pending.append((future, batch))
+
+                if pending:
+                    # Wait for the oldest submitted batch so live-recording
+                    # translations remain in input order while requests run
+                    # concurrently underneath.
+                    future, batch = pending.pop(0)
+                    try:
+                        results = future.result()
+                    except Exception:
+                        logging.exception("Translation batch failed")
+                        results = [("", tid) for _, tid in batch]
+                    self._emit_batch_result(results)
+                    continue
+
+                if cancel_seen:
                     self._cancelled = False
-                    batch = []
+                    cancel_seen = False
+                    continue
+
+                if stop_after_pending or self._stopping:
+                    logging.debug("Translation queue received stop signal")
                     break
-                batch.append(next_item)
-
-            for sub_batch in self._split_batches(batch):
-                if len(sub_batch) == 1:
-                    translation, tid = self._translate_single(*sub_batch[0])
-                    if not self._cancelled:
-                        if translation:
-                            self.translation.emit(translation, tid)
-                        else:
-                            self.translation_failed.emit(tid)
-                else:
-                    logging.debug(f"Translating batch of {len(sub_batch)} in single request")
-                    results = self._translate_batch(sub_batch)
-                    if self._cancelled:
-                        continue
-                    for translation, tid in results:
-                        if translation:
-                            self.translation.emit(translation, tid)
-                        else:
-                            self.translation_failed.emit(tid)
-            self.batch_completed.emit()
-
-            if stop_after_batch or self._stopping:
-                logging.debug("Translation queue received stop signal")
-                break
 
         logging.debug("Translation queue stopped")
         self.finished.emit()
