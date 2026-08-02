@@ -16,9 +16,17 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QFileDialog,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
 )
 
 from buzz.db.entity.transcription import Transcription
@@ -104,6 +112,7 @@ class MainWindow(QMainWindow):
         self._update_info: Optional[UpdateInfo] = None
 
         self.toolbar = MainWindowToolbar(shortcuts=self.shortcuts, parent=self)
+        self.toolbar.setObjectName("MainToolbar")
         self.toolbar.new_transcription_action_triggered.connect(
             self.on_new_transcription_action_triggered
         )
@@ -158,7 +167,7 @@ class MainWindow(QMainWindow):
             self.on_transcriptions_updated
         )
 
-        self.setCentralWidget(self.table_widget)
+        self._setup_task_library()
 
         transcriber_count = int(
             self.settings.value(
@@ -225,6 +234,248 @@ class MainWindow(QMainWindow):
         preferences = Preferences.load(settings.settings)
         settings.settings.endGroup()
         return preferences
+
+    def _setup_task_library(self):
+        self.search_input = QLineEdit()
+        self.search_input.setClearButtonEnabled(True)
+        self.search_input.setPlaceholderText(
+            _("Search file name, URL, model, or notes")
+        )
+        self.search_input.textChanged.connect(self._apply_task_filter)
+
+        self.status_filter = QComboBox()
+        self.status_filter.setMinimumWidth(126)
+        self.status_filter.addItem(_("All statuses"), "")
+        status_labels = {
+            FileTranscriptionTask.Status.QUEUED: _("Queued"),
+            FileTranscriptionTask.Status.IN_PROGRESS: _("In Progress"),
+            FileTranscriptionTask.Status.COMPLETED: _("Completed"),
+            FileTranscriptionTask.Status.FAILED: _("Failed"),
+            FileTranscriptionTask.Status.CANCELED: _("Canceled"),
+            FileTranscriptionTask.Status.SKIPPED: _("Skipped"),
+        }
+        for status in (
+            FileTranscriptionTask.Status.QUEUED,
+            FileTranscriptionTask.Status.IN_PROGRESS,
+            FileTranscriptionTask.Status.COMPLETED,
+            FileTranscriptionTask.Status.FAILED,
+            FileTranscriptionTask.Status.CANCELED,
+            FileTranscriptionTask.Status.SKIPPED,
+        ):
+            self.status_filter.addItem(status_labels[status], status.value)
+        self.status_filter.currentIndexChanged.connect(self._apply_task_filter)
+
+        self.clear_filters_button = QPushButton(_("Clear filters"))
+        self.clear_filters_button.setObjectName("ClearFilters")
+        self.clear_filters_button.setMinimumWidth(104)
+        self.clear_filters_button.setEnabled(False)
+        self.clear_filters_button.clicked.connect(self._clear_task_filters)
+
+        self.task_count_label = QLabel()
+        self.task_count_label.setObjectName("TaskCount")
+
+        central_widget = QWidget(self)
+        central_widget.setObjectName("TaskLibrary")
+        central_layout = QVBoxLayout(central_widget)
+        central_layout.setContentsMargins(28, 24, 28, 28)
+        central_layout.setSpacing(16)
+
+        heading_layout = QHBoxLayout()
+        heading_layout.setSpacing(16)
+        heading_text = QVBoxLayout()
+        heading_text.setSpacing(3)
+
+        eyebrow = QLabel("BUZZ / TRANSCRIPTION WORKSPACE")
+        eyebrow.setObjectName("Eyebrow")
+        heading_text.addWidget(eyebrow)
+
+        title = QLabel(_("Transcription workspace"))
+        title.setObjectName("PageTitle")
+        heading_text.addWidget(title)
+
+        subtitle = QLabel(_("Search, sort, and manage your transcriptions."))
+        subtitle.setObjectName("PageSubtitle")
+        heading_text.addWidget(subtitle)
+
+        heading_layout.addLayout(heading_text)
+        heading_layout.addStretch()
+        heading_layout.addWidget(self.task_count_label, 0, Qt.AlignmentFlag.AlignTop)
+        central_layout.addLayout(heading_layout)
+
+        filter_bar = QFrame()
+        filter_bar.setObjectName("FilterBar")
+        filter_layout = QHBoxLayout(filter_bar)
+        filter_layout.setContentsMargins(14, 10, 14, 10)
+        filter_layout.setSpacing(10)
+
+        filter_label = QLabel(_("Filter"))
+        filter_label.setObjectName("FilterLabel")
+        filter_layout.addWidget(filter_label)
+        filter_layout.addWidget(self.search_input, 1)
+
+        status_label = QLabel(_("Status"))
+        status_label.setObjectName("FilterLabel")
+        filter_layout.addWidget(status_label)
+        filter_layout.addWidget(self.status_filter)
+        filter_layout.addWidget(self.clear_filters_button)
+        central_layout.addWidget(filter_bar)
+        central_layout.addWidget(self.table_widget, 1)
+
+        self.setCentralWidget(central_widget)
+        self.table_widget.model().modelReset.connect(self._update_task_count)
+        self.table_widget.model().rowsInserted.connect(self._update_task_count)
+        self.table_widget.model().rowsRemoved.connect(self._update_task_count)
+        self._update_task_count()
+        self._apply_visual_style()
+
+    def _apply_task_filter(self, *_args):
+        self.table_widget.set_filter(
+            self.search_input.text(), self.status_filter.currentData() or ""
+        )
+        self.clear_filters_button.setEnabled(
+            bool(self.search_input.text().strip())
+            or bool(self.status_filter.currentData())
+        )
+        self._update_task_count()
+
+    def _clear_task_filters(self):
+        self.search_input.clear()
+        self.status_filter.setCurrentIndex(0)
+
+    def _update_task_count(self, *_args):
+        self.task_count_label.setText(
+            _("{} tasks").format(self.table_widget.model().rowCount())
+        )
+
+    def _apply_visual_style(self):
+        dark = self.palette().window().color().lightness() < 128
+        colors = (
+            {
+                "background": "#10181D",
+                "surface": "#172329",
+                "surface_alt": "#1D2C33",
+                "border": "#2D414A",
+                "text": "#E7F3F0",
+                "muted": "#A0B4B8",
+                "accent": "#35C8AE",
+                "accent_soft": "#24483F",
+                "toolbar": "#0C1216",
+                "toolbar_text": "#E7F3F0",
+            }
+            if dark
+            else {
+                "background": "#F3F6F7",
+                "surface": "#FFFFFF",
+                "surface_alt": "#F8FBFA",
+                "border": "#DCE7E7",
+                "text": "#153039",
+                "muted": "#6D7E84",
+                "accent": "#0E9F8A",
+                "accent_soft": "#DFF5EF",
+                "toolbar": "#182B33",
+                "toolbar_text": "#E8F3F0",
+            }
+        )
+        self.setStyleSheet(
+            f"""
+            QMainWindow, #TaskLibrary {{ background: {colors['background']}; }}
+            QToolBar#MainToolbar {{
+                background: {colors['toolbar']};
+                border: 0;
+                border-bottom: 1px solid {colors['border']};
+                padding: 8px 14px;
+                spacing: 4px;
+            }}
+            QToolBar#MainToolbar QToolButton {{
+                color: {colors['toolbar_text']};
+                background: transparent;
+                border: 0;
+                border-radius: 8px;
+                padding: 8px 10px;
+                margin: 0 2px;
+            }}
+            QToolBar#MainToolbar QToolButton:hover {{
+                background: {colors['accent_soft']};
+            }}
+            QToolBar#MainToolbar QToolButton:disabled {{
+                color: {colors['muted']};
+            }}
+            QLabel#Eyebrow {{
+                color: {colors['accent']};
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QLabel#PageTitle {{
+                color: {colors['text']};
+                font-size: 24px;
+                font-weight: 700;
+            }}
+            QLabel#PageSubtitle {{ color: {colors['muted']}; font-size: 13px; }}
+            QLabel#TaskCount {{
+                color: {colors['accent']};
+                background: {colors['accent_soft']};
+                border-radius: 12px;
+                padding: 7px 11px;
+                font-weight: 700;
+            }}
+            QFrame#FilterBar {{
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 12px;
+            }}
+            QLabel#FilterLabel {{
+                color: {colors['muted']};
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QLineEdit, QComboBox {{
+                color: {colors['text']};
+                background: {colors['surface_alt']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                padding: 8px 10px;
+                min-height: 18px;
+            }}
+            QLineEdit:focus, QComboBox:focus {{
+                border: 1px solid {colors['accent']};
+            }}
+            QPushButton#ClearFilters {{
+                color: {colors['accent']};
+                background: transparent;
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                padding: 8px 12px;
+            }}
+            QPushButton#ClearFilters:hover {{
+                background: {colors['accent_soft']};
+                border-color: {colors['accent']};
+            }}
+            QTableView#TaskTable {{
+                color: {colors['text']};
+                background: {colors['surface']};
+                alternate-background-color: {colors['surface_alt']};
+                border: 1px solid {colors['border']};
+                border-radius: 14px;
+                gridline-color: transparent;
+                outline: 0;
+                selection-background-color: {colors['accent_soft']};
+                selection-color: {colors['text']};
+            }}
+            QTableView#TaskTable::item {{
+                padding: 8px 10px;
+                border-bottom: 1px solid {colors['border']};
+            }}
+            QHeaderView::section {{
+                color: {colors['muted']};
+                background: {colors['surface_alt']};
+                border: 0;
+                border-bottom: 1px solid {colors['border']};
+                padding: 11px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            """
+        )
 
     def dragEnterEvent(self, event):
         # Accept file drag events

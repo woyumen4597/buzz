@@ -232,6 +232,20 @@ class TestTranscriptionTasksTableWidget:
         widget.delete_transcriptions([widget.model().index(0, 0)])
         assert widget.model().rowCount() == initial_row_count - 1
 
+    def test_set_filter_searches_task_fields_and_status(self, widget):
+        widget.set_filter("url")
+        assert widget.model().rowCount() == 1
+        assert widget.model().record(0).value("url") == "http://example.com/d.wav"
+
+        widget.set_filter(status="QUEUED")
+        assert widget.model().rowCount() == 2
+
+        widget.set_filter("missing")
+        assert widget.model().rowCount() == 0
+
+        widget.set_filter()
+        assert widget.model().rowCount() == 2
+
     def test_selected_transcriptions(self, widget):
         # Due to sorting, the second row (index 1) is now the first visible row (index 0)
         widget.selectRow(0)

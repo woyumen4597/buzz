@@ -100,7 +100,7 @@ class MainWindowToolbar(ToolBar):
         self.addAction(self.update_action)
 
         self.setMovable(False)
-        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        self.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
     def reset_shortcuts(self):
         self.record_action.setShortcut(

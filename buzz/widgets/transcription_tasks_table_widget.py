@@ -8,7 +8,7 @@ from typing import Optional, List
 from uuid import UUID
 
 from PyQt6 import QtGui
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QSignalBlocker
 from PyQt6.QtCore import pyqtSignal, QModelIndex
 from PyQt6.QtSql import QSqlTableModel, QSqlRecord
 from PyQt6.QtGui import QKeySequence
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QTableView,
     QAbstractItemView,
+    QFrame,
     QStyledItemDelegate,
 )
 
@@ -254,6 +255,10 @@ class TranscriptionTasksTableWidget(QTableView):
     def __init__(self, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.transcription_service = None
+        self.setObjectName("TaskTable")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setShowGrid(False)
+        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
 
         self.setHorizontalHeader(TranscriptionTasksTableHeaderView(Qt.Orientation.Horizontal, self))
 
@@ -288,6 +293,7 @@ class TranscriptionTasksTableWidget(QTableView):
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.verticalHeader().hide()
+        self.verticalHeader().setDefaultSectionSize(48)
         self.setAlternatingRowColors(True)
         
         # Enable column sorting and moving
@@ -295,6 +301,10 @@ class TranscriptionTasksTableWidget(QTableView):
         self.horizontalHeader().setSectionsMovable(True)
         self.horizontalHeader().setSectionsClickable(True)
         self.horizontalHeader().setSortIndicatorShown(True)
+        self.horizontalHeader().setHighlightSections(False)
+        self.horizontalHeader().setDefaultAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
 
         # Connect signals for column resize and move
         self.horizontalHeader().sectionResized.connect(self.on_column_resized)
@@ -309,6 +319,71 @@ class TranscriptionTasksTableWidget(QTableView):
 
         # Reload column visibility after all reordering is complete
         self.load_column_visibility()
+
+    def _fit_columns_to_viewport(self):
+        available_width = self.viewport().width()
+        visible_columns = [
+            definition.column.value
+            for definition in column_definitions
+            if not self.isColumnHidden(definition.column.value)
+        ]
+        if available_width <= 0 or not visible_columns:
+            return
+
+        current_widths = {
+            column: self.columnWidth(column) for column in visible_columns
+        }
+        if sum(current_widths.values()) <= available_width:
+            return
+
+        minimum_widths = {
+            Column.FILE.value: 240,
+            Column.MODEL_TYPE.value: 130,
+            Column.STATUS.value: 145,
+            Column.TASK.value: 90,
+            Column.TIME_ENDED.value: 180,
+            Column.TIME_QUEUED.value: 180,
+        }
+        scale = available_width / sum(current_widths.values())
+        compact_widths = {
+            column: max(
+                minimum_widths.get(column, 120),
+                int(width * scale),
+            )
+            for column, width in current_widths.items()
+        }
+
+        overflow = sum(compact_widths.values()) - available_width
+        while overflow > 0:
+            candidates = [
+                column
+                for column in visible_columns
+                if compact_widths[column] > minimum_widths.get(column, 120)
+            ]
+            if not candidates:
+                break
+            column = max(
+                candidates,
+                key=lambda item: compact_widths[item] - minimum_widths.get(item, 120),
+            )
+            reduction = min(
+                overflow,
+                compact_widths[column] - minimum_widths.get(column, 120),
+            )
+            compact_widths[column] -= reduction
+            overflow -= reduction
+
+        with QSignalBlocker(self.horizontalHeader()):
+            for column, width in compact_widths.items():
+                self.setColumnWidth(column, width)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_columns_to_viewport()
+
+    def showEvent(self, event: QtGui.QShowEvent) -> None:
+        super().showEvent(event)
+        self._fit_columns_to_viewport()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -612,6 +687,45 @@ class TranscriptionTasksTableWidget(QTableView):
         return Transcription.from_record(self.model().record(index.row()))
 
     def refresh_all(self):
+        self.model().select()
+
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        return (
+            value.replace("\\", "\\\\")
+            .replace("'", "''")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
+
+    def set_filter(self, text: str = "", status: str = ""):
+        """Filter the existing SQL model without adding a second data model."""
+        conditions = []
+        search = self._escape_like(text.strip().lower())
+        if search:
+            fields = (
+                "name",
+                "file",
+                "url",
+                "model_type",
+                "task",
+                "status",
+                "language",
+                "notes",
+                "error_message",
+            )
+            conditions.append(
+                "(" + " OR ".join(
+                    f"LOWER(COALESCE({field}, '')) LIKE '%{search}%' ESCAPE '\\'"
+                    for field in fields
+                ) + ")"
+            )
+
+        status = status.strip()
+        if status:
+            conditions.append("status = '" + status.replace("'", "''") + "'")
+
+        self.model().setFilter(" AND ".join(conditions))
         self.model().select()
 
     def refresh_row(self, id: UUID):
