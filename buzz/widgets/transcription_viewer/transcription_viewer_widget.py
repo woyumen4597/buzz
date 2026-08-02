@@ -91,6 +91,7 @@ class TranscriptionViewerWidget(QWidget):
         transcriptions_updated_signal: Optional[pyqtSignal] = None,
     ) -> None:
         super().__init__(parent, flags)
+        self.setObjectName("TranscriptionViewer")
         self.transcription = transcription
         self.transcription_service = transcription_service
         self.shortcuts = shortcuts
@@ -177,21 +178,26 @@ class TranscriptionViewerWidget(QWidget):
             translator=self.translator,
             parent=self
         )
+        self.table_widget.setObjectName("TranscriptTable")
         self.table_widget.segment_selected.connect(self.on_segment_selected)
         self.table_widget.timestamp_being_edited.connect(
             self.on_timestamp_being_edited)
 
     def _setup_media_players(self):
         self.text_display_box = TextDisplayBox(self)
+        self.text_display_box.setObjectName("TextDisplay")
         self.is_video = is_video_file(self.transcription.file) if self.transcription.file else False
         self.audio_player = AudioPlayer(file_path=self.transcription.file)
+        self.audio_player.setObjectName("AudioPlayer")
         self.video_player = None
 
         self.media_player_stack = QStackedWidget()
+        self.media_player_stack.setObjectName("MediaPlayerStack")
         self.media_player_stack.addWidget(self.audio_player)
 
         if self.is_video:
             self.video_player = VideoPlayer(file_path=self.transcription.file)
+            self.video_player.setObjectName("VideoPlayer")
             self.media_player_stack.addWidget(self.video_player)
 
         self.current_media_player = None
@@ -215,6 +221,7 @@ class TranscriptionViewerWidget(QWidget):
 
     def _setup_current_segment_frame(self):
         self.current_segment_frame = QFrame()
+        self.current_segment_frame.setObjectName("CurrentSegment")
         self.current_segment_frame.setFrameStyle(QFrame.Shape.NoFrame)
 
         segment_layout = QVBoxLayout(self.current_segment_frame)
@@ -222,16 +229,16 @@ class TranscriptionViewerWidget(QWidget):
         segment_layout.setSpacing(0)
 
         self.current_segment_text = QLabel("")
+        self.current_segment_text.setObjectName("CurrentSegmentText")
         self.current_segment_text.setAlignment(
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
         self.current_segment_text.setWordWrap(True)
-        self.current_segment_text.setStyleSheet(
-            "color: #666; line-height: 1.2; margin: 0; padding: 4px;")
         self.current_segment_text.setMinimumHeight(60)
         self.current_segment_text.setSizePolicy(
             QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
 
         self.current_segment_scroll_area = QScrollArea()
+        self.current_segment_scroll_area.setObjectName("CurrentSegmentScroll")
         self.current_segment_scroll_area.setWidget(self.current_segment_text)
         self.current_segment_scroll_area.setWidgetResizable(True)
         self.current_segment_scroll_area.setFrameStyle(QFrame.Shape.NoFrame)
@@ -239,25 +246,25 @@ class TranscriptionViewerWidget(QWidget):
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.current_segment_scroll_area.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.current_segment_scroll_area.setStyleSheet(
-            "QScrollBar:vertical { width: 12px; } QScrollBar::handle:vertical { background: #ccc; border-radius: 6px; }")
-
         segment_layout.addWidget(self.current_segment_scroll_area)
         self.current_segment_frame.hide()
 
     def _setup_toolbar(self):
         toolbar = ToolBar(self)
+        toolbar.setObjectName("ViewerToolbar")
 
         view_mode_tool_button = TranscriptionViewModeToolButton(
             self.shortcuts,
             self.has_translations,
             self.translator.translation,
         )
+        view_mode_tool_button.setObjectName("ViewModeButton")
         view_mode_tool_button.view_mode_changed.connect(
             self.on_view_mode_changed)
         toolbar.addWidget(view_mode_tool_button)
 
         export_tool_button = QToolButton()
+        export_tool_button.setObjectName("ExportButton")
         export_tool_button.setText(_("Export"))
         export_tool_button.setIcon(FileDownloadIcon(self))
         export_tool_button.setToolButtonStyle(
@@ -280,6 +287,7 @@ class TranscriptionViewerWidget(QWidget):
         toolbar.addWidget(export_tool_button)
 
         translate_button = QToolButton()
+        translate_button.setObjectName("TranslateButton")
         translate_button.setText(_("Translate"))
         translate_button.setIcon(TranslateIcon(self))
         translate_button.setToolButtonStyle(
@@ -290,6 +298,7 @@ class TranscriptionViewerWidget(QWidget):
         self.translate_button = translate_button
 
         translate_export_button = QToolButton()
+        translate_export_button.setObjectName("TranslateExportButton")
         translate_export_button.setText(_("Translate & Export"))
         translate_export_button.setIcon(FileDownloadIcon(self))
         translate_export_button.setToolButtonStyle(
@@ -313,7 +322,7 @@ class TranscriptionViewerWidget(QWidget):
         self.translate_export_button = translate_export_button
 
         self.translation_progress_label = QLabel("")
-        self.translation_progress_label.setStyleSheet("color: #666;")
+        self.translation_progress_label.setObjectName("TranslationProgress")
         toolbar.addWidget(self.translation_progress_label)
 
         resize_button = QToolButton()
@@ -339,6 +348,7 @@ class TranscriptionViewerWidget(QWidget):
             toolbar.addWidget(speaker_identification_button)
 
         self.find_button = QToolButton()
+        self.find_button.setObjectName("FindButton")
         self.find_button.setText(_("Find"))
         self.find_button.setIcon(VisibilityIcon(self))
         self.find_button.setToolButtonStyle(
@@ -353,12 +363,17 @@ class TranscriptionViewerWidget(QWidget):
         layout.setMenuBar(toolbar)
 
     def _finalize_ui(self):
+        self._setup_heading()
         self.create_search_bar()
         layout = self.layout()
+        layout.setContentsMargins(22, 18, 22, 22)
+        layout.setSpacing(12)
 
+        layout.addWidget(self.viewer_heading, 0)
         layout.addWidget(self.search_frame, 0)
 
         self.media_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.media_splitter.setObjectName("TranscriptSplitter")
         self.media_splitter.setHandleWidth(8)
         self.media_splitter.addWidget(self.table_widget)
         self.media_splitter.addWidget(self.media_player_stack)
@@ -375,10 +390,269 @@ class TranscriptionViewerWidget(QWidget):
         self.current_segment_frame.hide()
 
         self.setLayout(layout)
+        self._apply_visual_style()
         self.setup_shortcuts()
         self.restore_ui_state()
         self.load_geometry()
         self.reset_view()
+
+    def _setup_heading(self):
+        self.viewer_heading = QFrame()
+        self.viewer_heading.setObjectName("ViewerHeading")
+        heading_layout = QVBoxLayout(self.viewer_heading)
+        heading_layout.setContentsMargins(2, 0, 2, 2)
+        heading_layout.setSpacing(2)
+
+        eyebrow = QLabel("BUZZ / TRANSCRIPT")
+        eyebrow.setObjectName("Eyebrow")
+        heading_layout.addWidget(eyebrow)
+
+        title = QLabel(file_path_as_title(self.transcription.file))
+        title.setObjectName("PageTitle")
+        title.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        heading_layout.addWidget(title)
+
+    def _apply_visual_style(self):
+        dark = self.palette().window().color().lightness() < 128
+        colors = (
+            {
+                "background": "#10181D",
+                "surface": "#172329",
+                "surface_alt": "#1D2C33",
+                "border": "#2D414A",
+                "text": "#E7F3F0",
+                "muted": "#A0B4B8",
+                "accent": "#35C8AE",
+                "accent_soft": "#24483F",
+                "toolbar": "#0C1216",
+                "toolbar_text": "#E7F3F0",
+            }
+            if dark
+            else {
+                "background": "#F3F6F7",
+                "surface": "#FFFFFF",
+                "surface_alt": "#F8FBFA",
+                "border": "#DCE7E7",
+                "text": "#153039",
+                "muted": "#6D7E84",
+                "accent": "#0E9F8A",
+                "accent_soft": "#DFF5EF",
+                "toolbar": "#182B33",
+                "toolbar_text": "#E8F3F0",
+            }
+        )
+        self.setStyleSheet(
+            f"""
+            QWidget#TranscriptionViewer {{
+                background: {colors['background']};
+                color: {colors['text']};
+            }}
+            QToolBar#ViewerToolbar {{
+                background: {colors['toolbar']};
+                border: 0;
+                border-bottom: 1px solid {colors['border']};
+                padding: 8px 14px;
+                spacing: 4px;
+            }}
+            QToolBar#ViewerToolbar::separator {{
+                background: {colors['border']};
+                width: 1px;
+                margin: 6px 8px;
+            }}
+            QToolBar#ViewerToolbar QToolButton {{
+                color: {colors['toolbar_text']};
+                background: transparent;
+                border: 0;
+                border-radius: 8px;
+                padding: 8px 10px;
+                margin: 0 2px;
+            }}
+            QToolBar#ViewerToolbar QToolButton:hover,
+            QToolBar#ViewerToolbar QToolButton:checked {{
+                background: {colors['accent_soft']};
+            }}
+            QToolBar#ViewerToolbar QToolButton:disabled {{
+                color: {colors['muted']};
+            }}
+            QFrame#ViewerHeading {{
+                background: transparent;
+                border: 0;
+            }}
+            QLabel#Eyebrow {{
+                color: {colors['accent']};
+                font-size: 11px;
+                font-weight: 700;
+            }}
+            QLabel#PageTitle {{
+                color: {colors['text']};
+                font-size: 22px;
+                font-weight: 700;
+            }}
+            QFrame#ViewerSearchBar,
+            QFrame#PlaybackControls,
+            QFrame#CurrentSegment {{
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 12px;
+            }}
+            QLabel#SectionLabel {{
+                color: {colors['muted']};
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QLabel#SearchResults,
+            QLabel#TranslationProgress {{
+                color: {colors['muted']};
+                font-size: 12px;
+            }}
+            QLineEdit#SearchInput,
+            QComboBox#SpeedCombo {{
+                color: {colors['text']};
+                background: {colors['surface_alt']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                padding: 7px 10px;
+                min-height: 18px;
+            }}
+            QLineEdit#SearchInput:focus,
+            QComboBox#SpeedCombo:focus {{
+                border: 1px solid {colors['accent']};
+            }}
+            QComboBox#SpeedCombo {{
+                min-width: 68px;
+            }}
+            QComboBox#SpeedCombo QAbstractItemView {{
+                color: {colors['text']};
+                background: {colors['surface']};
+                selection-background-color: {colors['accent_soft']};
+                selection-color: {colors['text']};
+            }}
+            #TranscriptionViewer QPushButton {{
+                color: {colors['text']};
+                background: {colors['surface_alt']};
+                border: 1px solid {colors['border']};
+                border-radius: 8px;
+                padding: 7px 10px;
+            }}
+            #TranscriptionViewer QPushButton:hover {{
+                background: {colors['accent_soft']};
+                border-color: {colors['accent']};
+            }}
+            #TranscriptionViewer QPushButton:disabled {{
+                color: {colors['muted']};
+            }}
+            QWidget#AudioPlayer QPushButton,
+            QWidget#VideoPlayer QPushButton {{
+                background: {colors['accent_soft']};
+                border: 1px solid {colors['accent']};
+                padding: 4px;
+                icon-size: 22px;
+            }}
+            QWidget#AudioPlayer QPushButton:hover,
+            QWidget#VideoPlayer QPushButton:hover {{
+                background: {colors['surface']};
+                border-color: {colors['accent']};
+            }}
+            QPushButton#ClearSearch,
+            QPushButton#ScrollCurrent {{
+                color: {colors['accent']};
+            }}
+            QCheckBox {{
+                color: {colors['text']};
+                spacing: 8px;
+            }}
+            QSplitter#TranscriptSplitter {{
+                background: transparent;
+            }}
+            QSplitter#TranscriptSplitter::handle {{
+                background: {colors['border']};
+                margin: 4px 0;
+                border-radius: 4px;
+            }}
+            QTableView#TranscriptTable {{
+                color: {colors['text']};
+                background: {colors['surface']};
+                alternate-background-color: {colors['surface_alt']};
+                border: 1px solid {colors['border']};
+                border-radius: 14px;
+                gridline-color: transparent;
+                outline: 0;
+                selection-background-color: {colors['accent_soft']};
+                selection-color: {colors['text']};
+            }}
+            QTableView#TranscriptTable::item {{
+                padding: 8px 10px;
+                border-bottom: 1px solid {colors['border']};
+            }}
+            QHeaderView::section {{
+                color: {colors['muted']};
+                background: {colors['surface_alt']};
+                border: 0;
+                border-bottom: 1px solid {colors['border']};
+                padding: 11px 10px;
+                font-size: 12px;
+                font-weight: 700;
+            }}
+            QStackedWidget#MediaPlayerStack {{
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 14px;
+            }}
+            QPlainTextEdit#TextDisplay {{
+                color: {colors['text']};
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 14px;
+                padding: 16px;
+                selection-background-color: {colors['accent_soft']};
+            }}
+            QLabel#CurrentSegmentText {{
+                color: {colors['muted']};
+                padding: 8px 12px;
+            }}
+            QScrollArea#CurrentSegmentScroll {{
+                background: transparent;
+                border: 0;
+            }}
+            QScrollBar:vertical {{
+                width: 10px;
+                background: transparent;
+            }}
+            QScrollBar::handle:vertical {{
+                background: {colors['border']};
+                border-radius: 5px;
+                min-height: 24px;
+            }}
+            QScrollBar::handle:vertical:hover {{
+                background: {colors['muted']};
+            }}
+            QSlider::groove:horizontal {{
+                height: 4px;
+                background: {colors['border']};
+                border-radius: 2px;
+            }}
+            QSlider::handle:horizontal {{
+                width: 14px;
+                margin: -5px 0;
+                background: {colors['accent']};
+                border-radius: 7px;
+            }}
+            QMenu {{
+                color: {colors['text']};
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                padding: 5px;
+            }}
+            QMenu::item {{
+                padding: 7px 24px 7px 10px;
+                border-radius: 6px;
+            }}
+            QMenu::item:selected {{
+                background: {colors['accent_soft']};
+                color: {colors['text']};
+            }}
+            """
+        )
 
     def load_transcription_media(self):
         if self.is_video and self.video_player:
@@ -414,19 +688,22 @@ class TranscriptionViewerWidget(QWidget):
     def create_search_bar(self):
         """Create the search bar widget"""
         self.search_frame = QFrame()
+        self.search_frame.setObjectName("ViewerSearchBar")
         self.search_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         self.search_frame.setMaximumHeight(60)
 
         search_layout = QHBoxLayout(self.search_frame)
-        search_layout.setContentsMargins(10, 5, 10, 5)
+        search_layout.setContentsMargins(14, 8, 14, 8)
+        search_layout.setSpacing(8)
 
         # Find label
         search_label = QLabel(_("Find:"))
-        search_label.setStyleSheet("font-weight: bold;")
+        search_label.setObjectName("SectionLabel")
         search_layout.addWidget(search_label)
 
         # Find input - make it wider for better usability
         self.search_input = QLineEdit()
+        self.search_input.setObjectName("SearchInput")
         self.search_input.setPlaceholderText(_("Enter text to find..."))
         self.search_input.textChanged.connect(self.on_search_text_changed)
         self.search_input.returnPressed.connect(self.search_next)
@@ -440,6 +717,7 @@ class TranscriptionViewerWidget(QWidget):
 
         # Search buttons - make them consistent height and remove hardcoded font sizes
         self.search_prev_button = QPushButton("↑")
+        self.search_prev_button.setObjectName("SearchPrevious")
         self.search_prev_button.setToolTip(_("Previous match (Shift+Enter)"))
         self.search_prev_button.clicked.connect(self.search_previous)
         self.search_prev_button.setEnabled(False)
@@ -449,6 +727,7 @@ class TranscriptionViewerWidget(QWidget):
         search_layout.addWidget(self.search_prev_button)
 
         self.search_next_button = QPushButton("↓")
+        self.search_next_button.setObjectName("SearchNext")
         self.search_next_button.setToolTip(_("Next match (Ctrl+Enter)"))
         self.search_next_button.clicked.connect(self.search_next)
         self.search_next_button.setEnabled(False)
@@ -459,6 +738,7 @@ class TranscriptionViewerWidget(QWidget):
 
         # Clear button - make it bigger to accommodate different language translations
         self.clear_search_button = QPushButton(_("Clear"))
+        self.clear_search_button.setObjectName("ClearSearch")
         self.clear_search_button.clicked.connect(self.clear_search)
         self.clear_search_button.setMaximumWidth(80)  # Increased from 60 to 80
         self.clear_search_button.setMinimumHeight(
@@ -467,7 +747,7 @@ class TranscriptionViewerWidget(QWidget):
 
         # Results label
         self.search_results_label = QLabel("")
-        self.search_results_label.setStyleSheet("color: #666;")
+        self.search_results_label.setObjectName("SearchResults")
         search_layout.addWidget(self.search_results_label)
 
         search_layout.addStretch()
@@ -478,16 +758,16 @@ class TranscriptionViewerWidget(QWidget):
     def create_loop_controls(self):
         """Create the loop controls widget"""
         self.loop_controls_frame = QFrame()
+        self.loop_controls_frame.setObjectName("PlaybackControls")
         self.loop_controls_frame.setFrameStyle(QFrame.Shape.StyledPanel)
         self.loop_controls_frame.setMaximumHeight(50)
 
         loop_layout = QHBoxLayout(self.loop_controls_frame)
-        loop_layout.setContentsMargins(10, 5, 10, 5)
-        # Add some spacing between elements for better visual separation
-        loop_layout.setSpacing(8)
+        loop_layout.setContentsMargins(14, 8, 14, 8)
+        loop_layout.setSpacing(10)
         # Loop controls label
         loop_label = QLabel(_("Playback Controls:"))
-        loop_label.setStyleSheet("font-weight: bold;")
+        loop_label.setObjectName("SectionLabel")
         loop_layout.addWidget(loop_label)
 
         # Loop toggle button
@@ -518,10 +798,11 @@ class TranscriptionViewerWidget(QWidget):
 
         # Speed controls
         speed_label = QLabel("Speed:")
-        speed_label.setStyleSheet("font-weight: bold;")
+        speed_label.setObjectName("SectionLabel")
         loop_layout.addWidget(speed_label)
 
         self.speed_combo = QComboBox()
+        self.speed_combo.setObjectName("SpeedCombo")
         self.speed_combo.setEditable(True)
         self.speed_combo.addItems(
             ["0.5x", "0.75x", "1x", "1.25x", "1.5x", "2x"])
@@ -531,12 +812,14 @@ class TranscriptionViewerWidget(QWidget):
         loop_layout.addWidget(self.speed_combo)
 
         self.speed_down_btn = QPushButton("-")
+        self.speed_down_btn.setObjectName("SpeedDown")
         self.speed_down_btn.setMaximumWidth(40)  # Match search button width
         self.speed_down_btn.setMinimumHeight(30)  # Match search button height
         self.speed_down_btn.clicked.connect(self.decrease_speed)
         loop_layout.addWidget(self.speed_down_btn)
 
         self.speed_up_btn = QPushButton("+")
+        self.speed_up_btn.setObjectName("SpeedUp")
         self.speed_up_btn.setMaximumWidth(40)  # Match speed down button width
         self.speed_up_btn.setMinimumHeight(30)  # Match search button height
         self.speed_up_btn.clicked.connect(self.increase_speed)
@@ -554,14 +837,13 @@ class TranscriptionViewerWidget(QWidget):
 
         # Scroll to current button
         self.scroll_to_current_button = QPushButton(_("Scroll to Current"))
+        self.scroll_to_current_button.setObjectName("ScrollCurrent")
         self.scroll_to_current_button.setIcon(ScrollToCurrentIcon(self))
         self.scroll_to_current_button.setToolTip(
             _("Scroll to the currently spoken text"))
         self.scroll_to_current_button.clicked.connect(
             self.on_scroll_to_current_button_clicked)
         self.scroll_to_current_button.setMinimumHeight(30)
-        self.scroll_to_current_button.setStyleSheet(
-            "QPushButton { padding: 4px 8px; }")  # Better padding
         loop_layout.addWidget(self.scroll_to_current_button)
 
         loop_layout.addStretch()
