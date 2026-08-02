@@ -83,8 +83,14 @@ class TestVideoPlayer:
         widget = VideoPlayer(test_audio_path)
         qtbot.add_widget(widget)
 
-        # Qt audio output must always be muted — sounddevice handles audio
-        assert widget.audio_output.isMuted()
+        assert not widget.audio_output.isMuted()
+
+    def test_does_not_create_full_audio_decoder(self, qtbot: QtBot):
+        widget = VideoPlayer(test_audio_path)
+        qtbot.add_widget(widget)
+
+        assert not hasattr(widget, "_sd_player")
+        assert not hasattr(widget, "_poll_timer")
 
     def test_qt_media_player_has_no_video_output(self, qtbot: QtBot):
         widget = VideoPlayer(test_audio_path)

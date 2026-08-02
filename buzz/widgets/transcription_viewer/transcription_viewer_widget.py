@@ -187,33 +187,37 @@ class TranscriptionViewerWidget(QWidget):
         self.text_display_box = TextDisplayBox(self)
         self.text_display_box.setObjectName("TextDisplay")
         self.is_video = is_video_file(self.transcription.file) if self.transcription.file else False
-        self.audio_player = AudioPlayer(file_path=self.transcription.file)
-        self.audio_player.setObjectName("AudioPlayer")
+        self.audio_player = None
         self.video_player = None
 
         self.media_player_stack = QStackedWidget()
         self.media_player_stack.setObjectName("MediaPlayerStack")
-        self.media_player_stack.addWidget(self.audio_player)
 
         if self.is_video:
             self.video_player = VideoPlayer(file_path=self.transcription.file)
             self.video_player.setObjectName("VideoPlayer")
             self.media_player_stack.addWidget(self.video_player)
+        else:
+            self.audio_player = AudioPlayer(file_path=self.transcription.file)
+            self.audio_player.setObjectName("AudioPlayer")
+            self.media_player_stack.addWidget(self.audio_player)
 
         self.current_media_player = None
         self.load_transcription_media()
 
-        self.audio_player.position_ms_changed.connect(
-            self.on_audio_player_position_ms_changed
-        )
+        if self.audio_player:
+            self.audio_player.position_ms_changed.connect(
+                self.on_audio_player_position_ms_changed
+            )
         if self.video_player:
             self.video_player.position_ms_changed.connect(
                 self.on_audio_player_position_ms_changed
             )
 
-        self.audio_player.playback_state_changed.connect(
-            self.on_audio_playback_state_changed
-        )
+        if self.audio_player:
+            self.audio_player.playback_state_changed.connect(
+                self.on_audio_playback_state_changed
+            )
         if self.video_player:
             self.video_player.media_player.playbackStateChanged.connect(
                 self.on_audio_playback_state_changed
@@ -655,12 +659,8 @@ class TranscriptionViewerWidget(QWidget):
         )
 
     def load_transcription_media(self):
-        if self.is_video and self.video_player:
-            self.media_player_stack.setCurrentWidget(self.video_player)
-            self.current_media_player = self.video_player
-        else:
-            self.media_player_stack.setCurrentWidget(self.audio_player)
-            self.current_media_player = self.audio_player
+        self.current_media_player = self.video_player if self.is_video else self.audio_player
+        self.media_player_stack.setCurrentWidget(self.current_media_player)
 
         # Load splitter sizes after determining media type
         if hasattr(self, 'media_splitter'):
@@ -896,8 +896,8 @@ class TranscriptionViewerWidget(QWidget):
             self.current_media_player.set_position(start_time)
 
         # If audio is not playing, start playing
-        if self.audio_player.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self.audio_player.media_player.play()
+        if self.current_media_player.media_player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self.current_media_player.media_player.play()
 
     def decrease_segment_start(self):
         """Decrease the start time of the current segment by 0.5 seconds"""
@@ -1089,8 +1089,9 @@ class TranscriptionViewerWidget(QWidget):
         speed_text = f"{speed:.2f}x"
         self.speed_combo.setCurrentText(speed_text)
 
-        # Set the playback rate on the audio player
-        self.audio_player.media_player.setPlaybackRate(speed)
+        # Set the playback rate on the current media player
+        if self.current_media_player:
+            self.current_media_player.media_player.setPlaybackRate(speed)
 
         # Save the new rate to settings
         self.settings.set_value(self.settings.Key.AUDIO_PLAYBACK_RATE, speed)
@@ -1528,11 +1529,11 @@ class TranscriptionViewerWidget(QWidget):
         if column == Column.START.value:
             # Editing start time - update loop start
             end_time = edited_segment.value("end_time")
-            self.audio_player.set_range((new_value_ms, end_time))
+            self.current_media_player.set_range((new_value_ms, end_time))
         elif column == Column.END.value:
             # Editing end time - update loop end
             start_time = edited_segment.value("start_time")
-            self.audio_player.set_range((start_time, new_value_ms))
+            self.current_media_player.set_range((start_time, new_value_ms))
 
     def on_audio_player_position_ms_changed(self, position_ms: int) -> None:
         current_segment_index = self.table_widget.find_segment_index_at(position_ms)
