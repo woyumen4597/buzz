@@ -5,7 +5,11 @@ from unittest.mock import Mock, call, patch
 import httpx
 from PyQt6.QtCore import QThread
 
-from buzz.translator import Translator
+from buzz.translator import (
+    CHAT_COMPLETIONS_PROTOCOL,
+    RESPONSES_PROTOCOL,
+    Translator,
+)
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 
@@ -237,7 +241,7 @@ class TestTranslator:
         monkeypatch.setenv(
             "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
         )
-        monkeypatch.delenv("BUZZ_TRANSLATION_API_PROTOCOL", raising=False)
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.return_value = _success_response(
@@ -276,11 +280,68 @@ class TestTranslator:
         )
 
     @patch('buzz.translator.httpx.Client')
+    def test_openai_responses(self, mock_client_class, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.post.return_value = _success_response(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "AI Translated"}],
+                    }
+                ]
+            }
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert (
+            translator._messages("Translate this text:", "Hello", json_mode=True)
+            == "AI Translated"
+        )
+        mock_client.post.assert_called_once_with(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": "Bearer openai-key",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "max_output_tokens": 4096,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [
+                            {"type": "input_text", "text": "Translate this text:"}
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Hello"}],
+                    },
+                ],
+                "text": {"format": {"type": "json_object"}},
+            },
+        )
+
+    @patch('buzz.translator.httpx.Client')
     def test_batch_request_uses_json_mode(self, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv(
             "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
         )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.return_value = _success_response(
@@ -301,7 +362,7 @@ class TestTranslator:
     @patch('buzz.translator.httpx.Client')
     @patch('buzz.translator.queue.Queue', autospec=True)
     def test_start(self, mock_queue, mock_client_class, qtbot, monkeypatch):
-        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         def side_effect(*args, **kwargs):
             if side_effect.call_count <= 1:
@@ -316,7 +377,7 @@ class TestTranslator:
         mock_queue.get.side_effect = side_effect
         mock_client = Mock()
         mock_client.post.return_value = _success_response(
-            {"content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]}
+            {"choices": [{"message": {"content": "AI Translated: Hello, how are you?"}}]}
         )
         mock_client_class.return_value = mock_client
 
@@ -436,7 +497,7 @@ class TestTranslator:
 
     @patch('buzz.translator.httpx.Client')
     def test_translator(self, mock_client_class, qtbot, monkeypatch):
-        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         self.on_next_translation_called = False
 
@@ -446,7 +507,7 @@ class TestTranslator:
 
         mock_client = Mock()
         mock_client.post.return_value = _success_response(
-            {"content": [{"type": "text", "text": "AI Translated: Hello, how are you?"}]}
+            {"choices": [{"message": {"content": "AI Translated: Hello, how are you?"}}]}
         )
         mock_client_class.return_value = mock_client
 
@@ -509,6 +570,7 @@ class TestTranslator:
     ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.side_effect = [_failing_response(500)] * 3 + [
@@ -531,6 +593,7 @@ class TestTranslator:
     ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.side_effect = [
@@ -557,6 +620,7 @@ class TestTranslator:
     ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.side_effect = [
@@ -580,6 +644,7 @@ class TestTranslator:
     ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.side_effect = [_failing_response(401)]
@@ -599,6 +664,7 @@ class TestTranslator:
     ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
         mock_client.post.side_effect = [Exception("temporary failure")]

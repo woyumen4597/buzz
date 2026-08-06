@@ -4,7 +4,7 @@ title: Translations
 
 Default `Translation` task uses Whisper model ability to translate to English, however `Large-V3-Turbo` is not compatible with this standard. Buzz supports additional AI translations to any other language.
 
-To use translation feature you will need to configure OpenAI API base url and key and translation settings. Set OpenAI API ket in Preferences. For information on available APIs from ChatGPT, Claude or Gemini see this [discussion thread](https://github.com/chidiwilliams/buzz/discussions/827).
+To use translation feature you will need to configure the OpenAI API base URL, key, model, and protocol in Preferences. Buzz supports both the Chat Completions (`/chat/completions`) and Responses (`/responses`) protocols.
 
 Buzz also supports custom locally running translation AIs that support OpenAI API. For more information on locally running AIs see [ollama](https://ollama.com/blog/openai-compatibility) or [LM Studio](https://lmstudio.ai/). For information on available APIs see this [discussion thread](https://github.com/chidiwilliams/buzz/discussions/827).
 
@@ -16,4 +16,4 @@ For AI to know how to translate enter translation instructions in the "Instructi
 
 If you enable "Enable live recording transcription export" in Preferences, Live text transcripts will be exported to a text file as they get generated and translated. This file can be used to further integrate Live transcripts with other applications like OBS Studio.
 
-Approximate cost of translation for 1 hour long audio with ChatGPT or Claude model is around $1.00.
+Approximate cost of translation for 1 hour long audio with an OpenAI model is around $1.00.

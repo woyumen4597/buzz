@@ -4,7 +4,6 @@ import re
 import logging
 import queue
 import time
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Optional, List, Tuple
@@ -28,22 +27,12 @@ MAX_CONCURRENT_REQUESTS = 2
 BATCH_WINDOW_SECONDS = 0.1
 MAX_ATTEMPTS = 4
 
-DEFAULT_ANTHROPIC_BASE_URL = "https://api.anthropic.com"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
-ANTHROPIC_VERSION = "2023-06-01"
 # Must stay below the viewer's graceful shutdown wait so closing the window
 # never has to terminate the worker thread mid-request.
 REQUEST_TIMEOUT = 30.0
-OPENAI_PROTOCOL = "openai"
-ANTHROPIC_PROTOCOL = "anthropic"
-
-
-def _messages_url(base_url: str) -> str:
-    # base_url may or may not end in /v1; normalize so we hit .../v1/messages.
-    base = base_url.rstrip("/")
-    if base.endswith("/v1"):
-        return base + "/messages"
-    return base + "/v1/messages"
+CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
+RESPONSES_PROTOCOL = "responses"
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -55,14 +44,23 @@ def _chat_completions_url(base_url: str) -> str:
     return base + "/v1/chat/completions"
 
 
-def _translation_api_protocol(base_url: str) -> str:
-    configured = os.getenv("BUZZ_TRANSLATION_API_PROTOCOL", "").strip().lower()
-    if configured in {OPENAI_PROTOCOL, ANTHROPIC_PROTOCOL}:
-        return configured
+def _responses_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/responses"):
+        return base
+    if base.endswith("/v1"):
+        return base + "/responses"
+    return base + "/v1/responses"
 
-    hostname = (urlparse(base_url).hostname or "").lower()
-    is_anthropic = hostname == "anthropic.com" or hostname.endswith(".anthropic.com")
-    return ANTHROPIC_PROTOCOL if is_anthropic else OPENAI_PROTOCOL
+
+def _translation_api_protocol(configured: str = "") -> str:
+    configured = (
+        os.getenv("BUZZ_TRANSLATION_API_PROTOCOL", "").strip().lower()
+        or str(configured or "").strip().lower()
+    )
+    if configured in {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}:
+        return configured
+    return CHAT_COMPLETIONS_PROTOCOL
 
 
 # Queue marker that cancels the current run without stopping the worker:
@@ -112,16 +110,13 @@ class Translator(QObject):
                 settings.value(Settings.Key.CUSTOM_OPENAI_BASE_URL, ""),
             ),
         )
-        protocol_override = os.getenv(
-            "BUZZ_TRANSLATION_API_PROTOCOL", ""
-        ).strip().lower()
-        default_base_url = (
-            DEFAULT_OPENAI_BASE_URL
-            if protocol_override == OPENAI_PROTOCOL
-            else DEFAULT_ANTHROPIC_BASE_URL
+        self.base_url = configured_base_url or DEFAULT_OPENAI_BASE_URL
+        self.api_protocol = _translation_api_protocol(
+            settings.value(
+                Settings.Key.TRANSLATION_API_PROTOCOL,
+                CHAT_COMPLETIONS_PROTOCOL,
+            )
         )
-        self.base_url = configured_base_url or default_base_url
-        self.api_protocol = _translation_api_protocol(self.base_url)
 
         # ponytail: per-task llm_model wins, fall back to global preferences model.
         self.llm_model = self.transcription_options.llm_model or os.getenv(
@@ -136,25 +131,30 @@ class Translator(QObject):
     def _build_request(
         self, system: str, user_content: str, json_mode: bool
     ) -> Tuple[str, dict, dict]:
-        if self.api_protocol == ANTHROPIC_PROTOCOL:
-            url = _messages_url(self.base_url)
-            headers = {
-                "x-api-key": self.api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
-            }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        if self.api_protocol == RESPONSES_PROTOCOL:
+            url = _responses_url(self.base_url)
             body = {
                 "model": self.llm_model,
-                "max_tokens": 4096,
-                "system": system,
-                "messages": [{"role": "user", "content": user_content}],
+                "max_output_tokens": 4096,
+                "input": [
+                    {
+                        "role": "system",
+                        "content": [{"type": "input_text", "text": system}],
+                    },
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_content}],
+                    },
+                ],
             }
+            if json_mode:
+                body["text"] = {"format": {"type": "json_object"}}
         else:
             url = _chat_completions_url(self.base_url)
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
             body = {
                 "model": self.llm_model,
                 "max_tokens": 4096,
@@ -168,16 +168,25 @@ class Translator(QObject):
         return url, headers, body
 
     def _extract_text(self, data: dict) -> Optional[str]:
-        if self.api_protocol == ANTHROPIC_PROTOCOL:
-            content = data.get("content", [])
-            text = next(
-                (
-                    block.get("text")
-                    for block in content
-                    if isinstance(block, dict) and block.get("text")
-                ),
-                None,
-            )
+        if self.api_protocol == RESPONSES_PROTOCOL:
+            output_text = data.get("output_text")
+            if isinstance(output_text, str):
+                text = output_text
+            elif isinstance(output_text, list):
+                text = "".join(part for part in output_text if isinstance(part, str))
+            else:
+                text = ""
+
+            if not text:
+                text = "".join(
+                    block.get("text", "")
+                    for item in data.get("output", [])
+                    if isinstance(item, dict)
+                    for block in item.get("content", [])
+                    if isinstance(block, dict)
+                    and block.get("type") == "output_text"
+                    and isinstance(block.get("text"), str)
+                )
         else:
             choices = data.get("choices", [])
             message = choices[0].get("message", {}) if choices else {}

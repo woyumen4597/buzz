@@ -33,13 +33,11 @@ from buzz.locale import _
 from buzz.widgets.icon import INFO_ICON_PATH
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.translator import (
-    ANTHROPIC_PROTOCOL,
-    ANTHROPIC_VERSION,
-    DEFAULT_ANTHROPIC_BASE_URL,
+    CHAT_COMPLETIONS_PROTOCOL,
     DEFAULT_OPENAI_BASE_URL,
-    OPENAI_PROTOCOL,
+    RESPONSES_PROTOCOL,
     _chat_completions_url,
-    _messages_url,
+    _responses_url,
     _translation_api_protocol,
 )
 
@@ -158,6 +156,29 @@ class GeneralPreferencesWidget(QWidget):
         self.custom_openai_base_url_line_edit.setMinimumWidth(200)
         self.custom_openai_base_url_line_edit.setPlaceholderText("https://api.openai.com/v1")
         layout.addRow(_("OpenAI base url"), self.custom_openai_base_url_line_edit)
+
+        self.translation_api_protocol_combo_box = QComboBox(self)
+        self.translation_api_protocol_combo_box.setObjectName(
+            "TranslationAPIProtocolComboBox"
+        )
+        self.translation_api_protocol_combo_box.addItem(
+            _("Chat Completions (/chat/completions)"), CHAT_COMPLETIONS_PROTOCOL
+        )
+        self.translation_api_protocol_combo_box.addItem(
+            _("Responses (/responses)"), RESPONSES_PROTOCOL
+        )
+        protocol = self.settings.value(
+            Settings.Key.TRANSLATION_API_PROTOCOL,
+            CHAT_COMPLETIONS_PROTOCOL,
+        )
+        protocol_index = self.translation_api_protocol_combo_box.findData(protocol)
+        self.translation_api_protocol_combo_box.setCurrentIndex(
+            protocol_index if protocol_index >= 0 else 0
+        )
+        self.translation_api_protocol_combo_box.currentIndexChanged.connect(
+            self.on_translation_api_protocol_changed
+        )
+        layout.addRow(_("OpenAI API protocol"), self.translation_api_protocol_combo_box)
 
         self.openai_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
@@ -305,6 +326,11 @@ class GeneralPreferencesWidget(QWidget):
     def on_openai_api_model_changed(self, text: str):
         self.settings.set_value(Settings.Key.OPENAI_API_MODEL, text)
 
+    def on_translation_api_protocol_changed(self, index: int):
+        protocol = self.translation_api_protocol_combo_box.itemData(index)
+        if protocol in {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}:
+            self.settings.set_value(Settings.Key.TRANSLATION_API_PROTOCOL, protocol)
+
     def on_recording_export_enable_changed(self, state: int):
         self.recording_export_enabled = state == 2
 
@@ -392,40 +418,35 @@ class ValidateOpenAIApiKeyJob(QRunnable):
                 ),
             ),
         )
-        protocol_override = os.getenv(
-            "BUZZ_TRANSLATION_API_PROTOCOL", ""
-        ).strip().lower()
-        default_base_url = (
-            DEFAULT_OPENAI_BASE_URL
-            if protocol_override == OPENAI_PROTOCOL
-            else DEFAULT_ANTHROPIC_BASE_URL
-        )
-        base_url = configured_base_url or default_base_url
+        base_url = configured_base_url or DEFAULT_OPENAI_BASE_URL
         model = os.getenv(
             "BUZZ_TRANSLATION_API_MODEL",
-            settings.value(
-                key=Settings.Key.OPENAI_API_MODEL, default_value=""
-            ),
+            settings.value(key=Settings.Key.OPENAI_API_MODEL, default_value=""),
         )
-        protocol = _translation_api_protocol(base_url)
+        protocol = _translation_api_protocol(
+            settings.value(
+                Settings.Key.TRANSLATION_API_PROTOCOL,
+                CHAT_COMPLETIONS_PROTOCOL,
+            )
+        )
 
-        body = {
-            "model": model,
-            "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}],
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
         }
-        if protocol == ANTHROPIC_PROTOCOL:
-            url = _messages_url(base_url)
-            headers = {
-                "x-api-key": self.api_key,
-                "anthropic-version": ANTHROPIC_VERSION,
-                "content-type": "application/json",
+        if protocol == RESPONSES_PROTOCOL:
+            url = _responses_url(base_url)
+            body = {
+                "model": model,
+                "max_output_tokens": 8,
+                "input": "hi",
             }
         else:
             url = _chat_completions_url(base_url)
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
+            body = {
+                "model": model,
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}],
             }
 
         try:
@@ -449,6 +470,6 @@ class ValidateOpenAIApiKeyJob(QRunnable):
             pass
         self.signals.failed.emit(
             _("{} API key test failed ({}). Check the API key, base URL and model name.").format(
-                "Anthropic" if protocol == ANTHROPIC_PROTOCOL else "OpenAI", message
+                "OpenAI", message
             )
         )

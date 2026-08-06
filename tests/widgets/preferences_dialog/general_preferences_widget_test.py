@@ -6,6 +6,7 @@ from buzz.settings.settings import DEFAULT_TRANSCRIPTION_CONCURRENCY, Settings
 from buzz.widgets.preferences_dialog.general_preferences_widget import (
     GeneralPreferencesWidget, ValidateOpenAIApiKeyJob
 )
+from buzz.translator import CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL
 
 
 class TestGeneralPreferencesWidget:
@@ -52,7 +53,7 @@ class TestGeneralPreferencesWidget:
         assert test_button.isEnabled()
 
     def test_should_test_openai_api_key(self, qtbot, mocker, monkeypatch):
-        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", "anthropic")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
         mocker.patch(
             "buzz.widgets.preferences_dialog.general_preferences_widget.get_password",
             return_value="wrong-api-key",
@@ -82,7 +83,7 @@ class TestGeneralPreferencesWidget:
             assert message_box_warning_mock.call_args[0][1] == _("OpenAI API Key Test")
             assert (
                     message_box_warning_mock.call_args[0][2]
-                    == "Anthropic API key test failed (Incorrect API key provided). "
+                    == "OpenAI API key test failed (Incorrect API key provided). "
                        "Check the API key, base URL and model name."
             )
 
@@ -139,6 +140,23 @@ class TestGeneralPreferencesWidget:
 
         assert updated_openai_base_url == "http://localhost:11434/v1"
 
+    def test_translation_api_protocol_preferences(self, qtbot):
+        settings = Settings()
+        key = Settings.Key.TRANSLATION_API_PROTOCOL
+        previous_value = settings.value(key, CHAT_COMPLETIONS_PROTOCOL)
+        settings.set_value(key, CHAT_COMPLETIONS_PROTOCOL)
+
+        try:
+            widget = GeneralPreferencesWidget()
+            qtbot.add_widget(widget)
+            widget.translation_api_protocol_combo_box.setCurrentIndex(
+                widget.translation_api_protocol_combo_box.findData(RESPONSES_PROTOCOL)
+            )
+
+            assert settings.value(key, "") == RESPONSES_PROTOCOL
+        finally:
+            settings.set_value(key, previous_value)
+
 
 class TestTestOpenAIApiKeyJob:
     # No error = success
@@ -162,6 +180,28 @@ class TestTestOpenAIApiKeyJob:
         mock_failed.assert_not_called()
         mock_post.assert_called_once()
 
+    def test_run_responses(self, mocker, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        mock_response = mocker.Mock(status_code=200)
+        mock_post = mocker.patch(
+            "buzz.widgets.preferences_dialog.general_preferences_widget.httpx.post",
+            return_value=mock_response,
+        )
+        mocker.patch("buzz.settings.settings.Settings.value", return_value="")
+
+        job = ValidateOpenAIApiKeyJob(api_key="test_key")
+        job.run()
+
+        mock_post.assert_called_once_with(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": "Bearer test_key",
+                "Content-Type": "application/json",
+            },
+            json={"model": "", "max_output_tokens": 8, "input": "hi"},
+            timeout=20,
+        )
+
     # Has error = failure
     def test_run_authentication_error(self, mocker):
         mock_response = mocker.Mock(status_code=401)
@@ -184,7 +224,7 @@ class TestTestOpenAIApiKeyJob:
 
         mock_success.assert_not_called()
         mock_failed.assert_called_once_with(
-            "Anthropic API key test failed (Incorrect API key provided). "
+            "OpenAI API key test failed (Incorrect API key provided). "
             "Check the API key, base URL and model name."
         )
         mock_post.assert_called_once()
