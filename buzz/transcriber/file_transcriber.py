@@ -30,6 +30,7 @@ class FileTranscriber(QObject):
     transcription_task: FileTranscriptionTask
     progress = pyqtSignal(tuple)  # (current, total)
     download_progress = pyqtSignal(float)
+    checkpoint = pyqtSignal(list)  # durable partial List[Segment]
     completed = pyqtSignal(list)  # List[Segment]
     error = pyqtSignal(str)
 
@@ -52,6 +53,11 @@ class FileTranscriber(QObject):
 
         for segment in segments:
             segment.text = segment.text.strip()
+
+        # Keep a durable checkpoint before translation/export.  A process that
+        # dies after inference can be restarted with its last complete result.
+        self.transcription_task.segments = segments
+        self.checkpoint.emit(segments)
 
         try:
             segment_key = "text"

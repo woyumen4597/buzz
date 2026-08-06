@@ -136,9 +136,20 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
         num_chunks = math.ceil(total_size / max_chunk_size)
         chunk_duration = duration_secs / num_chunks
 
-        segments = []
+        # A checkpoint is only emitted after a whole API chunk, so it is safe
+        # to continue from that chunk after a crash without duplicating text.
+        start_chunk = min(
+            max(0, self.transcription_task.checkpoint_next_chunk), num_chunks
+        )
+        if start_chunk == num_chunks and self.transcription_task.segments:
+            self.progress.emit((num_chunks, num_chunks))
+            return self.transcription_task.segments
 
-        for i in range(num_chunks):
+        segments = list(self.transcription_task.segments) if start_chunk else []
+        if start_chunk:
+            self.progress.emit((start_chunk, num_chunks))
+
+        for i in range(start_chunk, num_chunks):
             chunk_start = i * chunk_duration
             chunk_end = min((i + 1) * chunk_duration, duration_secs)
 
@@ -178,6 +189,9 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
                 )
             )
             os.remove(chunk_file)
+            self.transcription_task.segments = segments
+            self.transcription_task.checkpoint_next_chunk = i + 1
+            self.checkpoint.emit(segments)
             self.progress.emit((i + 1, num_chunks))
 
         return segments

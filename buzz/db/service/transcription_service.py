@@ -4,7 +4,7 @@ from uuid import UUID
 from buzz.db.dao.transcription_dao import TranscriptionDAO
 from buzz.db.dao.transcription_segment_dao import TranscriptionSegmentDAO
 from buzz.db.entity.transcription_segment import TranscriptionSegment
-from buzz.transcriber.transcriber import Segment
+from buzz.transcriber.transcriber import FileTranscriptionTask, Segment
 
 
 class TranscriptionService:
@@ -33,6 +33,21 @@ class TranscriptionService:
 
     def update_transcription_progress(self, id: UUID, progress: float):
         self.transcription_dao.update_transcription_progress(id, progress)
+
+    def update_transcription_download_progress(self, id: UUID, progress: float):
+        self.transcription_dao.update_transcription_download_progress(id, progress)
+
+    def update_transcription_segment_checkpoint(
+        self, id: UUID, task: FileTranscriptionTask | None
+    ):
+        self.transcription_dao.update_transcription_segment_checkpoint(id, task)
+
+    def update_transcription_source_file_fingerprint(
+        self, id: UUID, source_file_fingerprint: str | None
+    ):
+        self.transcription_dao.update_transcription_source_file_fingerprint(
+            id, source_file_fingerprint
+        )
 
     def update_transcription_as_completed(self, id: UUID, segments: List[Segment]):
         self._with_transaction(
@@ -94,6 +109,12 @@ class TranscriptionService:
 
     def find_completed_transcription_by_filename(self, filename: str):
         return self.transcription_dao.find_completed_transcription_by_filename(filename)
+
+    def get_unfinished_transcriptions(self):
+        return self.transcription_dao.get_unfinished_transcriptions()
+
+    def queue_transcription_for_recovery(self, id: UUID):
+        self.transcription_dao.queue_transcription_for_recovery(id)
 
     def reset_transcription_for_restart(self, id: UUID):
         self.transcription_dao.reset_transcription_for_restart(id)

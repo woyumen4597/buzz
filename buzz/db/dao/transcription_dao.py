@@ -6,7 +6,12 @@ from PyQt6.QtSql import QSqlDatabase
 
 from buzz.db.dao.dao import DAO
 from buzz.db.entity.transcription import Transcription
-from buzz.transcriber.transcriber import FileTranscriptionTask
+from buzz.transcriber.transcriber import (
+    FileTranscriptionTask,
+    source_file_fingerprint,
+    serialize_segment_checkpoint,
+    serialize_task_options,
+)
 
 
 class TranscriptionDAO(DAO[Transcription]):
@@ -36,7 +41,11 @@ class TranscriptionDAO(DAO[Transcription]):
                 word_level_timings,
                 extract_speech,
                 name,
-                notes
+                notes,
+                task_options_json,
+                source_file_fingerprint,
+                download_progress,
+                segment_checkpoint_json
             ) VALUES (
                 :id,
                 :export_formats,
@@ -54,7 +63,11 @@ class TranscriptionDAO(DAO[Transcription]):
                 :word_level_timings,
                 :extract_speech,
                 :name,
-                :notes
+                :notes,
+                :task_options_json,
+                :source_file_fingerprint,
+                :download_progress,
+                :segment_checkpoint_json
             )
             """
         )
@@ -101,6 +114,16 @@ class TranscriptionDAO(DAO[Transcription]):
         )
         query.bindValue(":name", None)  # name is not available in FileTranscriptionTask
         query.bindValue(":notes", None)  # notes is not available in FileTranscriptionTask
+        query.bindValue(":task_options_json", serialize_task_options(task))
+        query.bindValue(
+            ":source_file_fingerprint",
+            source_file_fingerprint(task.original_file_path or task.file_path),
+        )
+        query.bindValue(":download_progress", task.fraction_downloaded)
+        query.bindValue(
+            ":segment_checkpoint_json",
+            serialize_segment_checkpoint(task) if task.segments else None,
+        )
         if not query.exec():
             raise Exception(query.lastError().text())
 
@@ -120,6 +143,8 @@ class TranscriptionDAO(DAO[Transcription]):
         transcription_data["id"] = str(new_id)
         transcription_data["time_queued"] = datetime.now().isoformat()
         transcription_data["status"] = FileTranscriptionTask.Status.QUEUED.value
+        transcription_data["download_progress"] = 0.0
+        transcription_data["segment_checkpoint_json"] = None
 
         query.prepare(
             """
@@ -140,7 +165,11 @@ class TranscriptionDAO(DAO[Transcription]):
                 word_level_timings,
                 extract_speech,
                 name,
-                notes
+                notes,
+                task_options_json,
+                source_file_fingerprint,
+                download_progress,
+                segment_checkpoint_json
             ) VALUES (
                 :id,
                 :export_formats,
@@ -158,7 +187,11 @@ class TranscriptionDAO(DAO[Transcription]):
                 :word_level_timings,
                 :extract_speech,
                 :name,
-                :notes
+                :notes,
+                :task_options_json,
+                :source_file_fingerprint,
+                :download_progress,
+                :segment_checkpoint_json
             )
             """
         )
@@ -234,12 +267,68 @@ class TranscriptionDAO(DAO[Transcription]):
         if not query.exec():
             raise Exception(query.lastError().text())
 
+    def update_transcription_download_progress(self, id: UUID, progress: float):
+        query = self._create_query()
+        query.prepare(
+            """
+            UPDATE transcription
+            SET download_progress = :download_progress
+            WHERE id = :id
+        """
+        )
+        query.bindValue(":id", str(id))
+        query.bindValue(":download_progress", max(0.0, min(1.0, float(progress))))
+        if not query.exec():
+            raise Exception(query.lastError().text())
+        if query.numRowsAffected() == 0:
+            raise Exception("Transcription not found")
+
+    def update_transcription_segment_checkpoint(
+        self, id: UUID, task: FileTranscriptionTask | None
+    ):
+        query = self._create_query()
+        query.prepare(
+            """
+            UPDATE transcription
+            SET segment_checkpoint_json = :segment_checkpoint_json
+            WHERE id = :id
+        """
+        )
+        query.bindValue(":id", str(id))
+        query.bindValue(
+            ":segment_checkpoint_json",
+            serialize_segment_checkpoint(task) if task is not None else None,
+        )
+        if not query.exec():
+            raise Exception(query.lastError().text())
+        if query.numRowsAffected() == 0:
+            raise Exception("Transcription not found")
+
+    def update_transcription_source_file_fingerprint(
+        self, id: UUID, source_file_fingerprint: str | None
+    ):
+        query = self._create_query()
+        query.prepare(
+            """
+            UPDATE transcription
+            SET source_file_fingerprint = :source_file_fingerprint
+            WHERE id = :id
+        """
+        )
+        query.bindValue(":id", str(id))
+        query.bindValue(":source_file_fingerprint", source_file_fingerprint)
+        if not query.exec():
+            raise Exception(query.lastError().text())
+        if query.numRowsAffected() == 0:
+            raise Exception("Transcription not found")
+
     def update_transcription_as_completed(self, id: UUID):
         query = self._create_query()
         query.prepare(
             """
             UPDATE transcription
-            SET status = :status, time_ended = :time_ended
+            SET status = :status, time_ended = :time_ended,
+                segment_checkpoint_json = NULL
             WHERE id = :id
         """
         )
@@ -250,12 +339,15 @@ class TranscriptionDAO(DAO[Transcription]):
         if not query.exec():
             raise Exception(query.lastError().text())
 
-    def update_transcription_file_and_name(self, id: UUID, file_path: str, name: str | None = None):
+    def update_transcription_file_and_name(
+        self, id: UUID, file_path: str, name: str | None = None
+    ):
         query = self._create_query()
         query.prepare(
             """
             UPDATE transcription
-            SET file = :file, name = COALESCE(:name, name)
+            SET file = :file, name = COALESCE(:name, name),
+                source_file_fingerprint = :source_file_fingerprint
             WHERE id = :id
         """
         )
@@ -263,6 +355,7 @@ class TranscriptionDAO(DAO[Transcription]):
         query.bindValue(":id", str(id))
         query.bindValue(":file", file_path)
         query.bindValue(":name", name)
+        query.bindValue(":source_file_fingerprint", source_file_fingerprint(file_path))
         if not query.exec():
             raise Exception(query.lastError().text())
 
@@ -322,7 +415,8 @@ class TranscriptionDAO(DAO[Transcription]):
         query.prepare(
             """
             UPDATE transcription
-            SET status = :status, time_ended = :time_ended
+            SET status = :status, time_ended = :time_ended,
+                segment_checkpoint_json = NULL
             WHERE id = :id
         """
         )
@@ -332,6 +426,36 @@ class TranscriptionDAO(DAO[Transcription]):
         query.bindValue(":time_ended", datetime.now().isoformat())
         if not query.exec():
             raise Exception(query.lastError().text())
+
+    def get_unfinished_transcriptions(self) -> list[Transcription]:
+        query = self._create_query()
+        query.prepare(
+            """
+            SELECT * FROM transcription
+            WHERE status IN (:queued, :in_progress)
+            ORDER BY time_queued
+        """
+        )
+        query.bindValue(":queued", FileTranscriptionTask.Status.QUEUED.value)
+        query.bindValue(":in_progress", FileTranscriptionTask.Status.IN_PROGRESS.value)
+        return self._execute_all(query)
+
+    def queue_transcription_for_recovery(self, id: UUID):
+        query = self._create_query()
+        query.prepare(
+            """
+            UPDATE transcription
+            SET status = :status, time_started = NULL, time_ended = NULL,
+                error_message = NULL
+            WHERE id = :id
+        """
+        )
+        query.bindValue(":id", str(id))
+        query.bindValue(":status", FileTranscriptionTask.Status.QUEUED.value)
+        if not query.exec():
+            raise Exception(query.lastError().text())
+        if query.numRowsAffected() == 0:
+            raise Exception("Transcription not found")
 
     def find_completed_transcription_by_filename(self, filename: str):
         query = self._create_query()
@@ -356,7 +480,9 @@ class TranscriptionDAO(DAO[Transcription]):
         query.prepare(
             """
             UPDATE transcription
-            SET status = :status, progress = :progress, time_started = NULL, time_ended = NULL, error_message = NULL
+            SET status = :status, progress = :progress, download_progress = 0.0,
+                segment_checkpoint_json = NULL, time_started = NULL, time_ended = NULL,
+                error_message = NULL
             WHERE id = :id
         """
         )

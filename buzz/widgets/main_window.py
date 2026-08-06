@@ -45,13 +45,17 @@ from buzz.settings.settings import (
 from buzz.update_checker import UpdateChecker, UpdateInfo
 from buzz.widgets.update_dialog import UpdateDialog
 from buzz.settings.shortcuts import Shortcuts
-from buzz.store.keyring_store import set_password, Key
+from buzz.store.keyring_store import get_password, set_password, Key
 from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     TranscriptionOptions,
     FileTranscriptionOptions,
     SUPPORTED_AUDIO_FORMATS,
     Segment,
+    deserialize_segment_checkpoint,
+    deserialize_task_metadata,
+    deserialize_task_options,
+    source_file_matches_fingerprint,
 )
 from buzz.widgets.icon import BUZZ_ICON_PATH
 from buzz.widgets.import_url_dialog import ImportURLDialog
@@ -92,6 +96,7 @@ class MainWindow(QMainWindow):
         # Per-task (last written progress, monotonic time of that write) for
         # coalescing progress events; see PROGRESS_WRITE_MIN_*.
         self._progress_state: Dict[UUID, Tuple[float, float]] = {}
+        self._download_progress_state: Dict[UUID, Tuple[float, float]] = {}
         # Tasks that reached a terminal state; late progress events are ignored.
         self._finished_tasks = set()
 
@@ -197,12 +202,15 @@ class MainWindow(QMainWindow):
             worker.task_started.connect(self.on_task_started)
             worker.task_progress.connect(self.on_task_progress)
             worker.task_download_progress.connect(self.on_task_download_progress)
+            worker.task_checkpoint.connect(self.on_task_checkpoint)
             worker.task_error.connect(self.on_task_error)
             worker.task_completed.connect(self.on_task_completed)
 
             worker.completed.connect(thread.quit)
             thread.started.connect(worker.run)
             thread.start()
+
+        self.restore_unfinished_tasks()
 
         self.load_geometry()
 
@@ -701,6 +709,78 @@ class MainWindow(QMainWindow):
         worker = self._pick_transcriber_worker()
         worker.add_task(task)
 
+    def restore_unfinished_tasks(self):
+        """Put interrupted work back on the queue after validating its input."""
+        for transcription in self.transcription_service.get_unfinished_transcriptions():
+            try:
+                task = self._restore_task(transcription)
+                self.transcription_service.queue_transcription_for_recovery(
+                    transcription.id_as_uuid
+                )
+                self._pick_transcriber_worker().add_task(task)
+            except Exception as exc:
+                message = _("Could not recover transcription: {}").format(exc)
+                logging.warning("%s (%s)", message, transcription.id)
+                self.transcription_service.update_transcription_as_failed(
+                    transcription.id_as_uuid, message
+                )
+        self.table_widget.refresh_all()
+
+    def _restore_task(self, transcription: Transcription) -> FileTranscriptionTask:
+        task_metadata = deserialize_task_metadata(transcription.task_options_json)
+        source_value = transcription.source or task_metadata.get("source")
+        source_file = transcription.file or task_metadata.get("file_path")
+        if source_value != FileTranscriptionTask.Source.URL_IMPORT.value:
+            if not source_file or not os.path.isfile(source_file):
+                raise FileNotFoundError(_("Source file is missing"))
+            if (
+                transcription.source_file_fingerprint
+                and not source_file_matches_fingerprint(
+                    source_file, transcription.source_file_fingerprint
+                )
+            ):
+                raise ValueError(_("Source file has changed"))
+
+        transcription_options, file_transcription_options = deserialize_task_options(
+            transcription.task_options_json,
+            fallback=transcription,
+            openai_access_token=get_password(Key.OPENAI_API_KEY),
+        )
+        model_path = transcription_options.model.get_local_model_path()
+        if model_path is None:
+            from buzz.model_loader import ModelDownloader
+
+            ModelDownloader(model=transcription_options.model).run()
+            model_path = transcription_options.model.get_local_model_path()
+        if model_path is None:
+            raise RuntimeError(_("Model is not available"))
+
+        checkpoint_segments, checkpoint_next_chunk = deserialize_segment_checkpoint(
+            transcription.segment_checkpoint_json
+        )
+        try:
+            source = FileTranscriptionTask.Source(source_value)
+        except (TypeError, ValueError):
+            source = FileTranscriptionTask.Source.FILE_IMPORT
+        return FileTranscriptionTask(
+            transcription_options=transcription_options,
+            file_transcription_options=file_transcription_options,
+            model_path=model_path,
+            uid=transcription.id_as_uuid,
+            source=source,
+            file_path=source_file,
+            original_file_path=task_metadata.get("original_file_path"),
+            delete_source_file=bool(task_metadata.get("delete_source_file")),
+            url=transcription.url or task_metadata.get("url") or file_transcription_options.url,
+            output_directory=(
+                transcription.output_folder or task_metadata.get("output_directory")
+            ),
+            segments=checkpoint_segments,
+            fraction_completed=transcription.progress or 0.0,
+            fraction_downloaded=transcription.download_progress or 0.0,
+            checkpoint_next_chunk=checkpoint_next_chunk,
+        )
+
     def _pick_transcriber_worker(self):
         """Prefer an idle worker; otherwise the least-loaded queue.
 
@@ -724,6 +804,7 @@ class MainWindow(QMainWindow):
     def on_task_started(self, task: FileTranscriptionTask):
         self._finished_tasks.discard(task.uid)
         self._progress_state.pop(task.uid, None)
+        self._download_progress_state.pop(task.uid, None)
         self.transcription_service.update_transcription_as_started(task.uid)
         self.table_widget.refresh_row(task.uid)
 
@@ -742,15 +823,46 @@ class MainWindow(QMainWindow):
     def on_task_download_progress(
         self, task: FileTranscriptionTask, fraction_downloaded: float
     ):
-        # TODO: Save download progress in the database
-        pass
+        if task.uid in self._finished_tasks:
+            return
+        pct = max(0.0, min(1.0, fraction_downloaded))
+        now = time.monotonic()
+        last_pct, last_write = self._download_progress_state.get(
+            task.uid, (-1.0, 0.0)
+        )
+        if (
+            pct - last_pct < PROGRESS_WRITE_MIN_DELTA
+            and now - last_write < PROGRESS_WRITE_MIN_INTERVAL_S
+        ):
+            return
+        task.fraction_downloaded = pct
+        self._download_progress_state[task.uid] = (pct, now)
+        self.transcription_service.update_transcription_download_progress(
+            task.uid, pct
+        )
+        self.table_widget.refresh_row(task.uid)
+
+    def on_task_checkpoint(
+        self, task: FileTranscriptionTask, segments: List[Segment]
+    ):
+        if task.uid in self._finished_tasks:
+            return
+        task.segments = segments
+        self.transcription_service.update_transcription_segment_checkpoint(
+            task.uid, task
+        )
 
     def on_task_completed(self, task: FileTranscriptionTask, segments: List[Segment]):
         # Force the final 100% into the database: the completed marker does
         # not carry a progress value, and the last coalesced write may be lower.
         self._finished_tasks.add(task.uid)
         self._progress_state.pop(task.uid, None)
+        self._download_progress_state.pop(task.uid, None)
         self.transcription_service.update_transcription_progress(task.uid, 1.0)
+        if task.source == FileTranscriptionTask.Source.URL_IMPORT:
+            self.transcription_service.update_transcription_download_progress(
+                task.uid, 1.0
+            )
 
         # Handle skipped tasks (e.g. plugin detected file already transcribed)
         if task.status == FileTranscriptionTask.Status.SKIPPED:
@@ -803,6 +915,7 @@ class MainWindow(QMainWindow):
     def on_task_error(self, task: FileTranscriptionTask, error: str):
         self._finished_tasks.add(task.uid)
         self._progress_state.pop(task.uid, None)
+        self._download_progress_state.pop(task.uid, None)
         self.transcription_service.update_transcription_as_failed(task.uid, error)
         self.table_widget.refresh_row(task.uid)
 
@@ -834,6 +947,7 @@ class MainWindow(QMainWindow):
                 worker.task_started.disconnect()
                 worker.task_progress.disconnect()
                 worker.task_download_progress.disconnect()
+                worker.task_checkpoint.disconnect()
                 worker.task_error.disconnect()
                 worker.task_completed.disconnect()
             except Exception as e:

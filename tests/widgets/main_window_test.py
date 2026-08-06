@@ -27,6 +27,7 @@ from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     TranscriptionOptions,
     FileTranscriptionOptions,
+    Segment,
 )
 from buzz.widgets.main_window import MainWindow
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import FileTranscriptionPreferences
@@ -44,6 +45,56 @@ def get_test_asset(filename: str):
 
 
 class TestMainWindow:
+    def test_should_restore_unfinished_task_configuration(
+        self, tmp_path, transcription_dao, transcription_service, monkeypatch
+    ):
+        source = tmp_path / "source.wav"
+        source.write_bytes(b"audio")
+        task = FileTranscriptionTask(
+            transcription_options=TranscriptionOptions(
+                language="zh",
+                task=Task.TRANSLATE,
+                model=TranscriptionModel(
+                    model_type=ModelType.OPEN_AI_WHISPER_API,
+                    whisper_model_size=None,
+                ),
+                temperature=(0.1, 0.7),
+                initial_prompt="保留专有名词",
+                enable_llm_translation=True,
+                llm_prompt="准确翻译",
+                llm_model="gpt-test",
+            ),
+            file_transcription_options=FileTranscriptionOptions(
+                file_paths=[str(source)],
+                output_formats={OutputFormat.SRT},
+                translate=True,
+            ),
+            model_path="",
+            file_path=str(source),
+            fraction_downloaded=0.4,
+        )
+        task.segments = [Segment(start=0, end=100, text="partial")]
+        task.checkpoint_next_chunk = 1
+        transcription_service.create_transcription(task)
+        transcription_service.update_transcription_progress(task.uid, 0.3)
+        transcription_service.update_transcription_segment_checkpoint(task.uid, task)
+        transcription = transcription_dao.find_by_id(str(task.uid))
+        monkeypatch.setattr(
+            "buzz.widgets.main_window.get_password", lambda _key: "current-token"
+        )
+
+        restored = MainWindow._restore_task(MainWindow.__new__(MainWindow), transcription)
+
+        assert restored.transcription_options.initial_prompt == "保留专有名词"
+        assert restored.transcription_options.temperature == (0.1, 0.7)
+        assert restored.transcription_options.llm_prompt == "准确翻译"
+        assert restored.transcription_options.llm_model == "gpt-test"
+        assert restored.transcription_options.openai_access_token == "current-token"
+        assert restored.file_transcription_options.translate is True
+        assert restored.fraction_downloaded == 0.4
+        assert restored.segments == task.segments
+        assert restored.checkpoint_next_chunk == 1
+
     def test_should_set_window_title_and_icon(self, qtbot, transcription_service):
         window = MainWindow(transcription_service)
         qtbot.add_widget(window)

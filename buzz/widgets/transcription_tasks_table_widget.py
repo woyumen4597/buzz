@@ -1,9 +1,7 @@
 import enum
-import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from enum import auto
 from typing import Optional, List
 from uuid import UUID
 
@@ -631,7 +629,7 @@ class TranscriptionTasksTableWidget(QTableView):
         all_columns.sort(key=lambda x: x[1])
 
         # Move sections to match the saved order
-        for target_visual, (logical_index, _) in enumerate(all_columns):
+        for target_visual, (logical_index, saved_visual) in enumerate(all_columns):
             current_visual = header.visualIndex(logical_index)
             if current_visual != target_visual:
                 header.moveSection(current_visual, target_visual)
@@ -828,6 +826,9 @@ class TranscriptionTasksTableWidget(QTableView):
         
         try:
             self.transcription_service.reset_transcription_for_restart(UUID(transcription.id))
+            transcription.progress = 0.0
+            transcription.download_progress = 0.0
+            transcription.segment_checkpoint_json = None
             self._restart_transcription_task(transcription)
             self.refresh_all()
         except Exception as e:
@@ -840,56 +841,18 @@ class TranscriptionTasksTableWidget(QTableView):
     
     def _restart_transcription_task(self, transcription):
         """Create a new FileTranscriptionTask and add it to the queue worker"""
+        from buzz.store.keyring_store import Key, get_password
         from buzz.transcriber.transcriber import (
-            FileTranscriptionTask, 
-            TranscriptionOptions, 
-            FileTranscriptionOptions,
-            Task
+            FileTranscriptionTask,
+            deserialize_segment_checkpoint,
+            deserialize_task_metadata,
+            deserialize_task_options,
         )
-        from buzz.model_loader import TranscriptionModel, ModelType
-        from buzz.transcriber.transcriber import OutputFormat
-        
-        # Recreate the transcription options from the database record
-        from buzz.model_loader import WhisperModelSize
-        
-        # Convert string whisper_model_size to enum if it exists
-        whisper_model_size = None
-        if transcription.whisper_model_size:
-            try:
-                whisper_model_size = WhisperModelSize(transcription.whisper_model_size)
-            except ValueError:
-                # If the stored value is invalid, use a default
-                whisper_model_size = WhisperModelSize.TINY
-        
-        transcription_options = TranscriptionOptions(
-            language=transcription.language if transcription.language else None,
-            task=Task(transcription.task) if transcription.task else Task.TRANSCRIBE,
-            model=TranscriptionModel(
-                model_type=ModelType(transcription.model_type) if transcription.model_type else ModelType.WHISPER,
-                whisper_model_size=whisper_model_size,
-                hugging_face_model_id=transcription.hugging_face_model_id
-            ),
-            word_level_timings=transcription.word_level_timings == "1" if transcription.word_level_timings else False,
-            extract_speech=transcription.extract_speech == "1" if transcription.extract_speech else False,
-            initial_prompt="",  # Not stored in database, use default
-            openai_access_token="",  # Not stored in database, use default
-            enable_llm_translation=False,  # Not stored in database, use default
-            llm_prompt="",  # Not stored in database, use default
-            llm_model=""  # Not stored in database, use default
-        )
-        
-        # Recreate the file transcription options
-        output_formats = set()
-        if transcription.export_formats:
-            for format_str in transcription.export_formats.split(','):
-                try:
-                    output_formats.add(OutputFormat(format_str.strip()))
-                except ValueError:
-                    pass  # Skip invalid formats
-        
-        file_transcription_options = FileTranscriptionOptions(
-            url=transcription.url if transcription.url else None,
-            output_formats=output_formats
+
+        transcription_options, file_transcription_options = deserialize_task_options(
+            getattr(transcription, "task_options_json", None),
+            fallback=transcription,
+            openai_access_token=get_password(Key.OPENAI_API_KEY),
         )
         
         # Get the model path from the transcription options
@@ -908,17 +871,37 @@ class TranscriptionTasksTableWidget(QTableView):
                 _("Could not restart transcription: model not available and could not be downloaded.")
             )
             return
-        
+
+        checkpoint_segments, checkpoint_next_chunk = deserialize_segment_checkpoint(
+            getattr(transcription, "segment_checkpoint_json", None)
+        )
+        task_metadata = deserialize_task_metadata(
+            getattr(transcription, "task_options_json", None)
+        )
+        source_value = transcription.source or task_metadata.get("source")
+        try:
+            source = FileTranscriptionTask.Source(source_value)
+        except (TypeError, ValueError):
+            source = FileTranscriptionTask.Source.FILE_IMPORT
+
         # Create the new task
         task = FileTranscriptionTask(
             transcription_options=transcription_options,
             file_transcription_options=file_transcription_options,
             model_path=model_path,
-            file_path=transcription.file if transcription.file else None,
-            url=transcription.url if transcription.url else None,
-            output_directory=transcription.output_folder if transcription.output_folder else None,
-            source=FileTranscriptionTask.Source(transcription.source) if transcription.source else FileTranscriptionTask.Source.FILE_IMPORT,
-            uid=UUID(transcription.id)
+            file_path=transcription.file or task_metadata.get("file_path"),
+            original_file_path=task_metadata.get("original_file_path"),
+            delete_source_file=bool(task_metadata.get("delete_source_file")),
+            url=transcription.url or task_metadata.get("url"),
+            output_directory=(
+                transcription.output_folder or task_metadata.get("output_directory")
+            ),
+            source=source,
+            uid=UUID(transcription.id),
+            segments=checkpoint_segments,
+            fraction_completed=getattr(transcription, "progress", 0.0) or 0.0,
+            fraction_downloaded=getattr(transcription, "download_progress", 0.0) or 0.0,
+            checkpoint_next_chunk=checkpoint_next_chunk,
         )
         
         # Add the task to the queue worker

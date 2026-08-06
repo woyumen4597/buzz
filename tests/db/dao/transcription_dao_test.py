@@ -5,10 +5,22 @@ from PyQt6.QtSql import QSqlDatabase, QSqlQuery
 
 from buzz.db.dao.transcription_dao import TranscriptionDAO
 from buzz.db.entity.transcription import Transcription
+from buzz.model_loader import ModelType, TranscriptionModel, WhisperModelSize
+from buzz.transcriber.transcriber import (
+    deserialize_segment_checkpoint,
+    deserialize_task_options,
+    FileTranscriptionOptions,
+    FileTranscriptionTask,
+    OutputFormat,
+    Segment,
+    source_file_matches_fingerprint,
+    Task,
+    TranscriptionOptions,
+)
 
 
 @pytest.fixture
-def db():
+def db(qtbot):
     """Create an in-memory SQLite database for testing"""
     db = QSqlDatabase.addDatabase("QSQLITE")
     db.setDatabaseName(":memory:")
@@ -38,7 +50,11 @@ def db():
             word_level_timings BOOLEAN DEFAULT FALSE,
             extract_speech BOOLEAN DEFAULT FALSE,
             name TEXT,
-            notes TEXT
+            notes TEXT,
+            task_options_json TEXT,
+            source_file_fingerprint TEXT,
+            download_progress DOUBLE PRECISION DEFAULT 0.0,
+            segment_checkpoint_json TEXT
         )
     """)
     
@@ -68,6 +84,78 @@ def sample_transcription():
 
 
 class TestTranscriptionDAO:
+    def test_create_transcription_persists_recovery_state(
+        self, transcription_dao, tmp_path
+    ):
+        source = tmp_path / "source.mp3"
+        source.write_bytes(b"source audio")
+        task = FileTranscriptionTask(
+            transcription_options=TranscriptionOptions(
+                language="zh",
+                task=Task.TRANSLATE,
+                model=TranscriptionModel(
+                    model_type=ModelType.FASTER_WHISPER,
+                    whisper_model_size=WhisperModelSize.SMALL,
+                    hugging_face_model_id="repo/model",
+                ),
+                temperature=(0.1, 0.5),
+                initial_prompt="keep names",
+                openai_access_token="must-not-persist",
+                enable_llm_translation=True,
+                llm_prompt="translate faithfully",
+                llm_model="gpt-test",
+            ),
+            file_transcription_options=FileTranscriptionOptions(
+                file_paths=[str(source)],
+                output_formats={OutputFormat.SRT},
+                translate=True,
+            ),
+            model_path="/models/small",
+            file_path=str(source),
+            fraction_downloaded=0.25,
+        )
+
+        transcription_dao.create_transcription(task)
+        transcription = transcription_dao.find_by_id(str(task.uid))
+
+        assert transcription is not None
+        assert [record.id for record in transcription_dao.get_unfinished_transcriptions()] == [
+            str(task.uid)
+        ]
+        assert "must-not-persist" not in transcription.task_options_json
+        restored_options, restored_file_options = deserialize_task_options(
+            transcription.task_options_json
+        )
+        assert restored_options.temperature == (0.1, 0.5)
+        assert restored_options.initial_prompt == "keep names"
+        assert restored_options.llm_prompt == "translate faithfully"
+        assert restored_options.llm_model == "gpt-test"
+        assert restored_options.model.model_type == ModelType.FASTER_WHISPER
+        assert restored_options.model.whisper_model_size == WhisperModelSize.SMALL
+        assert restored_file_options.output_formats == {OutputFormat.SRT}
+        assert source_file_matches_fingerprint(
+            str(source), transcription.source_file_fingerprint
+        )
+        assert transcription.download_progress == 0.25
+        assert not transcription.segment_checkpoint_json
+
+        segments = [Segment(start=0, end=100, text="one")]
+        transcription_dao.update_transcription_download_progress(task.uid, 0.75)
+        task.segments = segments
+        task.checkpoint_next_chunk = 1
+        transcription_dao.update_transcription_segment_checkpoint(task.uid, task)
+        transcription = transcription_dao.find_by_id(str(task.uid))
+        assert transcription.download_progress == 0.75
+        assert deserialize_segment_checkpoint(transcription.segment_checkpoint_json) == (
+            segments,
+            1,
+        )
+
+    def test_deserialize_task_options_accepts_old_rows(self):
+        options, file_options = deserialize_task_options(None)
+        assert options.initial_prompt == ""
+        assert file_options.output_formats == set()
+
     def test_insert_transcription_with_name_and_notes(self, transcription_dao, sample_transcription):
         """Test inserting a transcription with name and notes fields"""
         transcription_dao.insert(sample_transcription)

@@ -69,7 +69,7 @@ def _speech_extraction_worker(conn, file_path: str, speech_path: str, force_cpu:
 
         try:
             from demucs import api as demucsApi
-        except ImportError as exc:
+        except ImportError:
             conn.send(("error", backend_install_hint("Demucs", "demucs")))
             return
 
@@ -101,13 +101,13 @@ def _speech_extraction_worker(conn, file_path: str, speech_path: str, force_cpu:
             conn.close()
         except Exception:
             pass
-from buzz.model_loader import ModelType
-from buzz.transcriber.file_transcriber import FileTranscriber
-from buzz.transcriber.openai_whisper_api_file_transcriber import (
+from buzz.model_loader import ModelType  # noqa: E402
+from buzz.transcriber.file_transcriber import FileTranscriber  # noqa: E402
+from buzz.transcriber.openai_whisper_api_file_transcriber import (  # noqa: E402
     OpenAIWhisperAPIFileTranscriber,
 )
-from buzz.transcriber.transcriber import FileTranscriptionTask, Segment
-from buzz.transcriber.whisper_file_transcriber import WhisperFileTranscriber
+from buzz.transcriber.transcriber import FileTranscriptionTask, Segment  # noqa: E402
+from buzz.transcriber.whisper_file_transcriber import WhisperFileTranscriber  # noqa: E402
 
 
 @dataclass
@@ -123,6 +123,7 @@ class FileTranscriberQueueWorker(QObject):
     task_started = pyqtSignal(FileTranscriptionTask)
     task_progress = pyqtSignal(FileTranscriptionTask, float)
     task_download_progress = pyqtSignal(FileTranscriptionTask, float)
+    task_checkpoint = pyqtSignal(FileTranscriptionTask, list)
     task_completed = pyqtSignal(FileTranscriptionTask, list)
     task_error = pyqtSignal(FileTranscriptionTask, str)
 
@@ -288,6 +289,7 @@ class FileTranscriberQueueWorker(QObject):
         self.current.transcriber.download_progress.connect(
             self.on_task_download_progress
         )
+        self.current.transcriber.checkpoint.connect(self.on_task_checkpoint)
         self.current.transcriber.error.connect(self.on_task_error)
 
         self.current.transcriber.completed.connect(self.on_task_completed)
@@ -429,11 +431,20 @@ class FileTranscriberQueueWorker(QObject):
     @pyqtSlot(tuple)
     def on_task_progress(self, progress: Tuple[int, int]):
         if self.current.task is not None:
-            self.task_progress.emit(self.current.task, progress[0] / progress[1])
+            self.current.task.fraction_completed = progress[0] / progress[1]
+            self.task_progress.emit(
+                self.current.task, self.current.task.fraction_completed
+            )
 
     def on_task_download_progress(self, fraction_downloaded: float):
         if self.current.task is not None:
+            self.current.task.fraction_downloaded = fraction_downloaded
             self.task_download_progress.emit(self.current.task, fraction_downloaded)
+
+    def on_task_checkpoint(self, segments: List[Segment]):
+        if self.current.task is not None:
+            self.current.task.segments = segments
+            self.task_checkpoint.emit(self.current.task, segments)
 
     @pyqtSlot(list)
     def on_task_completed(self, segments: List[Segment]):

@@ -5,6 +5,11 @@ from sqlite3 import Connection
 from buzz.assets import get_path
 from buzz.cache import TasksCache
 from buzz.db.migrator import dumb_migrate_db
+from buzz.transcriber.transcriber import (
+    serialize_segment_checkpoint,
+    serialize_task_options,
+    source_file_fingerprint,
+)
 
 
 def copy_transcriptions_from_json_to_sqlite(conn: Connection):
@@ -15,8 +20,15 @@ def copy_transcriptions_from_json_to_sqlite(conn: Connection):
         for task in tasks:
             cursor.execute(
                 """
-                INSERT INTO transcription (id, error_message, export_formats, file, output_folder, progress, language, model_type, source, status, task, time_ended, time_queued, time_started, url, whisper_model_size, hugging_face_model_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ?), ?, ?, ?, ?)
+                INSERT INTO transcription (
+                    id, error_message, export_formats, file, output_folder,
+                    progress, language, model_type, source, status, task,
+                    time_ended, time_queued, time_started, url,
+                    whisper_model_size, hugging_face_model_id,
+                    task_options_json, source_file_fingerprint,
+                    download_progress, segment_checkpoint_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, ?), ?, ?, ?, ?, ?, ?, ?, ?)
                 RETURNING id;
                 """,
                 (
@@ -46,6 +58,12 @@ def copy_transcriptions_from_json_to_sqlite(conn: Connection):
                     task.transcription_options.model.hugging_face_model_id
                     if task.transcription_options.model.hugging_face_model_id
                     else None,
+                    serialize_task_options(task),
+                    source_file_fingerprint(
+                        task.original_file_path or task.file_path
+                    ),
+                    task.fraction_downloaded,
+                    serialize_segment_checkpoint(task) if task.segments else None,
                 ),
             )
             transcription_id = cursor.fetchone()[0]
@@ -74,16 +92,3 @@ def run_sqlite_migrations(db: Connection):
     with open(schema_path) as schema_file:
         schema = schema_file.read()
         dumb_migrate_db(db=db, schema=schema)
-
-
-def mark_in_progress_and_queued_transcriptions_as_canceled(conn: Connection):
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        UPDATE transcription
-        SET status = 'canceled', time_ended = ?
-        WHERE status = 'in_progress' OR status = 'queued';
-        """,
-        (datetime.now().isoformat(),),
-    )
-    conn.commit()

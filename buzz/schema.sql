@@ -19,7 +19,11 @@ CREATE TABLE transcription (
     word_level_timings BOOLEAN DEFAULT FALSE,
     extract_speech BOOLEAN DEFAULT FALSE,
     name TEXT,
-    notes TEXT
+    notes TEXT,
+    task_options_json TEXT,
+    source_file_fingerprint TEXT,
+    download_progress DOUBLE PRECISION DEFAULT 0.0,
+    segment_checkpoint_json TEXT
 );
 
 CREATE TABLE transcription_segment (

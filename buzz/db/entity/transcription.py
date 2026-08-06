@@ -32,6 +32,10 @@ class Transcription(Entity):
     url: str | None = None
     name: str | None = None
     notes: str | None = None
+    task_options_json: str | None = None
+    source_file_fingerprint: str | None = None
+    download_progress: float = 0.0
+    segment_checkpoint_json: str | None = None
 
     @property
     def id_as_uuid(self):

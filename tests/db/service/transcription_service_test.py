@@ -1,10 +1,10 @@
 import pytest
 from unittest.mock import Mock, patch
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from buzz.db.service.transcription_service import TranscriptionService
 from buzz.db.entity.transcription import Transcription
-from buzz.transcriber.transcriber import Segment
+from buzz.transcriber.transcriber import FileTranscriptionTask, Segment
 
 
 @pytest.fixture
@@ -41,6 +41,38 @@ def sample_transcription():
 
 
 class TestTranscriptionService:
+    def test_recovery_updates_delegate_to_dao(
+        self, transcription_service, mock_transcription_dao
+    ):
+        transcription_id = uuid4()
+        task = Mock(spec=FileTranscriptionTask)
+
+        transcription_service.update_transcription_download_progress(
+            transcription_id, 0.5
+        )
+        transcription_service.update_transcription_segment_checkpoint(
+            transcription_id, task
+        )
+        transcription_service.update_transcription_source_file_fingerprint(
+            transcription_id, "v1:fingerprint"
+        )
+        transcription_service.get_unfinished_transcriptions()
+        transcription_service.queue_transcription_for_recovery(transcription_id)
+
+        mock_transcription_dao.update_transcription_download_progress.assert_called_once_with(
+            transcription_id, 0.5
+        )
+        mock_transcription_dao.update_transcription_segment_checkpoint.assert_called_once_with(
+            transcription_id, task
+        )
+        mock_transcription_dao.update_transcription_source_file_fingerprint.assert_called_once_with(
+            transcription_id, "v1:fingerprint"
+        )
+        mock_transcription_dao.get_unfinished_transcriptions.assert_called_once_with()
+        mock_transcription_dao.queue_transcription_for_recovery.assert_called_once_with(
+            transcription_id
+        )
+
     def test_update_transcription_name(self, transcription_service, mock_transcription_dao):
         """Test updating transcription name through service"""
         transcription_id = uuid4()

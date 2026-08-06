@@ -9,7 +9,6 @@ from platformdirs import user_data_dir
 from buzz.db.helpers import (
     run_sqlite_migrations,
     copy_transcriptions_from_json_to_sqlite,
-    mark_in_progress_and_queued_transcriptions_as_canceled,
 )
 
 
@@ -29,7 +28,6 @@ def _setup_db(path: str) -> QSqlDatabase:
     try:
         run_sqlite_migrations(db)
         copy_transcriptions_from_json_to_sqlite(db)
-        mark_in_progress_and_queued_transcriptions_as_canceled(db)
         db.commit()
     finally:
         db.close()
