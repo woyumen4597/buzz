@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from collections import deque
 
@@ -63,11 +64,10 @@ class TranslateExportMenu(QMenu):
                 "text",
             )
         for mode, (label, _ext) in VIDEO_MODES.items():
-            segment_key = "translation" if has_translation else "text"
             self._add_action(
-                f"{label} - {_('Translation') if has_translation else _('Text')}",
+                f"{label} - {_('Translation')}",
                 mode,
-                segment_key,
+                "translation",
             )
         self.triggered.connect(self._on_triggered)
 
@@ -83,6 +83,8 @@ class TranslateExportMenu(QMenu):
 
 
 class ExportTranscriptionMenu(QMenu):
+    translation_export_requested = pyqtSignal(str, str)
+
     def __init__(
         self,
         transcription: Transcription,
@@ -116,12 +118,12 @@ class ExportTranscriptionMenu(QMenu):
         # segment_key stored in action data (not parsed from text — the format name
         # contains " - " which breaks split); flipped to translation once it loads.
         self.video_burned_action = QAction(
-            text=f"{VIDEO_MODES[MP4_BURNED][0]} - {translation_label}"
-            if has_translation
-            else f"{VIDEO_MODES[MP4_BURNED][0]} - {text_label}",
+            text=f"{VIDEO_MODES[MP4_BURNED][0]} - {translation_label}",
             parent=self,
         )
-        self.video_burned_action.setData({"mode": MP4_BURNED, "segment_key": "translation" if has_translation else "text"})
+        self.video_burned_action.setData(
+            {"mode": MP4_BURNED, "segment_key": "translation"}
+        )
         # URL imports keep only the extracted audio; the original video is
         # fetched on demand, so video export is still offered for them.
         is_video = bool(
@@ -129,12 +131,12 @@ class ExportTranscriptionMenu(QMenu):
         )
         self.video_burned_action.setVisible(is_video)
         self.video_soft_action = QAction(
-            text=f"{VIDEO_MODES[MP4_SOFT][0]} - {translation_label}"
-            if has_translation
-            else f"{VIDEO_MODES[MP4_SOFT][0]} - {text_label}",
+            text=f"{VIDEO_MODES[MP4_SOFT][0]} - {translation_label}",
             parent=self,
         )
-        self.video_soft_action.setData({"mode": MP4_SOFT, "segment_key": "translation" if has_translation else "text"})
+        self.video_soft_action.setData(
+            {"mode": MP4_SOFT, "segment_key": "translation"}
+        )
         self.video_soft_action.setVisible(is_video)
 
         actions = (
@@ -187,7 +189,10 @@ class ExportTranscriptionMenu(QMenu):
             # segment_key stored in data (原文用 'text', 译文用 'translation'); never
             # parse it from action_text — the format name itself contains " - ".
             segment_key = action_data.get("segment_key", "text")
-            self._export_video(action_data["mode"], segment_key)
+            if segment_key == "translation":
+                self.translation_export_requested.emit(action_data["mode"], segment_key)
+            else:
+                self._export_video(action_data["mode"], segment_key)
             return
 
         head, segment_key = self.extract_format_and_segment_key(action_text)
@@ -497,6 +502,7 @@ class ExportTranscriptionMenu(QMenu):
                 "-c:a", "copy",
                 "-c:v", "libx264", "-pix_fmt", "yuv420p",
                 "-progress", "pipe:1", "-nostats",
+                "-f", "mp4",
                 part_path,
             ]
         else:  # MP4_SOFT
@@ -535,7 +541,6 @@ class ExportTranscriptionMenu(QMenu):
             "-map", "0:v:0", "-map", "0:a:0?", "-map", "1:0",
             "-c:s:0", "mov_text",
             "-progress", "pipe:1", "-nostats",
-            part_path,
         ]
         if subtitle_language:
             cmd += ["-metadata:s:s:0", f"language={subtitle_language}"]
@@ -547,6 +552,7 @@ class ExportTranscriptionMenu(QMenu):
             cmd += ["-c:a", "copy"]
         else:
             cmd += ["-c:a", "aac", "-b:a", "192k"]
+        cmd += ["-f", "mp4", part_path]
         return cmd
 
     def _on_ffmpeg_output(self, proc: QProcess):
@@ -577,6 +583,7 @@ class ExportTranscriptionMenu(QMenu):
             except OSError:
                 pass
             else:
+                self._clear_quarantine(proc.output_path)
                 proc.dialog.close()
                 QMessageBox.information(
                     self, _("Export Video"),
@@ -632,6 +639,17 @@ class ExportTranscriptionMenu(QMenu):
             self, _("Export Video"),
             _("Could not start ffmpeg: {}").format(err),
         )
+
+    @staticmethod
+    def _clear_quarantine(path: str):
+        # Generated locally; don't carry a source download's macOS quarantine
+        # marker onto the exported video.
+        if sys.platform != "darwin":
+            return
+        try:
+            os.removexattr(path, "com.apple.quarantine")
+        except (AttributeError, OSError):
+            pass
 
     @staticmethod
     def _cleanup_srt(srt_path):

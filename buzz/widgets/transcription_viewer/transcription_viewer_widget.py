@@ -284,6 +284,9 @@ class TranscriptionViewerWidget(QWidget):
             self
         )
         self.export_menu = export_transcription_menu
+        export_transcription_menu.translation_export_requested.connect(
+            self.start_translate_export
+        )
         export_tool_button.setMenu(export_transcription_menu)
         export_tool_button.setPopupMode(
             QToolButton.ToolButtonPopupMode.MenuButtonPopup)
@@ -1702,6 +1705,10 @@ class TranscriptionViewerWidget(QWidget):
         format_value = self.settings.value(
             Settings.Key.TRANSLATE_EXPORT_FORMAT, OutputFormat.SRT.value
         )
+        valid_formats = {output_format.value for output_format in OutputFormat}
+        valid_formats.update(VIDEO_MODES)
+        if format_value not in valid_formats:
+            format_value = OutputFormat.SRT.value
         self.start_translate_export(format_value, "translation")
 
     def start_translate_export(self, format_or_mode: str, segment_key: str):
@@ -1752,7 +1759,14 @@ class TranscriptionViewerWidget(QWidget):
             self.export_menu._export_video(format_or_mode, segment_key)
             return
 
-        output_format = OutputFormat(format_or_mode)
+        try:
+            output_format = OutputFormat(format_or_mode)
+        except (TypeError, ValueError):
+            logging.warning(
+                "Invalid translate export format %r; falling back to SRT",
+                format_or_mode,
+            )
+            output_format = OutputFormat.SRT
         self.table_widget.flush_translations()
         segments = [
             Segment(

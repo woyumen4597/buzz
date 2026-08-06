@@ -126,6 +126,23 @@ class TestExportTranscriptionMenu:
         assert widget.video_burned_action.isVisible()
         assert widget.video_soft_action.isVisible()
 
+    def test_video_translation_action_requests_translation(
+        self, tmp_path: pathlib.Path, qtbot: QtBot, transcription, transcription_service
+    ):
+        source_path = tmp_path / "movie.mp4"
+        source_path.touch()
+        transcription.file = str(source_path)
+        widget = self._make_widget(transcription, transcription_service)
+        qtbot.add_widget(widget)
+        requested = []
+        widget.translation_export_requested.connect(
+            lambda mode, key: requested.append((mode, key))
+        )
+
+        widget.video_soft_action.trigger()
+
+        assert requested == [(MP4_SOFT, "translation")]
+
     @pytest.mark.parametrize(
         ("segment_key", "suffix"),
         [("text", "subtitled"), ("translation", "translated")],
@@ -181,6 +198,7 @@ class TestExportTranscriptionMenu:
             "PyQt6.QtWidgets.QMessageBox.information"
         )
         critical = mocker.patch("PyQt6.QtWidgets.QMessageBox.critical")
+        clear_quarantine = mocker.patch.object(widget, "_clear_quarantine")
 
         part_path = tmp_path / "movie.mp4.part"
         output_path = tmp_path / "movie.mp4"
@@ -203,6 +221,7 @@ class TestExportTranscriptionMenu:
         assert output_path.read_bytes() == b"video"
         assert not part_path.exists()
         assert not srt_path.exists()
+        clear_quarantine.assert_called_once_with(str(output_path))
         information.assert_called_once()
 
         part_path.write_bytes(b"partial")
@@ -354,6 +373,7 @@ class TestExportTranscriptionMenu:
         assert copy_cmd[copy_cmd.index("-c:v") + 1] == "copy"
         assert "libx264" not in copy_cmd
         assert copy_cmd[copy_cmd.index("-c:a") + 1] == "copy"
+        assert copy_cmd[copy_cmd.index("-f") + 1] == "mp4"
         # Explicit stream maps: source subtitles are never copied over.
         maps = [copy_cmd[i + 1] for i, arg in enumerate(copy_cmd) if arg == "-map"]
         assert maps == ["0:v:0", "0:a:0?", "1:0"]
@@ -370,6 +390,7 @@ class TestExportTranscriptionMenu:
         transcode_cmd = proc.start.call_args.args[1]
         assert "libx264" in transcode_cmd
         assert "aac" in transcode_cmd
+        assert transcode_cmd[transcode_cmd.index("-f") + 1] == "mp4"
         assert proc.transcode_cmd[1:] == transcode_cmd
 
         # Known language: metadata written only for source text.

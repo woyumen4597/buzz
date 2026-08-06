@@ -1589,6 +1589,24 @@ class TestTranslateAndExport:
         assert widget._translate_export_pending == ("srt", "translation")
         widget.close()
 
+    def test_empty_saved_format_defaults_to_srt(
+        self, qtbot: QtBot, transcription, transcription_service, shortcuts, mocker
+    ):
+        widget = TranscriptionViewerWidget(
+            transcription, transcription_service, shortcuts
+        )
+        qtbot.add_widget(widget)
+        widget.settings.set_value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+        start_translate_export = mocker.patch.object(
+            widget, "start_translate_export"
+        )
+
+        widget.on_translate_export_button_clicked()
+
+        start_translate_export.assert_called_once_with("srt", "translation")
+        widget.settings.set_value(Settings.Key.TRANSLATE_EXPORT_FORMAT, "")
+        widget.close()
+
     def test_partial_failure_requires_confirmation(
         self, qtbot: QtBot, transcription, transcription_service, shortcuts, mocker
     ):
@@ -1653,7 +1671,7 @@ class TestTranslateAndExport:
             (MP4_SOFT, "translation"),
         ]
 
-    def test_menu_mp4_uses_text_when_no_translation(self, qtbot: QtBot):
+    def test_menu_mp4_uses_translation_when_no_translation(self, qtbot: QtBot):
         menu = TranslateExportMenu(has_translation=False)
         qtbot.add_widget(menu)
         selected = []
@@ -1663,4 +1681,4 @@ class TestTranslateAndExport:
 
         menu.actions()[7].trigger()
 
-        assert selected == [(MP4_SOFT, "text")]
+        assert selected == [(MP4_SOFT, "translation")]
