@@ -77,21 +77,29 @@ def format_record_status_text(record: QSqlRecord) -> str:
                     elapsed_s = elapsed.total_seconds()
                     if elapsed_s > 2:
                         remaining_s = (1 - progress) * elapsed_s / progress
-                        # format seconds into human-readable string
-                        if remaining_s >= 60:
-                            eta_str = f"{int(remaining_s // 60)}m {int(remaining_s % 60)}s"
-                        else:
-                            eta_str = f"{int(remaining_s)}s"
-                        return f"{in_progress_label} ({progress:.0%}) — ETA: {eta_str}"
+                        eta_str = TranscriptionTasksTableWidget.format_timedelta(
+                            timedelta(seconds=int(remaining_s))
+                        )
+                        return _("{status} ({progress:.0%}) — ETA: {eta}").format(
+                            status=in_progress_label, progress=progress, eta=eta_str
+                        )
                 except (ValueError, OSError):
                     pass
-            return f"{in_progress_label} ({progress:.0%})"
+            return _("{status} ({progress:.0%})").format(
+                status=in_progress_label, progress=progress
+            )
         case FileTranscriptionTask.Status.COMPLETED:
             status = _("Completed")
             started_at = record.value("time_started")
             completed_at = record.value("time_ended")
             if started_at != "" and completed_at != "":
-                status += f" ({TranscriptionTasksTableWidget.format_timedelta(datetime.fromisoformat(completed_at) - datetime.fromisoformat(started_at))})"
+                return _("{status} ({duration})").format(
+                    status=status,
+                    duration=TranscriptionTasksTableWidget.format_timedelta(
+                        datetime.fromisoformat(completed_at)
+                        - datetime.fromisoformat(started_at)
+                    ),
+                )
             return status
         case FileTranscriptionTask.Status.FAILED:
             failed_label = _("Failed")
@@ -736,14 +744,14 @@ class TranscriptionTasksTableWidget(QTableView):
     @staticmethod
     def format_timedelta(delta: timedelta):
         mm, ss = divmod(delta.seconds, 60)
-        result = f"{ss}s"
+        result = _("{}s").format(ss)
         if mm == 0:
             return result
         hh, mm = divmod(mm, 60)
-        result = f"{mm}m {result}"
+        result = _("{}m {}").format(mm, result)
         if hh == 0:
             return result
-        return f"{hh}h {result}"
+        return _("{}h {}").format(hh, result)
 
     def on_rename_action(self):
         selected_rows = self.selectionModel().selectedRows()

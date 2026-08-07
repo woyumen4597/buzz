@@ -96,7 +96,8 @@ class MainWindowToolbar(ToolBar):
             ]
         )
 
-        self.addSeparator()
+        self.update_action_separator = self.addSeparator()
+        self.update_action_separator.setVisible(False)
         self.addAction(self.update_action)
 
         self.setMovable(False)
@@ -130,4 +131,5 @@ class MainWindowToolbar(ToolBar):
 
     def set_update_available(self, available: bool):
         """Shows or hides the update action in the toolbar."""
+        self.update_action_separator.setVisible(available)
         self.update_action.setVisible(available)

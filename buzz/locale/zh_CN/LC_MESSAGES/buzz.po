@@ -559,9 +559,65 @@ msgstr "清除历史纪录"
 msgid "Update Available"
 msgstr "有可用更新"
 
+#: buzz/widgets/main_window.py
+msgid "BUZZ / TRANSCRIPTION WORKSPACE"
+msgstr "BUZZ / 识别工作台"
+
+#: buzz/widgets/main_window.py
+msgid "Transcription workspace"
+msgstr "识别工作台"
+
+#: buzz/widgets/main_window.py
+msgid "Search, sort, and manage your transcriptions."
+msgstr "搜索、排序并管理识别任务。"
+
+#: buzz/widgets/main_window.py
+msgid "Filter"
+msgstr "筛选"
+
+#: buzz/widgets/main_window.py
+msgid "Search file name, URL, model, or notes"
+msgstr "搜索文件名、URL、模型或备注"
+
+#: buzz/widgets/main_window.py
+msgid "All statuses"
+msgstr "全部状态"
+
+#: buzz/widgets/main_window.py
+msgid "Clear filters"
+msgstr "清除筛选"
+
+#: buzz/widgets/main_window.py
+msgid "{} tasks"
+msgstr "{} 个任务"
+
 #: buzz/widgets/transcription_tasks_table_widget.py
 msgid "In Progress"
 msgstr "运行中"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{status} ({progress:.0%}) — ETA: {eta}"
+msgstr "{status}（{progress:.0%}）— 预计剩余：{eta}"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{status} ({progress:.0%})"
+msgstr "{status}（{progress:.0%}）"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{status} ({duration})"
+msgstr "{status}（{duration}）"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{}s"
+msgstr "{} 秒"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{}m {}"
+msgstr "{} 分 {}"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
+msgid "{}h {}"
+msgstr "{} 小时 {}"
 
 #: buzz/widgets/transcription_tasks_table_widget.py
 msgid "Completed"

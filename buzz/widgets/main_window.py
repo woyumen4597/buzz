@@ -293,7 +293,7 @@ class MainWindow(QMainWindow):
         heading_text = QVBoxLayout()
         heading_text.setSpacing(3)
 
-        eyebrow = QLabel("BUZZ / TRANSCRIPTION WORKSPACE")
+        eyebrow = QLabel(_("BUZZ / TRANSCRIPTION WORKSPACE"))
         eyebrow.setObjectName("Eyebrow")
         heading_text.addWidget(eyebrow)
 
@@ -458,6 +458,10 @@ class MainWindow(QMainWindow):
                 background: {colors['accent_soft']};
                 border-color: {colors['accent']};
             }}
+            QPushButton#ClearFilters:disabled {{
+                color: {colors['muted']};
+                background: {colors['surface_alt']};
+            }}
             QTableView#TaskTable {{
                 color: {colors['text']};
                 background: {colors['surface']};
@@ -481,6 +485,11 @@ class MainWindow(QMainWindow):
                 padding: 11px 10px;
                 font-size: 12px;
                 font-weight: 700;
+            }}
+            QHeaderView, QTableCornerButton::section {{
+                background: {colors['surface_alt']};
+                border: 0;
+                border-bottom: 1px solid {colors['border']};
             }}
             """
         )
