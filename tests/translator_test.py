@@ -117,6 +117,135 @@ class TestSplitBatches:
         batches = Translator._split_batches(items)
         assert batches == [[items[0]]]
 
+    def test_splits_on_conservative_token_budget(self):
+        items = [("中" * 6, 1), ("中" * 6, 2)]
+        assert Translator._estimate_tokens(items[0][0]) == 6
+        assert Translator._split_batches(items, max_tokens=6) == [
+            [items[0]],
+            [items[1]],
+        ]
+
+
+class TestTranslationRuntimeControls:
+    def _make_translator(self):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        return Translator(options)
+
+    def test_cache_keyed_by_model_prompt_and_source(self, qtbot):
+        translator = self._make_translator()
+        with patch.object(translator, "_messages", return_value="translated") as messages:
+            assert translator._translate_single("hello", 1) == ("translated", 1)
+            assert translator._translate_single("hello", 2) == ("translated", 2)
+            translator.llm_model = "other-model"
+            assert translator._translate_single("hello", 3) == ("translated", 3)
+        assert messages.call_count == 2
+
+    def test_partial_batch_result_is_reused_after_cancel(self, qtbot):
+        translator = self._make_translator()
+        with patch.object(
+            translator,
+            "_messages",
+            side_effect=['{"translations": {"1": "first"}}', None],
+        ) as messages:
+            assert translator._translate_batch([("a", 1), ("b", 2)]) == [
+                ("first", 1),
+                ("", 2),
+            ]
+            translator.cancel()
+            assert translator._translate_single("a", 99) == ("first", 99)
+        assert messages.call_count == 2
+
+    def test_queue_emits_completed_batch_without_head_of_line_blocking(self, qtbot):
+        translator = self._make_translator()
+        for tid in range(40):
+            translator.queue.put((f"text-{tid}", tid))
+        translator.queue.put(None)
+        first_started = threading.Event()
+        second_finished = threading.Event()
+        second_emitted = threading.Event()
+        release_first = threading.Event()
+        emitted = []
+
+        def translate(batch):
+            if batch[0][1] == 0:
+                first_started.set()
+                release_first.wait(2)
+            else:
+                second_finished.set()
+            return [(f"t-{tid}", tid) for _, tid in batch]
+
+        def emit(results, generation=None):
+            emitted.append(results)
+            if results and results[0][1] == 20:
+                second_emitted.set()
+
+        with patch.object(translator, "_translate_batch_group", side_effect=translate), patch.object(
+            translator, "_emit_batch_result", side_effect=emit
+        ):
+            worker = threading.Thread(target=translator.start)
+            worker.start()
+            assert first_started.wait(2)
+            assert second_finished.wait(2)
+            assert second_emitted.wait(2)
+            assert emitted and emitted[0][0][1] == 20
+            release_first.set()
+            worker.join(2)
+        assert not worker.is_alive()
+
+    def test_cancel_closes_in_flight_client_and_interrupts_wait(self, qtbot):
+        translator = self._make_translator()
+        started = threading.Event()
+        closed = threading.Event()
+        client = Mock()
+
+        def post(*args, **kwargs):
+            started.set()
+            closed.wait(2)
+            raise httpx.ConnectError("closed")
+
+        client.post.side_effect = post
+        client.close.side_effect = closed.set
+        translator._client_instance = client
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(translator._messages("Translate:", "hello"))
+        )
+        worker.start()
+        assert started.wait(2)
+        translator.cancel()
+        worker.join(1)
+        assert not worker.is_alive()
+        assert client.close.called
+        assert result == [None]
+
+    def test_rate_limiter_wait_is_cancelable(self, monkeypatch, qtbot):
+        monkeypatch.setenv("BUZZ_TRANSLATION_REQUESTS_PER_MINUTE", "1")
+        translator = self._make_translator()
+        translator._rate_tokens = 0
+        generation, cancel_event = translator._capture_generation()
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                translator._acquire_rate_limit(generation, cancel_event)
+            )
+        )
+        worker.start()
+        time.sleep(0.05)
+        translator.cancel()
+        worker.join(1)
+        assert not worker.is_alive()
+        assert result == [False]
+
+    def test_default_logs_do_not_contain_response_text(self, caplog, qtbot):
+        translator = self._make_translator()
+        translator.api_protocol = CHAT_COMPLETIONS_PROTOCOL
+        caplog.set_level("DEBUG")
+        secret = "private translated response"
+        assert translator._extract_text(
+            {"choices": [{"message": {"content": secret}}]}
+        ) == secret
+        assert secret not in caplog.text
+
 
 class TestTranslateItemsSync:
     def test_returns_results_in_input_order(self, qtbot):

@@ -3,8 +3,10 @@ import os
 import re
 import logging
 import queue
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 
 from typing import Optional, List, Tuple
 import httpx
@@ -16,16 +18,20 @@ from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 
 
-# Max items per batch and max combined chars per batch. The char budget keeps
-# the prompt and the expected translation output within max_tokens.
+# Count, character, and token caps keep each provider request bounded.
 BATCH_SIZE = 20
 MAX_BATCH_CHARS = 3000
+# A character limit is not a token limit.  This conservative estimate keeps
+# multilingual input below the provider context limit without a tokenizer.
+MAX_BATCH_TOKENS = 2048
 MAX_CONCURRENT_REQUESTS = 2
 # After the first item arrives, wait briefly for more items so a burst of
 # enqueues becomes a few deterministic batch requests instead of racing
 # get_nowait() into per-item requests.
 BATCH_WINDOW_SECONDS = 0.1
 MAX_ATTEMPTS = 4
+DEFAULT_REQUESTS_PER_MINUTE = 60.0
+TRANSLATION_CACHE_SIZE = 1024
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 # Must stay below the viewer's graceful shutdown wait so closing the window
@@ -68,6 +74,20 @@ def _translation_api_protocol(configured: str = "") -> str:
 _CANCEL = object()
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class Translator(QObject):
     # Only non-empty results are emitted on `translation`; failures (including
     # empty responses) are emitted on `translation_failed` so the UI can show
@@ -96,8 +116,34 @@ class Translator(QObject):
 
         self.queue = queue.Queue()
         self._client_instance: Optional[httpx.Client] = None
+        self._client_lock = threading.Lock()
+        self._state_lock = threading.RLock()
+        self._future_lock = threading.Lock()
+        self._active_futures = set()
         self._stopping = False
         self._cancelled = False
+        self._generation = 0
+        self._cancel_event = threading.Event()
+        self._cancel_marker_expected = False
+        self._thread_context = threading.local()
+
+        self._cache_lock = threading.RLock()
+        self._translation_cache = OrderedDict()
+        self._cache_size = max(
+            1, _env_int("BUZZ_TRANSLATION_CACHE_SIZE", TRANSLATION_CACHE_SIZE)
+        )
+        self.max_batch_tokens = max(
+            1, _env_int("BUZZ_TRANSLATION_MAX_BATCH_TOKENS", MAX_BATCH_TOKENS)
+        )
+        requests_per_minute = _env_float(
+            "BUZZ_TRANSLATION_REQUESTS_PER_MINUTE", DEFAULT_REQUESTS_PER_MINUTE
+        )
+        self._rate_per_second = max(0.0, requests_per_minute / 60.0)
+        # One token prevents a whole minute's requests from bursting at start.
+        self._rate_capacity = 1.0
+        self._rate_tokens = self._rate_capacity
+        self._rate_updated = time.monotonic()
+        self._rate_lock = threading.Lock()
 
         settings = Settings()
         self.api_key = os.getenv("BUZZ_TRANSLATION_API_KEY") or get_password(
@@ -124,9 +170,159 @@ class Translator(QObject):
         ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
     def _client(self) -> httpx.Client:
-        if self._client_instance is None:
-            self._client_instance = httpx.Client(timeout=REQUEST_TIMEOUT)
-        return self._client_instance
+        with self._client_lock:
+            if self._client_instance is None:
+                self._client_instance = httpx.Client(timeout=REQUEST_TIMEOUT)
+            return self._client_instance
+
+    def _close_client(self) -> None:
+        with self._client_lock:
+            client = self._client_instance
+            self._client_instance = None
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                logging.debug("Translation client close failed", exc_info=True)
+
+    def _run_context(self) -> Tuple[Optional[int], Optional[threading.Event]]:
+        return (
+            getattr(self._thread_context, "generation", None),
+            getattr(self._thread_context, "cancel_event", None),
+        )
+
+    def _capture_generation(self) -> Tuple[int, threading.Event]:
+        with self._state_lock:
+            return self._generation, self._cancel_event
+
+    def _is_cancelled(
+        self,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> bool:
+        with self._state_lock:
+            if self._stopping:
+                return True
+            if generation is not None and generation != self._generation:
+                return True
+            if generation is None and self._cancelled:
+                return True
+        return cancel_event.is_set() if cancel_event is not None else False
+
+    def _set_run_context(
+        self, generation: Optional[int], cancel_event: Optional[threading.Event]
+    ) -> None:
+        if generation is None:
+            self._thread_context.__dict__.pop("generation", None)
+            self._thread_context.__dict__.pop("cancel_event", None)
+        else:
+            self._thread_context.generation = generation
+            self._thread_context.cancel_event = cancel_event
+
+    def _run_batch_group(
+        self,
+        items: List[Tuple[str, int]],
+        generation: int,
+        cancel_event: threading.Event,
+    ) -> List[Tuple[str, int]]:
+        self._set_run_context(generation, cancel_event)
+        try:
+            return self._translate_batch_group(items)
+        finally:
+            self._set_run_context(None, None)
+
+    def _run_batch(
+        self,
+        items: List[Tuple[str, int]],
+        generation: int,
+        cancel_event: threading.Event,
+    ) -> List[Tuple[str, int]]:
+        self._set_run_context(generation, cancel_event)
+        try:
+            return self._translate_batch(items)
+        finally:
+            self._set_run_context(None, None)
+
+    def _track_future(self, future) -> None:
+        with self._future_lock:
+            self._active_futures.add(future)
+        future.add_done_callback(self._untrack_future)
+
+    def _untrack_future(self, future) -> None:
+        with self._future_lock:
+            self._active_futures.discard(future)
+
+    def _cancel_active_futures(self) -> None:
+        with self._future_lock:
+            futures = tuple(self._active_futures)
+        for future in futures:
+            future.cancel()
+
+    def _invalidate_generation(self) -> None:
+        with self._state_lock:
+            self._cancelled = True
+            self._generation += 1
+            event = self._cancel_event
+            self._cancel_event = threading.Event()
+            self._cancel_marker_expected = True
+        event.set()
+        self._cancel_active_futures()
+        self._close_client()
+
+    def _cache_key(self, source: str) -> Tuple[str, str, str]:
+        return (
+            str(self.llm_model or ""),
+            str(self.transcription_options.llm_prompt or ""),
+            source,
+        )
+
+    def _cache_get(self, source: str) -> Optional[str]:
+        key = self._cache_key(source)
+        with self._cache_lock:
+            value = self._translation_cache.get(key)
+            if value is not None:
+                self._translation_cache.move_to_end(key)
+            return value
+
+    def _cache_put(self, source: str, translation: str) -> None:
+        if not translation:
+            return
+        key = self._cache_key(source)
+        with self._cache_lock:
+            self._translation_cache[key] = translation
+            self._translation_cache.move_to_end(key)
+            while len(self._translation_cache) > self._cache_size:
+                self._translation_cache.popitem(last=False)
+
+    def _acquire_rate_limit(
+        self,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> bool:
+        if self._rate_per_second <= 0:
+            return not self._is_cancelled(generation, cancel_event)
+        while True:
+            with self._rate_lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._rate_updated)
+                self._rate_tokens = min(
+                    self._rate_capacity,
+                    self._rate_tokens + elapsed * self._rate_per_second,
+                )
+                self._rate_updated = now
+                if self._rate_tokens >= 1.0:
+                    self._rate_tokens -= 1.0
+                    return not self._is_cancelled(generation, cancel_event)
+                delay = (1.0 - self._rate_tokens) / self._rate_per_second
+            if self._is_cancelled(generation, cancel_event):
+                return False
+            delay = min(delay, 0.5)
+            if cancel_event is None:
+                with self._state_lock:
+                    cancel_event = self._cancel_event
+            if self._is_cancelled(generation, cancel_event):
+                return False
+            cancel_event.wait(delay)
 
     def _build_request(
         self, system: str, user_content: str, json_mode: bool
@@ -193,9 +389,10 @@ class Translator(QObject):
             text = message.get("content") if isinstance(message, dict) else None
 
         if isinstance(text, str) and text:
-            logging.debug(f"Received translation response: {data}")
+            # Never put potentially sensitive translated text in default logs.
+            logging.debug("Received translation response (%d chars)", len(text))
             return text
-        logging.error(f"Translation error! Unexpected response: {data}")
+        logging.error("Translation error! Unexpected response shape")
         return None
 
     @staticmethod
@@ -219,103 +416,171 @@ class Translator(QObject):
         except (TypeError, ValueError):
             return None
 
-    def _sleep(self, seconds: float) -> None:
+    def _sleep(
+        self,
+        seconds: float,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
         # Sleep in small slices so stop() can interrupt a backoff wait.
-        while seconds > 0 and not self._stopping:
+        while seconds > 0 and not self._is_cancelled(generation, cancel_event):
             slice_ = min(seconds, 0.5)
-            time.sleep(slice_)
+            if cancel_event is not None:
+                cancel_event.wait(slice_)
+            else:
+                time.sleep(slice_)
             seconds -= slice_
 
-    def _backoff(self, attempt: int, response: Optional[httpx.Response] = None) -> None:
+    def _backoff(
+        self,
+        attempt: int,
+        response: Optional[httpx.Response] = None,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
+    ) -> None:
         delay = min(2 ** attempt, 8.0)
         retry_after = self._retry_after_seconds(response)
         if retry_after is not None:
             delay = max(delay, min(retry_after, 30.0))
-        self._sleep(delay)
+        self._sleep(delay, generation, cancel_event)
 
     def _messages(
-        self, system: str, user_content: str, json_mode: bool = False
+        self,
+        system: str,
+        user_content: str,
+        json_mode: bool = False,
+        generation: Optional[int] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
         """Call the configured translation protocol and return its text response."""
+        if generation is None and cancel_event is None:
+            generation, cancel_event = self._run_context()
         url, headers, body = self._build_request(system, user_content, json_mode)
         for attempt in range(MAX_ATTEMPTS):
+            if self._is_cancelled(generation, cancel_event):
+                return None
+            if not self._acquire_rate_limit(generation, cancel_event):
+                return None
             try:
                 resp = self._client().post(url, headers=headers, json=body)
                 resp.raise_for_status()
                 return self._extract_text(resp.json())
             except httpx.HTTPStatusError as e:
-                status = e.response.status_code
-                logging.error(
-                    f"Translation error! HTTP {status}: {e.response.text[:300]}"
+                status = getattr(e.response, "status_code", "unknown")
+                logging.error("Translation error! HTTP %s", status)
+                retryable_status = (
+                    isinstance(status, int) and self._is_retryable_status(status)
                 )
                 if (
-                    self._stopping
-                    or self._cancelled
+                    self._is_cancelled(generation, cancel_event)
                     or attempt == MAX_ATTEMPTS - 1
-                    or not self._is_retryable_status(status)
+                    or not retryable_status
                 ):
                     return None
-                self._backoff(attempt, e.response)
+                self._backoff(attempt, e.response, generation, cancel_event)
             except httpx.TransportError as e:
-                logging.error(f"Translation error! Network failure: {e}")
-                if self._stopping or self._cancelled or attempt == MAX_ATTEMPTS - 1:
+                logging.error("Translation error! Network failure (%s)", type(e).__name__)
+                if (
+                    self._is_cancelled(generation, cancel_event)
+                    or attempt == MAX_ATTEMPTS - 1
+                ):
                     return None
-                self._backoff(attempt)
+                self._backoff(attempt, generation=generation, cancel_event=cancel_event)
             except Exception as e:
-                logging.error(f"Translation error! {e}")
+                logging.error("Translation error! %s", type(e).__name__)
                 return None
         return None
 
     def _translate_single(self, transcript: str, transcript_id: int) -> Tuple[str, int]:
         """Translate a single transcript via the API. Returns (translation, transcript_id)."""
+        cached = self._cache_get(transcript)
+        if cached is not None:
+            return cached, transcript_id
+        generation, cancel_event = self._run_context()
+        message_args = {
+            "system": self.transcription_options.llm_prompt,
+            "user_content": transcript,
+        }
+        if generation is not None or cancel_event is not None:
+            message_args.update(generation=generation, cancel_event=cancel_event)
         translation = self._messages(
-            system=self.transcription_options.llm_prompt, user_content=transcript
+            **message_args,
         )
+        if translation:
+            self._cache_put(transcript, translation)
         return translation or "", transcript_id
 
     def _translate_batch(self, items: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
         """Translate multiple transcripts in a single API call.
         Returns list of (translation, transcript_id) in the same order as input."""
+        if not items:
+            return []
+
+        by_index = {}
+        missing = []
+        for index, (transcript, tid) in enumerate(items):
+            cached = self._cache_get(transcript)
+            if cached is None:
+                missing.append((index, transcript, tid))
+            else:
+                by_index[index] = cached
+        if not missing:
+            return [(by_index.get(index, ""), tid) for index, (_, tid) in enumerate(items)]
+
         numbered_parts = []
-        for i, (transcript, _) in enumerate(items, 1):
+        for i, (_, transcript, _) in enumerate(missing, 1):
             numbered_parts.append(f"[{i}] {transcript}")
         combined = "\n".join(numbered_parts)
 
         batch_prompt = (
             f"{self.transcription_options.llm_prompt}\n\n"
-            f"You will receive {len(items)} numbered texts. "
+            f"You will receive {len(missing)} numbered texts. "
             f"Process each one separately according to the instruction above "
             f"and return a JSON object mapping each number to its processed text, "
             f'e.g. {{"translations": {{"1": "processed text 1", "2": "processed text 2"}}}}. '
             f"Respond with only that JSON object and nothing else."
         )
 
+        generation, cancel_event = self._run_context()
+        message_args = {
+            "system": batch_prompt,
+            "user_content": combined,
+            "json_mode": True,
+        }
+        if generation is not None or cancel_event is not None:
+            message_args.update(generation=generation, cancel_event=cancel_event)
         response_text = self._messages(
-            system=batch_prompt, user_content=combined, json_mode=True
+            **message_args,
         )
         if not response_text:
-            return [("", tid) for _, tid in items]
+            return [
+                (by_index.get(index, ""), tid)
+                for index, (_, tid) in enumerate(items)
+            ]
 
-        translations = self._parse_batch_response(response_text, len(items))
-        missing = []
-        by_id = {}
-        for translation, (transcript, tid) in zip(translations, items):
+        translations = self._parse_batch_response(response_text, len(missing))
+        retry_missing = []
+        for translation, (index, transcript, tid) in zip(translations, missing):
             if translation:
-                by_id[tid] = translation
+                by_index[index] = translation
+                self._cache_put(transcript, translation)
             else:
-                missing.append((transcript, tid))
+                retry_missing.append((index, transcript, tid))
 
-        if missing:
+        if retry_missing:
             # A malformed/missing entry must not lose the whole batch; re-request
             # only the failed items individually.
             logging.debug(
-                f"Batch response incomplete ({len(missing)} missing), "
+                f"Batch response incomplete ({len(retry_missing)} missing), "
                 "retrying individually"
             )
-            for transcript, tid in missing:
-                by_id[tid] = self._translate_single(transcript, tid)[0]
+            for index, transcript, tid in retry_missing:
+                by_index[index] = self._translate_single(transcript, tid)[0]
 
-        return [(by_id.get(tid, ""), tid) for _, tid in items]
+        return [
+            (by_index.get(index, ""), tid)
+            for index, (_, tid) in enumerate(items)
+        ]
 
     @staticmethod
     def _try_parse_json_mapping(response: str) -> Optional[dict]:
@@ -371,22 +636,43 @@ class Translator(QObject):
         ]
 
     @staticmethod
-    def _split_batches(items: List[Tuple[str, int]]) -> List[List[Tuple[str, int]]]:
-        """Split items into sub-batches that fit the character budget."""
+    def _estimate_tokens(text: str) -> int:
+        # Three UTF-8 bytes per token is deliberately conservative for both
+        # ASCII and CJK text; it avoids adding a tokenizer dependency.
+        text = str(text or "")
+        return max(1, (len(text.encode("utf-8")) + 2) // 3)
+
+    @staticmethod
+    def _split_batches(
+        items: List[Tuple[str, int]],
+        token_budget: Optional[int] = None,
+        prompt_tokens: int = 0,
+        max_tokens: Optional[int] = None,
+    ) -> List[List[Tuple[str, int]]]:
+        """Split items by count, chars, and a conservative token estimate."""
+        if max_tokens is not None:
+            token_budget = max_tokens
+        token_budget = max(1, token_budget or MAX_BATCH_TOKENS)
+        token_budget = max(1, token_budget - max(0, prompt_tokens))
         batches = []
         current: List[Tuple[str, int]] = []
         current_chars = 0
+        current_tokens = 0
         for item in items:
             chars = len(item[0])
+            tokens = Translator._estimate_tokens(item[0])
             if current and (
                 len(current) >= BATCH_SIZE
                 or current_chars + chars > MAX_BATCH_CHARS
+                or current_tokens + tokens > token_budget
             ):
                 batches.append(current)
                 current = []
                 current_chars = 0
+                current_tokens = 0
             current.append(item)
             current_chars += chars
+            current_tokens += tokens
         if current:
             batches.append(current)
         return batches
@@ -395,27 +681,61 @@ class Translator(QObject):
         self, items: List[Tuple[str, int]]
     ) -> List[Tuple[str, int]]:
         """Translate items concurrently while returning results in input order."""
-        results: List[Tuple[str, int]] = []
-        batches = self._split_batches(items)
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
-            futures = [
-                executor.submit(self._translate_batch, batch)
-                for batch in batches
-            ]
-            for batch, future in zip(batches, futures):
+        batches = self._split_batches(
+            items,
+            token_budget=self.max_batch_tokens,
+            prompt_tokens=self._estimate_tokens(self.transcription_options.llm_prompt),
+        )
+        completed = {}
+        pending = {}
+        executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+        generation, cancel_event = self._capture_generation()
+        try:
+            for index, batch in enumerate(batches):
+                future = executor.submit(
+                    self._run_batch, batch, generation, cancel_event
+                )
+                pending[future] = (index, batch)
+                self._track_future(future)
+
+            while pending:
+                if self._is_cancelled(generation, cancel_event):
+                    for future in pending:
+                        future.cancel()
+                    break
                 try:
-                    results.extend(future.result())
+                    future = next(as_completed(tuple(pending), timeout=0.1))
+                except TimeoutError:
+                    continue
+                index, batch = pending.pop(future)
+                try:
+                    completed[index] = future.result()
                 except Exception:
                     logging.exception("Translation batch failed")
-                    results.extend(("", tid) for _, tid in batch)
+                    completed[index] = [("", tid) for _, tid in batch]
+        finally:
+            cancelled = self._is_cancelled(generation, cancel_event)
+            executor.shutdown(wait=not cancelled, cancel_futures=True)
+
+        results: List[Tuple[str, int]] = []
+        for index, batch in enumerate(batches):
+            results.extend(
+                completed.get(index, [("", tid) for _, tid in batch])
+            )
         return results
 
     def _translate_batch_group(
         self, items: List[Tuple[str, int]]
     ) -> List[Tuple[str, int]]:
         results: List[Tuple[str, int]] = []
-        for sub_batch in self._split_batches(items):
-            if self._cancelled:
+        prompt_tokens = self._estimate_tokens(self.transcription_options.llm_prompt)
+        for sub_batch in self._split_batches(
+            items,
+            token_budget=self.max_batch_tokens,
+            prompt_tokens=prompt_tokens,
+        ):
+            generation, cancel_event = self._run_context()
+            if self._is_cancelled(generation, cancel_event):
                 break
             if len(sub_batch) == 1:
                 results.append(self._translate_single(*sub_batch[0]))
@@ -429,8 +749,9 @@ class Translator(QObject):
     def _emit_batch_result(
         self,
         results: List[Tuple[str, int]],
+        generation: Optional[int] = None,
     ) -> None:
-        if not self._cancelled:
+        if not self._is_cancelled(generation):
             for translation, tid in results:
                 if translation:
                     self.translation.emit(translation, tid)
@@ -440,13 +761,35 @@ class Translator(QObject):
 
     def start(self):
         logging.debug("Starting translation queue")
-        self._stopping = False
-
-        pending = []
+        with self._state_lock:
+            self._stopping = False
+            if self._cancel_event.is_set():
+                self._cancel_event = threading.Event()
+        executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+        pending = {}
+        completed_in_order = {}
+        next_sequence = 0
+        next_emit = 0
+        preserve_order = False
         stop_after_pending = False
         cancel_seen = False
-        with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS) as executor:
+
+        def consume_cancel_marker() -> bool:
+            with self._state_lock:
+                expected = self._cancel_marker_expected
+                self._cancel_marker_expected = False
+            if expected:
+                return True
+            self._invalidate_generation()
+            with self._state_lock:
+                self._cancel_marker_expected = False
+            return True
+
+        try:
             while True:
+                if self._cancelled or self._stopping:
+                    cancel_seen = True
+
                 while (
                     len(pending) < MAX_CONCURRENT_REQUESTS
                     and not stop_after_pending
@@ -464,71 +807,96 @@ class Translator(QObject):
                         break
 
                     if item is _CANCEL:
+                        consume_cancel_marker()
                         cancel_seen = True
                         break
 
-                    # Collect a batch: start with the first item, then wait
-                    # briefly for more instead of racing get_nowait() into
-                    # single-item requests.
+                    # Collect a short burst into one provider request.
                     batch = [item]
-                    batch_window_expired = False
                     deadline = time.monotonic() + BATCH_WINDOW_SECONDS
                     while len(batch) < BATCH_SIZE:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
-                            batch_window_expired = True
                             break
                         try:
                             next_item = self.queue.get(timeout=remaining)
                         except queue.Empty:
-                            batch_window_expired = True
                             break
                         if next_item is None:
                             stop_after_pending = True
                             break
                         if next_item is _CANCEL:
-                            # Cancel drops already-collected items; they stay
-                            # untranslated and can be re-queued later.
+                            consume_cancel_marker()
                             cancel_seen = True
                             batch = []
                             break
                         batch.append(next_item)
 
                     if batch:
-                        if not pending and batch_window_expired:
-                            try:
-                                results = self._translate_batch_group(batch)
-                            except Exception:
-                                logging.exception("Translation batch failed")
-                                results = [("", tid) for _, tid in batch]
-                            self._emit_batch_result(results)
-                        else:
-                            future = executor.submit(
-                                self._translate_batch_group, batch
-                            )
-                            pending.append((future, batch))
+                        preserve_order = preserve_order or any(
+                            transcript_id is None for _, transcript_id in batch
+                        )
+                        generation, cancel_event = self._capture_generation()
+                        future = executor.submit(
+                            self._run_batch_group,
+                            batch,
+                            generation,
+                            cancel_event,
+                        )
+                        pending[future] = (batch, generation, next_sequence)
+                        next_sequence += 1
+                        self._track_future(future)
+
+                if cancel_seen:
+                    for future in pending:
+                        future.cancel()
+                    pending.clear()
+                    if self._stopping:
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        break
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+                    with self._state_lock:
+                        self._cancelled = False
+                    completed_in_order.clear()
+                    next_sequence = 0
+                    next_emit = 0
+                    preserve_order = False
+                    cancel_seen = False
+                    stop_after_pending = False
+                    continue
 
                 if pending:
-                    # Wait for the oldest submitted batch so live-recording
-                    # translations remain in input order while requests run
-                    # concurrently underneath.
-                    future, batch = pending.pop(0)
+                    try:
+                        future = next(as_completed(tuple(pending), timeout=0.1))
+                    except TimeoutError:
+                        continue
+                    batch, generation, sequence = pending.pop(future)
                     try:
                         results = future.result()
                     except Exception:
                         logging.exception("Translation batch failed")
                         results = [("", tid) for _, tid in batch]
-                    self._emit_batch_result(results)
-                    continue
-
-                if cancel_seen:
-                    self._cancelled = False
-                    cancel_seen = False
+                    if preserve_order:
+                        completed_in_order[sequence] = (results, generation)
+                        while next_emit in completed_in_order:
+                            ready_results, ready_generation = completed_in_order.pop(
+                                next_emit
+                            )
+                            self._emit_batch_result(ready_results, ready_generation)
+                            next_emit += 1
+                    else:
+                        self._emit_batch_result(results, generation)
                     continue
 
                 if stop_after_pending or self._stopping:
                     logging.debug("Translation queue received stop signal")
                     break
+        finally:
+            cancelled = self._stopping or self._cancelled
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=not cancelled, cancel_futures=True)
 
         logging.debug("Translation queue stopped")
         self.finished.emit()
@@ -549,18 +917,24 @@ class Translator(QObject):
         self.queue.put((transcript, transcript_id))
 
     def stop(self):
-        # Flag stops retries/backoff immediately; the sentinel unblocks the
-        # worker so it exits after the current batch without draining the queue.
-        self._stopping = True
+        # Stop retries/backoff and close the transport so shutdown is prompt.
+        with self._state_lock:
+            self._stopping = True
+            event = self._cancel_event
+        event.set()
+        self._cancel_active_futures()
+        self._close_client()
         self.queue.put(None)
 
     def cancel(self):
         """Cancel the current run: drop queued items and discard in-flight
         results. The worker thread stays alive for the next run."""
-        self._cancelled = True
+        self._invalidate_generation()
         while True:
             try:
                 self.queue.get_nowait()
             except queue.Empty:
                 break
+        with self._state_lock:
+            self._cancel_marker_expected = True
         self.queue.put(_CANCEL)
