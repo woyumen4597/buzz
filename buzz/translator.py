@@ -35,8 +35,11 @@ TRANSLATION_CACHE_SIZE = 1024
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 # Must stay below the viewer's graceful shutdown wait so closing the window
-# never has to terminate the worker thread mid-request.
-REQUEST_TIMEOUT = 30.0
+# never has to terminate the worker thread mid-request. Read timeout stays
+# 30s (within the 35s shutdown budget); the connect timeout is shorter so a
+# dead/hung proxy fails fast and the retry can reach a healthy path sooner
+# instead of burning the full budget each attempt.
+REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
 RESPONSES_PROTOCOL = "responses"
 
@@ -462,9 +465,14 @@ class Translator(QObject):
             if not self._acquire_rate_limit(generation, cancel_event):
                 return None
             try:
-                resp = self._client().post(url, headers=headers, json=body)
-                resp.raise_for_status()
-                return self._extract_text(resp.json())
+                # Stream so the read timeout is per-chunk (30s between chunks)
+                # rather than one deadline for the whole body — slow-first-byte
+                # gateways and long responses no longer share the same tight cap.
+                with self._client().stream(
+                    "POST", url, headers=headers, json=body
+                ) as resp:
+                    resp.raise_for_status()
+                    return self._extract_text(resp.json())
             except httpx.HTTPStatusError as e:
                 status = getattr(e.response, "status_code", "unknown")
                 logging.error("Translation error! HTTP %s", status)
@@ -479,7 +487,11 @@ class Translator(QObject):
                     return None
                 self._backoff(attempt, e.response, generation, cancel_event)
             except httpx.TransportError as e:
-                logging.error("Translation error! Network failure (%s)", type(e).__name__)
+                # Transient network failures are retried; only the final attempt
+                # is an error, earlier ones are just progress noise.
+                log = logging.error if attempt == MAX_ATTEMPTS - 1 else logging.warning
+                log("Translation network failure (%s), attempt %d/%d",
+                    type(e).__name__, attempt + 1, MAX_ATTEMPTS)
                 if (
                     self._is_cancelled(generation, cancel_event)
                     or attempt == MAX_ATTEMPTS - 1

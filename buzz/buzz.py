@@ -89,6 +89,11 @@ def main():
     logging.getLogger("training_telemetry_provider").setLevel(logging.ERROR)
     logging.getLogger("default_recorder").setLevel(logging.WARNING)
     logging.getLogger("config").setLevel(logging.WARNING)
+    # These dump per-request HTTP internals (connect_tcp.started / start_tls /
+    # full response header dicts) at DEBUG, drowning the useful app logs.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
     if getattr(sys, "frozen", False) is False:
         stdout_handler = logging.StreamHandler(sys.stdout)
