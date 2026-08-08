@@ -25,6 +25,7 @@ class FileTranscriptionPreferences:
     llm_prompt: str
     llm_model: str
     output_formats: Set["OutputFormat"]
+    use_vad: bool = False
 
     def save(self, settings: QSettings) -> None:
         settings.setValue("language", self.language)
@@ -32,6 +33,7 @@ class FileTranscriptionPreferences:
         settings.setValue("model", self.model)
         settings.setValue("word_level_timings", self.word_level_timings)
         settings.setValue("extract_speech", self.extract_speech)
+        settings.setValue("use_vad", self.use_vad)
         settings.setValue("initial_prompt", self.initial_prompt)
         settings.setValue("enable_llm_translation", self.enable_llm_translation)
         settings.setValue("llm_model", self.llm_model)
@@ -57,6 +59,9 @@ class FileTranscriptionPreferences:
         extract_speech = False if extract_speech_value == "false" \
             else bool(extract_speech_value)
 
+        use_vad_value = settings.value("use_vad", False)
+        use_vad = False if use_vad_value == "false" else bool(use_vad_value)
+
         initial_prompt = settings.value("initial_prompt", "")
         enable_llm_translation_value = settings.value("enable_llm_translation", True)
         enable_llm_translation = False if enable_llm_translation_value == "false" \
@@ -72,6 +77,7 @@ class FileTranscriptionPreferences:
             else TranscriptionModel.default(),
             word_level_timings=word_level_timings,
             extract_speech=extract_speech,
+            use_vad=use_vad,
             initial_prompt=initial_prompt,
             enable_llm_translation=enable_llm_translation,
             llm_model=llm_model,
@@ -96,6 +102,7 @@ class FileTranscriptionPreferences:
             llm_prompt=transcription_options.llm_prompt,
             word_level_timings=transcription_options.word_level_timings,
             extract_speech=transcription_options.extract_speech,
+            use_vad=transcription_options.use_vad,
             model=transcription_options.model,
             output_formats=file_transcription_options.output_formats,
         )
@@ -116,6 +123,7 @@ class FileTranscriptionPreferences:
                 llm_prompt=self.llm_prompt,
                 word_level_timings=self.word_level_timings,
                 extract_speech=self.extract_speech,
+                use_vad=self.use_vad,
                 model=self.model,
                 openai_access_token=openai_access_token,
             ),

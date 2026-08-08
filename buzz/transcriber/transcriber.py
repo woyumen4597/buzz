@@ -162,6 +162,7 @@ class TranscriptionOptions:
     silence_threshold: float = 0.0025
     line_separator: str = "\n\n"
     transcription_step: float = 3.5
+    use_vad: bool = False
 
 
 def humanize_language(language: str) -> str:
@@ -250,6 +251,7 @@ def serialize_task_options(task: FileTranscriptionTask) -> str:
                 },
                 "word_level_timings": options.word_level_timings,
                 "extract_speech": options.extract_speech,
+                "use_vad": options.use_vad,
                 "temperature": list(options.temperature),
                 "initial_prompt": options.initial_prompt,
                 "enable_llm_translation": options.enable_llm_translation,
@@ -372,6 +374,7 @@ def deserialize_task_options(
         extract_speech=as_bool(
             options_data.get("extract_speech", value("extract_speech"))
         ),
+        use_vad=as_bool(options_data.get("use_vad")),
         temperature=temperature,
         initial_prompt=options_data.get("initial_prompt", ""),
         openai_access_token=openai_access_token,

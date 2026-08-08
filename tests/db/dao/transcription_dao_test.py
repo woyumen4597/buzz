@@ -1,3 +1,5 @@
+import json
+
 import pytest
 from unittest.mock import Mock, patch
 from uuid import UUID, uuid4
@@ -15,6 +17,7 @@ from buzz.transcriber.transcriber import (
     Segment,
     source_file_matches_fingerprint,
     Task,
+    TASK_OPTIONS_VERSION,
     TranscriptionOptions,
 )
 
@@ -100,6 +103,7 @@ class TestTranscriptionDAO:
                 ),
                 temperature=(0.1, 0.5),
                 initial_prompt="keep names",
+                use_vad=True,
                 openai_access_token="must-not-persist",
                 enable_llm_translation=True,
                 llm_prompt="translate faithfully",
@@ -130,6 +134,7 @@ class TestTranscriptionDAO:
         assert restored_options.initial_prompt == "keep names"
         assert restored_options.llm_prompt == "translate faithfully"
         assert restored_options.llm_model == "gpt-test"
+        assert restored_options.use_vad is True
         assert restored_options.model.model_type == ModelType.FASTER_WHISPER
         assert restored_options.model.whisper_model_size == WhisperModelSize.SMALL
         assert restored_file_options.output_formats == {OutputFormat.SRT}
@@ -154,7 +159,13 @@ class TestTranscriptionDAO:
     def test_deserialize_task_options_accepts_old_rows(self):
         options, file_options = deserialize_task_options(None)
         assert options.initial_prompt == ""
+        assert options.use_vad is False
         assert file_options.output_formats == set()
+
+        old_json_options, _ = deserialize_task_options(
+            json.dumps({"version": TASK_OPTIONS_VERSION, "transcription_options": {}})
+        )
+        assert old_json_options.use_vad is False
 
     def test_insert_transcription_with_name_and_notes(self, transcription_dao, sample_transcription):
         """Test inserting a transcription with name and notes fields"""

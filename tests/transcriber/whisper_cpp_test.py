@@ -328,6 +328,7 @@ class TestWhisperCpp:
             language=language,
             task=Task.TRANSCRIBE,
             word_level_timings=True,
+            use_vad=vad_enabled,
             model=TranscriptionModel(
                 model_type=ModelType.WHISPER_CPP,
                 whisper_model_size=WhisperModelSize.TINY,
@@ -350,6 +351,26 @@ class TestWhisperCpp:
             with patch("buzz.transcriber.whisper_cpp.os.path.exists", return_value=vad_enabled):
                 with patch("builtins.open", mock_open(read_data=json_bytes.decode("latin-1"))):
                     return WhisperCpp.transcribe(task=task)
+
+    def test_transcribe_only_enables_available_vad_when_requested(self):
+        def task(use_vad):
+            return FileTranscriptionTask(
+                transcription_options=TranscriptionOptions(use_vad=use_vad),
+                file_transcription_options=FileTranscriptionOptions(),
+                model_path="/fake/model.bin",
+                file_path="/fake/audio.wav",
+            )
+
+        with patch.object(WhisperCpp, "_build_command", return_value=[]) as build_command, patch.object(
+            WhisperCpp, "_run_whisper", return_value=0
+        ), patch.object(WhisperCpp, "_read_json_output", return_value={"transcription": []}), patch.object(
+            WhisperCpp, "_cleanup_files"
+        ), patch("buzz.transcriber.whisper_cpp.os.path.exists", return_value=True):
+            WhisperCpp.transcribe(task(False))
+            assert build_command.call_args[0][-1] is False
+
+            WhisperCpp.transcribe(task(True))
+            assert build_command.call_args[0][-1] is True
 
     def test_vad_remaps_word_offsets_to_original_time(self):
         """With VAD enabled, whisper-cli remaps segment offsets back to the original

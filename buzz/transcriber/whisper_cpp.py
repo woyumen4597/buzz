@@ -377,7 +377,9 @@ class WhisperCpp:
         vad_model_path = os.path.join(
             os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
         )
-        vad_enabled = os.path.exists(vad_model_path)
+        vad_enabled = (
+            task.transcription_options.use_vad and os.path.exists(vad_model_path)
+        )
 
         cmd = WhisperCpp._build_command(task, file_to_process, language, vad_enabled)
         return_code = WhisperCpp._run_whisper(cmd)

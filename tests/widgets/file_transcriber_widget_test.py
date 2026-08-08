@@ -4,11 +4,14 @@ from PyQt6.QtCore import QSettings, Qt
 from pytestqt.qtbot import QtBot
 
 from buzz.model_loader import ModelType, TranscriptionModel
-from buzz.transcriber.transcriber import TranscriptionOptions
+from buzz.transcriber.transcriber import FileTranscriptionOptions, TranscriptionOptions
 from buzz.widgets.preferences_dialog.models.file_transcription_preferences import (
     FileTranscriptionPreferences,
 )
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
+from buzz.widgets.transcriber.file_transcription_form_widget import (
+    FileTranscriptionFormWidget,
+)
 from tests.audio import test_audio_path
 
 
@@ -21,6 +24,28 @@ class TestFileTranscriberWidget:
 
         settings.setValue("enable_llm_translation", False)
         assert FileTranscriptionPreferences.load(settings).enable_llm_translation is False
+
+    def test_vad_defaults_off_and_is_persisted(self, tmp_path):
+        settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+
+        preferences = FileTranscriptionPreferences.load(settings)
+        assert preferences.use_vad is False
+
+        preferences.use_vad = True
+        preferences.save(settings)
+
+        assert FileTranscriptionPreferences.load(settings).use_vad is True
+
+    def test_vad_checkbox_updates_transcription_options(self, qtbot: QtBot):
+        form = FileTranscriptionFormWidget(
+            transcription_options=TranscriptionOptions(),
+            file_transcription_options=FileTranscriptionOptions(),
+        )
+        qtbot.add_widget(form)
+
+        assert form.use_vad_checkbox.isChecked() is False
+        form.use_vad_checkbox.setChecked(True)
+        assert form.transcription_options.use_vad is True
 
     def test_should_set_window_title(self, qtbot: QtBot):
         widget = FileTranscriberWidget(
