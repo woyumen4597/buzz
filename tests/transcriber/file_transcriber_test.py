@@ -1,4 +1,5 @@
 import pytest
+from yt_dlp.utils import DownloadCancelled
 
 from buzz.transcriber.file_transcriber import FileTranscriber
 from buzz.transcriber.transcriber import (
@@ -87,6 +88,37 @@ class TestOnDownloadProgress:
     )
     def test_stays_quiet_on_unusable_payloads(self, tmp_path, qtbot, data):
         assert self._emitted(tmp_path, data) == []
+
+
+class TestDownloadCancellation:
+    """Cancel arrives on another thread while ydl.download() blocks. Raising out
+    of yt-dlp's callbacks is the only way to abort it, so both hooks must do so
+    once stop() has run."""
+
+    def _transcriber(self, tmp_path):
+        return StubFileTranscriber(_task(tmp_path, {OutputFormat.SRT}))
+
+    def test_starts_out_running(self, tmp_path, qtbot):
+        assert self._transcriber(tmp_path).stopped is False
+
+    def test_progress_hook_aborts_after_stop(self, tmp_path, qtbot):
+        transcriber = self._transcriber(tmp_path)
+        transcriber.stopped = True
+        with pytest.raises(DownloadCancelled):
+            transcriber.on_download_progress(
+                {"status": "downloading", "downloaded_bytes": 5, "total_bytes": 10}
+            )
+
+    def test_match_filter_passes_while_running(self, tmp_path, qtbot):
+        # None means "keep going" to yt-dlp.
+        assert self._transcriber(tmp_path)._abort_download_if_stopped({}) is None
+
+    def test_match_filter_aborts_after_stop(self, tmp_path, qtbot):
+        # This is the hook that fires during extraction, before any bytes move.
+        transcriber = self._transcriber(tmp_path)
+        transcriber.stopped = True
+        with pytest.raises(DownloadCancelled):
+            transcriber._abort_download_if_stopped({})
 
 
 class TestFileTranscriberTranslationExport:

@@ -304,4 +304,6 @@ class OpenAIWhisperAPIFileTranscriber(FileTranscriber):
             return result_segments
 
     def stop(self):
-        pass
+        # The URL download path in the base class polls this flag, so Cancel has
+        # to set it even when there is no process of our own to tear down.
+        self.stopped = True

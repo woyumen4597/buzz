@@ -11,6 +11,7 @@ from pathlib import Path
 
 from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot
 from yt_dlp import YoutubeDL
+from yt_dlp.utils import DownloadCancelled
 
 from buzz import whisper_audio
 from buzz.assets import APP_BASE_DIR
@@ -37,12 +38,19 @@ class FileTranscriber(QObject):
     def __init__(self, task: FileTranscriptionTask, parent: Optional["QObject"] = None):
         super().__init__(parent)
         self.transcription_task = task
+        # Set by stop(). The URL download path polls this so Cancel interrupts a
+        # download or an ffmpeg transcode instead of running to completion in the
+        # background.
+        self.stopped = False
 
     @pyqtSlot()
     def run(self):
         if self.transcription_task.source == FileTranscriptionTask.Source.URL_IMPORT:
             if not self._download_from_url():
                 return
+
+        if self.stopped:
+            return
 
         try:
             segments = self.transcribe()
@@ -108,10 +116,18 @@ class FileTranscriber(QObject):
 
         extract_options = {
             "logger": logging.getLogger(),
+            # This probe only needs a title. Without these a season/playlist URL
+            # (e.g. bilibili .../play/ss33378) makes yt-dlp recursively resolve
+            # every episode -- over a thousand HTTP round trips before a single
+            # byte of audio is fetched, which looks like a task frozen at 0%.
+            "extract_flat": "in_playlist",
+            "playlist_items": "1",
+            "noplaylist": True,
         }
         if cookiefile:
             extract_options["cookiefile"] = cookiefile
 
+        info = None
         try:
             with YoutubeDL(extract_options) as ydl_info:
                 info = ydl_info.extract_info(self.transcription_task.url, download=False)
@@ -119,6 +135,20 @@ class FileTranscriber(QObject):
         except Exception as exc:
             logging.debug(f"Error extracting video info: {exc}")
             video_title = "audio"
+
+        if self.stopped:
+            return False
+
+        # A playlist/season URL has no single audio track to transcribe. Say so
+        # instead of silently transcribing whichever episode happens to be first.
+        if info is not None and info.get("_type") == "playlist":
+            message = (
+                f"{self.transcription_task.url} is a playlist, not a single video. "
+                f"Add the URL of one video (for bilibili, an .../play/ep... link)."
+            )
+            logging.debug(message)
+            self.error.emit(message)
+            return False
 
         video_title = YoutubeDL.sanitize_info({"title": video_title})["title"]
         for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
@@ -146,6 +176,12 @@ class FileTranscriber(QObject):
             "progress_hooks": [self.on_download_progress],
             "outtmpl": temp_output_path,
             "logger": logging.getLogger(),
+            # Never fan out to a whole playlist from a single task.
+            "noplaylist": True,
+            # Called once per candidate video during extraction, where progress
+            # hooks do not fire yet. Raising DownloadCancelled is yt-dlp's
+            # documented way to abort from here.
+            "match_filter": self._abort_download_if_stopped,
         }
 
         if cookiefile:
@@ -155,9 +191,19 @@ class FileTranscriber(QObject):
             logging.debug(f"Downloading audio file from URL: {self.transcription_task.url}")
             with YoutubeDL(options) as ydl:
                 ydl.download([self.transcription_task.url])
+        except DownloadCancelled:
+            logging.debug("Download canceled by user")
+            return False
         except Exception as exc:
             logging.debug(f"Error downloading audio: {exc}")
+            # stop() aborts the download by raising out of the progress hook;
+            # that is a cancellation, not a failure worth surfacing.
+            if self.stopped:
+                return False
             self.error.emit(str(exc))
+            return False
+
+        if self.stopped:
             return False
 
         downloaded = _find_downloaded_file(temp_output_path)
@@ -182,29 +228,42 @@ class FileTranscriber(QObject):
             wav_file
         ]
 
+        popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.PIPE}
         if sys.platform == "win32":
             si = subprocess.STARTUPINFO()
             si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
             si.wShowWindow = subprocess.SW_HIDE
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
+            popen_kwargs.update(
                 startupinfo=si,
                 env=app_env,
-                creationflags=subprocess.CREATE_NO_WINDOW
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
-        else:
-            result = subprocess.run(cmd, capture_output=True)
 
-        if result.returncode != 0 or not os.path.isfile(wav_file):
+        # Poll instead of subprocess.run so Cancel during a long transcode kills
+        # ffmpeg rather than leaving it running to completion in the background.
+        process = subprocess.Popen(cmd, **popen_kwargs)
+        while True:
+            try:
+                stdout, stderr_bytes = process.communicate(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if self.stopped:
+                    process.kill()
+                    process.communicate()
+                    logging.debug("Canceled audio transcode")
+                    return False
+
+        if process.returncode != 0 or not os.path.isfile(wav_file):
+            if self.stopped:
+                return False
             stderr = (
-                result.stderr.decode(errors="replace")[:2000]
-                if result.stderr
+                stderr_bytes.decode(errors="replace")[:2000]
+                if stderr_bytes
                 else ""
             )
             logging.warning(
                 "Error processing downloaded audio (returncode %s): %s",
-                result.returncode, stderr,
+                process.returncode, stderr,
             )
             raise Exception(
                 f"Error processing downloaded audio: {stderr or 'unknown ffmpeg error'}"
@@ -231,7 +290,21 @@ class FileTranscriber(QObject):
                     ),
                 )
 
+    def _abort_download_if_stopped(self, info_dict, incomplete=False):
+        """yt-dlp match_filter hook. Returning None means "keep going"; raising
+        DownloadCancelled aborts the whole download. This is the only callback
+        yt-dlp runs during extraction, so it is what makes Cancel effective
+        before any bytes start moving."""
+        if self.stopped:
+            raise DownloadCancelled("Canceled by user")
+        return None
+
     def on_download_progress(self, data: dict):
+        # Cancel arrives on another thread while ydl.download() blocks here.
+        # Raising out of the progress hook is how yt-dlp is told to give up.
+        if self.stopped:
+            raise DownloadCancelled("Canceled by user")
+
         if data.get("status") != "downloading":
             return
 
