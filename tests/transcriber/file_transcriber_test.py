@@ -1,3 +1,5 @@
+import pytest
+
 from buzz.transcriber.file_transcriber import FileTranscriber
 from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
@@ -32,6 +34,59 @@ def _task(output_directory, output_formats, translate=False):
         model_path="mock_path",
         output_directory=str(output_directory),
     )
+
+
+class TestOnDownloadProgress:
+    """yt-dlp calls this from inside its progress hook; a raise here aborts the
+    download, so missing/None byte fields must be tolerated."""
+
+    def _emitted(self, tmp_path, data):
+        transcriber = StubFileTranscriber(_task(tmp_path, {OutputFormat.SRT}))
+        received = []
+        transcriber.download_progress.connect(received.append)
+        transcriber.on_download_progress(data)
+        return received
+
+    def test_emits_fraction_from_total_bytes(self, tmp_path, qtbot):
+        assert self._emitted(
+            tmp_path,
+            {"status": "downloading", "downloaded_bytes": 50, "total_bytes": 200},
+        ) == [0.25]
+
+    def test_falls_back_to_total_bytes_estimate(self, tmp_path, qtbot):
+        # DASH/HLS sources (bilibili among them) report only an estimate.
+        assert self._emitted(
+            tmp_path,
+            {
+                "status": "downloading",
+                "downloaded_bytes": 30,
+                "total_bytes_estimate": 120,
+            },
+        ) == [0.25]
+
+    def test_clamps_overshoot_past_estimate(self, tmp_path, qtbot):
+        assert self._emitted(
+            tmp_path,
+            {
+                "status": "downloading",
+                "downloaded_bytes": 150,
+                "total_bytes_estimate": 100,
+            },
+        ) == [1.0]
+
+    @pytest.mark.parametrize(
+        "data",
+        [
+            {"status": "downloading", "downloaded_bytes": 10},
+            {"status": "downloading", "downloaded_bytes": 10, "total_bytes": None},
+            {"status": "downloading", "downloaded_bytes": 10, "total_bytes": 0},
+            {"status": "downloading", "total_bytes": 100},
+            {"status": "finished", "downloaded_bytes": 100, "total_bytes": 100},
+            {},
+        ],
+    )
+    def test_stays_quiet_on_unusable_payloads(self, tmp_path, qtbot, data):
+        assert self._emitted(tmp_path, data) == []
 
 
 class TestFileTranscriberTranslationExport:

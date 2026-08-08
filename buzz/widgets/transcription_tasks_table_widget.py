@@ -68,8 +68,17 @@ def format_record_status_text(record: QSqlRecord) -> str:
     match status:
         case FileTranscriptionTask.Status.IN_PROGRESS:
             in_progress_label = _("In Progress")
-            progress = record.value("progress")
+            progress = record.value("progress") or 0.0
             started_at = record.value("time_started")
+
+            # URL tasks download before transcribing. Transcription progress
+            # stays at 0 for the whole download, so show the download fraction
+            # instead of a status that looks stuck at "In Progress (0%)".
+            download_progress = record.value("download_progress") or 0.0
+            if progress <= 0 and 0 < download_progress < 1:
+                return _("{status} ({progress:.0%})").format(
+                    status=_("Downloading"), progress=download_progress
+                )
             if started_at and progress and progress > 0 and progress < 1:
                 try:
                     started_dt = datetime.fromisoformat(started_at)

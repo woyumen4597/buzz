@@ -596,6 +596,10 @@ msgid "In Progress"
 msgstr "运行中"
 
 #: buzz/widgets/transcription_tasks_table_widget.py
+msgid "Downloading"
+msgstr "下载中"
+
+#: buzz/widgets/transcription_tasks_table_widget.py
 msgid "{status} ({progress:.0%}) — ETA: {eta}"
 msgstr "{status}（{progress:.0%}）— 预计剩余：{eta}"
 

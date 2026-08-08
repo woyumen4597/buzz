@@ -232,8 +232,19 @@ class FileTranscriber(QObject):
                 )
 
     def on_download_progress(self, data: dict):
-        if data["status"] == "downloading":
-            self.download_progress.emit(data["downloaded_bytes"] / data["total_bytes"])
+        if data.get("status") != "downloading":
+            return
+
+        # DASH/HLS sources (bilibili among them) often report only an estimate,
+        # and either field can be missing or None on the first callbacks. A raise
+        # here would propagate out of yt-dlp's progress hook and kill the
+        # download, so bail out quietly instead.
+        total = data.get("total_bytes") or data.get("total_bytes_estimate")
+        downloaded = data.get("downloaded_bytes")
+        if not total or downloaded is None:
+            return
+
+        self.download_progress.emit(min(1.0, downloaded / total))
 
     @abstractmethod
     def transcribe(self) -> List[Segment]:

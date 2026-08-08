@@ -156,6 +156,26 @@ def test_format_record_status_text_logic():
     )
 
 
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        # URL task mid-download: show the download fraction, not a stuck 0%.
+        ({"progress": 0, "download_progress": 0.42}, "Downloading (42%)"),
+        # Download done, transcription not started yet.
+        ({"progress": 0, "download_progress": 1.0}, "In Progress (0%)"),
+        # Local file task: no download phase at all.
+        ({"progress": 0}, "In Progress (0%)"),
+        # Transcribing after a completed download.
+        ({"progress": 0.5, "download_progress": 1.0}, "In Progress (50%)"),
+    ],
+)
+def test_format_record_status_text_download_phase(values, expected):
+    assert (
+        format_record_status_text(mock_record({"status": "IN_PROGRESS", **values}))
+        == expected
+    )
+
+
 def test_column_delegates_text_getters(monkeypatch):
     # Mock the RecordDelegate class itself
     mock_record_delegate_class = MagicMock(spec=QStyledItemDelegate)
