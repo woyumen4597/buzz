@@ -61,6 +61,36 @@ class ColDef:
     width: Optional[int] = None
     delegate: Optional[QStyledItemDelegate] = None
     hidden_toggleable: bool = True
+    # Floor for both viewport compaction and widths restored from settings, so a
+    # column cannot come back from a previous session too narrow to read.
+    min_width: int = 120
+
+
+def record_download_progress(record: QSqlRecord) -> Optional[float]:
+    """Download fraction while a URL task is still downloading, else None.
+
+    URL tasks download before transcribing, and transcription progress stays at
+    0 for the whole download. Both the status and task columns key off this so
+    the download phase is not reported as a transcription stuck at 0%.
+    """
+    if FileTranscriptionTask.Status(record.value("status")) != (
+        FileTranscriptionTask.Status.IN_PROGRESS
+    ):
+        return None
+
+    progress = record.value("progress") or 0.0
+    download_progress = record.value("download_progress") or 0.0
+    if progress <= 0 and 0 < download_progress < 1:
+        return download_progress
+    return None
+
+
+def format_record_task_text(record: QSqlRecord) -> str:
+    # Nothing is being transcribed or translated yet while bytes are still
+    # coming down, so name the phase that is actually running.
+    if record_download_progress(record) is not None:
+        return _("Downloading")
+    return TASK_LABEL_TRANSLATIONS[Task(record.value("task"))]
 
 
 def format_record_status_text(record: QSqlRecord) -> str:
@@ -71,11 +101,8 @@ def format_record_status_text(record: QSqlRecord) -> str:
             progress = record.value("progress") or 0.0
             started_at = record.value("time_started")
 
-            # URL tasks download before transcribing. Transcription progress
-            # stays at 0 for the whole download, so show the download fraction
-            # instead of a status that looks stuck at "In Progress (0%)".
-            download_progress = record.value("download_progress") or 0.0
-            if progress <= 0 and 0 < download_progress < 1:
+            download_progress = record_download_progress(record)
+            if download_progress is not None:
                 return _("{status} ({progress:.0%})").format(
                     status=_("Downloading"), progress=download_progress
                 )
@@ -128,6 +155,7 @@ column_definitions = [
         header=_("File Name / URL"),
         column=Column.FILE,
         width=400,
+        min_width=240,
         delegate=RecordDelegate(
             text_getter=lambda record: record.value("name") or (
                 os.path.basename(record.value("file")) if record.value("file")
@@ -141,6 +169,7 @@ column_definitions = [
         header=_("Model"),
         column=Column.MODEL_TYPE,
         width=180,
+        min_width=130,
         delegate=RecordDelegate(
             text_getter=lambda record: str(TranscriptionRecord.model(record))
         ),
@@ -150,15 +179,17 @@ column_definitions = [
         header=_("Task"),
         column=Column.TASK,
         width=120,
-        delegate=RecordDelegate(
-            text_getter=lambda record: TASK_LABEL_TRANSLATIONS[Task(record.value("task"))]
-        ),
+        min_width=90,
+        delegate=RecordDelegate(text_getter=format_record_task_text),
     ),
     ColDef(
         id="status",
         header=_("Status"),
         column=Column.STATUS,
-        width=180,
+        # Status carries the longest text in the table: a progress percentage
+        # plus an ETA, or a whole error message. 180px elided all of it.
+        width=320,
+        min_width=220,
         delegate=RecordDelegate(text_getter=format_record_status_text),
         hidden_toggleable=True,
     ),
@@ -168,6 +199,7 @@ column_definitions = [
         header=_("Date Completed"),
         column=Column.TIME_ENDED,
         width=180,
+        min_width=180,
         delegate=RecordDelegate(
             text_getter=lambda record: datetime.fromisoformat(
                 record.value("time_ended")
@@ -180,6 +212,7 @@ column_definitions = [
         header=_("Date Added"),
         column=Column.TIME_QUEUED,
         width=180,
+        min_width=180,
         delegate=RecordDelegate(
             text_getter=lambda record: datetime.fromisoformat(
                 record.value("time_queued")
@@ -352,12 +385,8 @@ class TranscriptionTasksTableWidget(QTableView):
             return
 
         minimum_widths = {
-            Column.FILE.value: 240,
-            Column.MODEL_TYPE.value: 130,
-            Column.STATUS.value: 145,
-            Column.TASK.value: 90,
-            Column.TIME_ENDED.value: 180,
-            Column.TIME_QUEUED.value: 180,
+            definition.column.value: definition.min_width
+            for definition in column_definitions
         }
         scale = available_width / sum(current_widths.values())
         compact_widths = {
@@ -477,13 +506,35 @@ class TranscriptionTasksTableWidget(QTableView):
 
     def load_column_widths(self):
         """Load saved column widths from settings"""
+        # Read every saved width before touching the header. setColumnWidth fires
+        # sectionResized -> save_column_widths(), which rewrites *all* widths from
+        # the header's current state; reading inside that loop would hand back
+        # values the previous iteration had already overwritten with defaults.
         self.settings.begin_group(Settings.Key.TRANSCRIPTION_TASKS_TABLE_COLUMN_WIDTHS)
-        for definition in column_definitions:
-            if definition.width is not None:  # Only load if column has a default width
-                saved_width = self.settings.settings.value(definition.id, definition.width)
-                if saved_width is not None:
-                    self.setColumnWidth(definition.column.value, int(saved_width))
+        saved_widths = {
+            definition.column.value: self.settings.settings.value(
+                definition.id, definition.width
+            )
+            for definition in column_definitions
+            if definition.width is not None
+        }
         self.settings.end_group()
+
+        minimum_widths = {
+            definition.column.value: definition.min_width
+            for definition in column_definitions
+        }
+        # Blocked so restoring widths is not mistaken for the user dragging them.
+        with QSignalBlocker(self.horizontalHeader()):
+            for column, saved_width in saved_widths.items():
+                if saved_width is None:
+                    continue
+                # Clamp up: a width saved while the table was squeezed into a
+                # narrow window should not permanently elide the column.
+                self.setColumnWidth(
+                    column,
+                    max(minimum_widths.get(column, 120), int(saved_width)),
+                )
 
     def save_sort_state(self):
         """Save current sort state to settings"""
@@ -628,13 +679,18 @@ class TranscriptionTasksTableWidget(QTableView):
         # --- Apply visibility, widths, and order ---
         header = self.horizontalHeader()
 
-        # First, set visibility and width for each column
-        for definition in column_definitions:
-            is_visible = visibility_settings.get(definition.id, True)
-            width = width_settings.get(definition.id, definition.width)
-            self.setColumnHidden(definition.column.value, not is_visible)
-            if width is not None:
-                self.setColumnWidth(definition.column.value, max(width, 100))
+        # First, set visibility and width for each column. Block the header so
+        # each setColumnWidth does not fire sectionResized -> save_column_widths
+        # and write half-applied state back over the settings we just read.
+        with QSignalBlocker(header):
+            for definition in column_definitions:
+                is_visible = visibility_settings.get(definition.id, True)
+                width = width_settings.get(definition.id, definition.width)
+                self.setColumnHidden(definition.column.value, not is_visible)
+                if width is not None:
+                    self.setColumnWidth(
+                        definition.column.value, max(width, definition.min_width)
+                    )
 
         # Then, apply column order
         # Build a list of (logical_index, visual_position) for ALL columns (including hidden ones)

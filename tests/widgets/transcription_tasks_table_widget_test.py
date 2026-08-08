@@ -15,10 +15,12 @@ from buzz.widgets.transcription_tasks_table_widget import (
     TranscriptionTasksTableWidget,
     TranscriptionTasksTableHeaderView,
     format_record_status_text,
+    format_record_task_text,
+    record_download_progress,
     Column,
     column_definitions,
 )
-from buzz.transcriber.transcriber import Task
+from buzz.transcriber.transcriber import Task, TASK_LABEL_TRANSLATIONS
 from buzz.widgets.transcription_record import TranscriptionRecord
 
 
@@ -174,6 +176,51 @@ def test_format_record_status_text_download_phase(values, expected):
         format_record_status_text(mock_record({"status": "IN_PROGRESS", **values}))
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    "values, expected",
+    [
+        # Mid-download there is no transcription running yet, so the task column
+        # names the download instead of the eventual task.
+        ({"status": "IN_PROGRESS", "progress": 0, "download_progress": 0.42}, True),
+        # Download finished: back to the real task.
+        ({"status": "IN_PROGRESS", "progress": 0, "download_progress": 1.0}, False),
+        # Local file task, no download phase at all.
+        ({"status": "IN_PROGRESS", "progress": 0.5}, False),
+        ({"status": "QUEUED"}, False),
+        ({"status": "COMPLETED"}, False),
+    ],
+)
+def test_format_record_task_text(values, expected):
+    text = format_record_task_text(
+        mock_record({"task": Task.TRANSCRIBE.value, **values})
+    )
+    if expected:
+        assert text == "Downloading"
+    else:
+        assert text == TASK_LABEL_TRANSLATIONS[Task.TRANSCRIBE]
+
+
+def test_record_download_progress_only_while_downloading():
+    assert (
+        record_download_progress(
+            mock_record(
+                {"status": "IN_PROGRESS", "progress": 0, "download_progress": 0.42}
+            )
+        )
+        == 0.42
+    )
+    # A finished download is not "downloading" anymore.
+    assert (
+        record_download_progress(
+            mock_record(
+                {"status": "IN_PROGRESS", "progress": 0, "download_progress": 1.0}
+            )
+        )
+        is None
+    )
+    assert record_download_progress(mock_record({"status": "QUEUED"})) is None
 
 
 def test_column_delegates_text_getters(monkeypatch):
@@ -365,6 +412,20 @@ class TestTranscriptionTasksTableWidget:
         new_widget = TranscriptionTasksTableWidget()
         # Width should be loaded from settings (mocked to return 500)
         assert new_widget.columnWidth(Column.FILE.value) == 500
+
+    def test_loading_widths_clamps_up_to_minimum(self, widget):
+        """A width saved while the window was squeezed should not come back so
+        narrow that the column is permanently elided."""
+        status_def = next(
+            definition
+            for definition in column_definitions
+            if definition.column == Column.STATUS
+        )
+        widget.setColumnWidth(Column.STATUS.value, 40)
+        widget.save_column_widths()
+
+        new_widget = TranscriptionTasksTableWidget()
+        assert new_widget.columnWidth(Column.STATUS.value) == status_def.min_width
 
     def test_column_order_management(self, widget):
         """Test column order save/load functionality"""
