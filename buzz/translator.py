@@ -339,6 +339,10 @@ class Translator(QObject):
             body = {
                 "model": self.llm_model,
                 "max_output_tokens": 4096,
+                # Ask the upstream to stream. Without this the gateway buffers
+                # the whole completion before sending a byte, so a large batch
+                # blows the read timeout on time-to-first-byte alone.
+                "stream": True,
                 "input": [
                     {
                         "role": "system",
@@ -357,6 +361,10 @@ class Translator(QObject):
             body = {
                 "model": self.llm_model,
                 "max_tokens": 4096,
+                # See the note in the responses branch: streaming is what makes
+                # the 30s read timeout a per-chunk gap instead of a hard cap on
+                # the entire generation.
+                "stream": True,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
@@ -397,6 +405,77 @@ class Translator(QObject):
             return text
         logging.error("Translation error! Unexpected response shape")
         return None
+
+    def _read_stream(self, resp: httpx.Response) -> Optional[str]:
+        """Accumulate an SSE response body into the full text.
+
+        Falls back to whole-body JSON when the gateway ignores `stream: true`
+        and answers with a plain completion object instead of an event stream.
+        """
+        chunks: List[str] = []
+        raw_lines: List[str] = []
+        saw_events = False
+
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            if not line.startswith("data:"):
+                # Not SSE — remember it in case this is a buffered JSON body.
+                raw_lines.append(line)
+                continue
+            saw_events = True
+            payload = line[len("data:") :].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except (ValueError, TypeError):
+                continue
+            if not isinstance(event, dict):
+                continue
+            chunks.append(self._stream_delta(event))
+
+        if saw_events:
+            text = "".join(chunks)
+            if text:
+                logging.debug("Received streamed translation (%d chars)", len(text))
+                return text
+            logging.error("Translation error! Empty event stream")
+            return None
+
+        # No SSE framing at all: treat the body as one JSON document.
+        try:
+            return self._extract_text(json.loads("".join(raw_lines)))
+        except (ValueError, TypeError):
+            logging.error("Translation error! Unparsable response body")
+            return None
+
+    def _stream_delta(self, event: dict) -> str:
+        """Pull the incremental text out of one SSE event."""
+        if self.api_protocol == RESPONSES_PROTOCOL:
+            if event.get("type") == "response.output_text.delta":
+                delta = event.get("delta")
+                return delta if isinstance(delta, str) else ""
+            return ""
+
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        delta = first.get("delta")
+        if isinstance(delta, dict):
+            content = delta.get("content")
+            if isinstance(content, str):
+                return content
+        # Some gateways replay non-streaming `message` objects inside events.
+        message = first.get("message")
+        if isinstance(message, dict):
+            content = message.get("content")
+            if isinstance(content, str):
+                return content
+        return ""
 
     @staticmethod
     def _is_retryable_status(status: int) -> bool:
@@ -459,6 +538,27 @@ class Translator(QObject):
         if generation is None and cancel_event is None:
             generation, cancel_event = self._run_context()
         url, headers, body = self._build_request(system, user_content, json_mode)
+
+        # Failure diagnostics: emitted ONLY when a request fails, so the success
+        # path stays silent. Body sizes plus time-to-first-byte are what tell a
+        # slow-generation stall apart from a genuine network fault.
+        t_start = time.monotonic()
+        user_bytes = len(user_content.encode("utf-8")) if user_content else 0
+        system_bytes = len(system.encode("utf-8")) if system else 0
+        n_segments = user_content.count("[") if user_content else 0  # batch marker count
+        t_sent = t_last_touch = None
+
+        def _diag(exc_type: str, status=None, attempts: int = 0):
+            now = time.monotonic()
+            parts = [
+                f"{exc_type} status={status} attempts={attempts}",
+                f"elapsed={now - t_start:.1f}s",
+                f"user={user_bytes}B system={system_bytes}B seg_markers={n_segments}",
+            ]
+            if t_sent is not None:
+                parts.append(f"to_first_byte={(t_last_touch or now) - t_sent:.1f}s")
+            logging.error("Translation diag: " + " | ".join(parts))
+
         for attempt in range(MAX_ATTEMPTS):
             if self._is_cancelled(generation, cancel_event):
                 return None
@@ -468,13 +568,17 @@ class Translator(QObject):
                 # Stream so the read timeout is per-chunk (30s between chunks)
                 # rather than one deadline for the whole body — slow-first-byte
                 # gateways and long responses no longer share the same tight cap.
+                t_sent = time.monotonic()
                 with self._client().stream(
                     "POST", url, headers=headers, json=body
                 ) as resp:
+                    t_last_touch = time.monotonic()
                     resp.raise_for_status()
-                    return self._extract_text(resp.json())
+                    t_last_touch = time.monotonic()
+                    return self._read_stream(resp)
             except httpx.HTTPStatusError as e:
                 status = getattr(e.response, "status_code", "unknown")
+                _diag("HTTPStatusError", status=status, attempts=attempt + 1)
                 logging.error("Translation error! HTTP %s", status)
                 retryable_status = (
                     isinstance(status, int) and self._is_retryable_status(status)
@@ -489,6 +593,7 @@ class Translator(QObject):
             except httpx.TransportError as e:
                 # Transient network failures are retried; only the final attempt
                 # is an error, earlier ones are just progress noise.
+                _diag(type(e).__name__, status=None, attempts=attempt + 1)
                 log = logging.error if attempt == MAX_ATTEMPTS - 1 else logging.warning
                 log("Translation network failure (%s), attempt %d/%d",
                     type(e).__name__, attempt + 1, MAX_ATTEMPTS)
@@ -498,7 +603,24 @@ class Translator(QObject):
                 ):
                     return None
                 self._backoff(attempt, generation=generation, cancel_event=cancel_event)
+            except httpx.StreamError as e:
+                # StreamError (e.g. ResponseNotRead) subclasses RuntimeError, not
+                # TransportError, so it used to fall through to the catch-all below
+                # and kill the whole batch without a single retry. It means the
+                # body was cut short mid-flight, which is exactly as transient as
+                # a ReadTimeout — retry it the same way.
+                _diag(type(e).__name__, status=None, attempts=attempt + 1)
+                log = logging.error if attempt == MAX_ATTEMPTS - 1 else logging.warning
+                log("Translation stream failure (%s), attempt %d/%d",
+                    type(e).__name__, attempt + 1, MAX_ATTEMPTS)
+                if (
+                    self._is_cancelled(generation, cancel_event)
+                    or attempt == MAX_ATTEMPTS - 1
+                ):
+                    return None
+                self._backoff(attempt, generation=generation, cancel_event=cancel_event)
             except Exception as e:
+                _diag(type(e).__name__, status=None, attempts=attempt + 1)
                 logging.error("Translation error! %s", type(e).__name__)
                 return None
         return None

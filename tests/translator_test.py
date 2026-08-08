@@ -1,6 +1,6 @@
 import threading
 import time
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, call, patch, MagicMock
 
 import httpx
 from PyQt6.QtCore import QThread
@@ -14,8 +14,37 @@ from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 
 
+def _sse_lines(text, protocol=CHAT_COMPLETIONS_PROTOCOL):
+    """Convert text into SSE delta lines for streaming response."""
+    lines = []
+    if protocol == RESPONSES_PROTOCOL:
+        for char in text:
+            lines.append(f'data: {{"type":"response.output_text.delta","delta":"{char}"}}')
+    else:
+        for char in text:
+            lines.append(f'data: {{"choices":[{{"delta":{{"content":"{char}"}}}}]}}')
+    lines.append("data: [DONE]")
+    return lines
+
+
+def _stream_response(text=None, lines=None, protocol=CHAT_COMPLETIONS_PROTOCOL):
+    """Create a mock streaming response that supports context manager."""
+    if lines is None:
+        lines = _sse_lines(text or "", protocol)
+
+    resp = MagicMock()
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=None)
+    resp.raise_for_status = MagicMock(return_value=None)
+    resp.iter_lines = MagicMock(return_value=iter(lines))
+    return resp
+
+
 def _failing_response(status_code, retry_after=None):
-    resp = Mock(status_code=status_code)
+    resp = MagicMock()
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=None)
+    resp.status_code = status_code
     resp.raise_for_status.side_effect = httpx.HTTPStatusError(
         f"HTTP {status_code}", request=Mock(), response=resp
     )
@@ -25,9 +54,27 @@ def _failing_response(status_code, retry_after=None):
 
 
 def _success_response(content):
-    resp = Mock(status_code=200)
+    resp = MagicMock()
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=None)
+    resp.status_code = 200
     resp.raise_for_status.return_value = None
     resp.json.return_value = content
+    lines = []
+    if "choices" in content and content["choices"]:
+        # Chat completions protocol - extract message content
+        text = content["choices"][0].get("message", {}).get("content", "")
+        lines = _sse_lines(text, CHAT_COMPLETIONS_PROTOCOL)
+    elif "output" in content:
+        # Responses protocol - extract text from output
+        text = ""
+        for item in content.get("output", []):
+            if item.get("type") == "message":
+                for block in item.get("content", []):
+                    if block.get("type") == "output_text":
+                        text += block.get("text", "")
+        lines = _sse_lines(text, RESPONSES_PROTOCOL)
+    resp.iter_lines = MagicMock(return_value=iter(lines))
     return resp
 
 
@@ -198,12 +245,12 @@ class TestTranslationRuntimeControls:
         closed = threading.Event()
         client = Mock()
 
-        def post(*args, **kwargs):
+        def stream(*args, **kwargs):
             started.set()
             closed.wait(2)
             raise httpx.ConnectError("closed")
 
-        client.post.side_effect = post
+        client.stream.side_effect = stream
         client.close.side_effect = closed.set
         translator._client_instance = client
         result = []
@@ -373,8 +420,8 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.return_value = _success_response(
-            {"choices": [{"message": {"content": "AI Translated"}}]}
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=CHAT_COMPLETIONS_PROTOCOL
         )
         mock_client_class.return_value = mock_client
 
@@ -391,8 +438,9 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate this text:", "Hello") == "AI Translated"
-        mock_client_class.assert_called_once_with(timeout=30.0)
-        mock_client.post.assert_called_once_with(
+        mock_client_class.assert_called_once_with(timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0))
+        mock_client.stream.assert_called_once_with(
+            "POST",
             "https://api.openai.com/v1/chat/completions",
             headers={
                 "Authorization": "Bearer openai-key",
@@ -401,6 +449,7 @@ class TestTranslator:
             json={
                 "model": "gpt-4o-mini",
                 "max_tokens": 4096,
+                "stream": True,
                 "messages": [
                     {"role": "system", "content": "Translate this text:"},
                     {"role": "user", "content": "Hello"},
@@ -415,15 +464,8 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.return_value = _success_response(
-            {
-                "output": [
-                    {
-                        "type": "message",
-                        "content": [{"type": "output_text", "text": "AI Translated"}],
-                    }
-                ]
-            }
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=RESPONSES_PROTOCOL
         )
         mock_client_class.return_value = mock_client
 
@@ -439,7 +481,8 @@ class TestTranslator:
             translator._messages("Translate this text:", "Hello", json_mode=True)
             == "AI Translated"
         )
-        mock_client.post.assert_called_once_with(
+        mock_client.stream.assert_called_once_with(
+            "POST",
             "https://api.openai.com/v1/responses",
             headers={
                 "Authorization": "Bearer openai-key",
@@ -448,6 +491,7 @@ class TestTranslator:
             json={
                 "model": "gpt-4o-mini",
                 "max_output_tokens": 4096,
+                "stream": True,
                 "input": [
                     {
                         "role": "system",
@@ -473,8 +517,8 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.return_value = _success_response(
-            {"choices": [{"message": {"content": '{"translations": {}}'}}]}
+        mock_client.stream.return_value = _stream_response(
+            '{"translations": {}}'
         )
         mock_client_class.return_value = mock_client
 
@@ -485,7 +529,7 @@ class TestTranslator:
         )
 
         translator._messages("Translate:", "Hello", json_mode=True)
-        request_body = mock_client.post.call_args.kwargs["json"]
+        request_body = mock_client.stream.call_args.kwargs["json"]
         assert request_body["response_format"] == {"type": "json_object"}
 
     @patch('buzz.translator.httpx.Client')
@@ -505,8 +549,8 @@ class TestTranslator:
 
         mock_queue.get.side_effect = side_effect
         mock_client = Mock()
-        mock_client.post.return_value = _success_response(
-            {"choices": [{"message": {"content": "AI Translated: Hello, how are you?"}}]}
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated: Hello, how are you?"
         )
         mock_client_class.return_value = mock_client
 
@@ -526,7 +570,7 @@ class TestTranslator:
         translator.start()
 
         mock_queue.get.assert_called()
-        mock_client.post.assert_called()
+        mock_client.stream.assert_called()
 
         translator.stop()
 
@@ -635,8 +679,8 @@ class TestTranslator:
             assert text.startswith("AI Translated:")
 
         mock_client = Mock()
-        mock_client.post.return_value = _success_response(
-            {"choices": [{"message": {"content": "AI Translated: Hello, how are you?"}}]}
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated: Hello, how are you?"
         )
         mock_client_class.return_value = mock_client
 
@@ -702,8 +746,8 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.side_effect = [_failing_response(500)] * 3 + [
-            _success_response({"choices": [{"message": {"content": "AI Translated"}}]})
+        mock_client.stream.side_effect = [_failing_response(500)] * 3 + [
+            _stream_response("AI Translated")
         ]
         mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
@@ -713,7 +757,7 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") == "AI Translated"
-        assert mock_client.post.call_count == 4
+        assert mock_client.stream.call_count == 4
 
     @patch('buzz.translator.time.sleep')
     @patch('buzz.translator.httpx.Client')
@@ -725,9 +769,9 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.side_effect = [
+        mock_client.stream.side_effect = [
             _failing_response(429, retry_after="2"),
-            _success_response({"choices": [{"message": {"content": "AI Translated"}}]}),
+            _stream_response("AI Translated"),
         ]
         mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
@@ -737,7 +781,7 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") == "AI Translated"
-        assert mock_client.post.call_count == 2
+        assert mock_client.stream.call_count == 2
         # delay = max(2**0, min(2, 30)) = 2.0s, slept in 0.5s slices
         assert mock_sleep.call_count == 4
         mock_sleep.assert_has_calls([call(0.5)] * 4)
@@ -752,10 +796,10 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.side_effect = [
+        mock_client.stream.side_effect = [
             httpx.ConnectError("connection refused"),
             httpx.ConnectError("connection refused"),
-            _success_response({"choices": [{"message": {"content": "AI Translated"}}]}),
+            _stream_response("AI Translated"),
         ]
         mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
@@ -765,7 +809,7 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") == "AI Translated"
-        assert mock_client.post.call_count == 3
+        assert mock_client.stream.call_count == 3
 
     @patch('buzz.translator.httpx.Client')
     def test_messages_does_not_retry_auth_error(
@@ -776,7 +820,7 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.side_effect = [_failing_response(401)]
+        mock_client.stream.side_effect = [_failing_response(401)]
         mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
         translator = Translator(
@@ -785,7 +829,7 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") is None
-        assert mock_client.post.call_count == 1
+        assert mock_client.stream.call_count == 1
 
     @patch('buzz.translator.httpx.Client')
     def test_messages_does_not_retry_unexpected_errors(
@@ -796,7 +840,7 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.post.side_effect = [Exception("temporary failure")]
+        mock_client.stream.side_effect = [Exception("temporary failure")]
         mock_client_class.return_value = mock_client
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
         translator = Translator(
@@ -805,4 +849,62 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate:", "Hello") is None
-        assert mock_client.post.call_count == 1
+        assert mock_client.stream.call_count == 1
+
+    @patch('buzz.translator.time.sleep')
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_retries_response_not_read(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch
+    ):
+        """A dropped stream body must be retried, not lose the whole batch.
+
+        httpx.ResponseNotRead is a StreamError/RuntimeError, not a
+        TransportError, so it used to fall through to the catch-all handler
+        and return None without a single retry.
+        """
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+
+        dropped = MagicMock()
+        dropped.__enter__ = MagicMock(return_value=dropped)
+        dropped.__exit__ = MagicMock(return_value=None)
+        dropped.raise_for_status = MagicMock(return_value=None)
+        dropped.iter_lines = MagicMock(side_effect=httpx.ResponseNotRead())
+
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            dropped,
+            _stream_response("AI Translated"),
+        ]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "AI Translated"
+        assert mock_client.stream.call_count == 2
+
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_falls_back_to_buffered_json(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """A gateway that ignores `stream: true` still has to work."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            lines=['{"choices": [{"message": {"content": "Buffered"}}]}']
+        )
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "Buffered"
