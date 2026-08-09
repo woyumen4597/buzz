@@ -87,6 +87,8 @@ set SOME_OTHER_VARIABLE=some_other_value
 
 **BUZZ_DOWNLOAD_COOKIEFILE** - 用于下载私有视频或绕过反机器人保护的 [cookiefile](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp) 的位置。
 
+**BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER** - 直接从本地浏览器配置读取 cookie（而非从文件读取），用于下载私有视频或绕过反机器人保护。取值与 yt-dlp 的 `--cookies-from-browser` 相同：`BROWSER[+KEYRING][:PROFILE][::CONTAINER]`，例如 `BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER=chrome` 或 `BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER=firefox:default`。支持的浏览器：brave、chrome、chromium、edge、firefox、opera、safari、vivaldi、whale。可与 `BUZZ_DOWNLOAD_COOKIEFILE` 同时使用。注意：浏览器必须在所转写 URL 的**同一域名**上处于登录状态；macOS 上基于 Chromium 的浏览器可能会弹出钥匙串授权请求。
+
 **BUZZ_FORCE_CPU** - 强制 Buzz 使用 CPU 而不是 GPU，适用于旧 GPU 较慢或 GPU 有问题的设置。示例用法：`BUZZ_FORCE_CPU=true`。自 `1.2.1` 版本起可用。
 
 **BUZZ_MERGE_REGROUP_RULE** - 合并带有单词级时间戳的转录时使用的自定义重新分组规则。更多可用选项的信息请参阅 [stable-ts 仓库](https://github.com/jianfch/stable-ts?tab=readme-ov-file#regrouping-methods)。自 `1.3.0` 版本起可用。

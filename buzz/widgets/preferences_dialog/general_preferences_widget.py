@@ -4,7 +4,7 @@ import httpx
 from typing import Optional
 from platformdirs import user_documents_dir
 
-from PyQt6.QtCore import QRunnable, QObject, pyqtSignal, QThreadPool, QLocale
+from PyQt6.QtCore import QRunnable, QObject, pyqtSignal, QThreadPool, QLocale, Qt
 from PyQt6.QtWidgets import (
     QWidget,
     QFormLayout,
@@ -12,11 +12,15 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QCheckBox,
     QHBoxLayout,
+    QVBoxLayout,
     QFileDialog,
     QSpinBox,
     QComboBox,
     QLabel,
     QSizePolicy,
+    QGroupBox,
+    QScrollArea,
+    QFrame,
 )
 from PyQt6.QtGui import QIcon
 
@@ -27,6 +31,7 @@ from buzz.settings.settings import (
     Settings,
 )
 from buzz.store.keyring_store import get_password, Key
+from buzz.transcriber.download_cookies import supported_browsers
 from buzz.widgets.line_edit import LineEdit
 from buzz.widgets.openai_api_key_line_edit import OpenAIAPIKeyLineEdit
 from buzz.locale import _
@@ -75,7 +80,37 @@ class GeneralPreferencesWidget(QWidget):
 
         self.openai_api_key = get_password(Key.OPENAI_API_KEY)
 
-        layout = QFormLayout(self)
+        # One box per concern, and the whole thing scrolls. The old flat form was
+        # taller than the dialog, so Qt compressed the rows on top of each other.
+        root_layout = QVBoxLayout(self)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(12, 12, 12, 12)
+        content_layout.setSpacing(12)
+
+        def add_group(title: str) -> QFormLayout:
+            group = QGroupBox(title, content)
+            form = QFormLayout(group)
+            # Fields share a single width instead of each one picking its own.
+            form.setFieldGrowthPolicy(
+                QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow
+            )
+            form.setRowWrapPolicy(QFormLayout.RowWrapPolicy.DontWrapRows)
+            form.setLabelAlignment(
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+            )
+            form.setHorizontalSpacing(12)
+            form.setVerticalSpacing(8)
+            content_layout.addWidget(group)
+            return form
+
+        interface_layout = add_group(_("Interface"))
+        transcription_layout = add_group(_("Transcription"))
+        openai_layout = add_group(_("OpenAI API"))
+        url_layout = add_group(_("URL download"))
+        export_layout = add_group(_("Export and live recording"))
 
         self.ui_language_combo_box = QComboBox(self)
         self.ui_language_combo_box.addItems(ui_locales.values())
@@ -100,15 +135,20 @@ class GeneralPreferencesWidget(QWidget):
         self.load_note_tooltip_icon.setVisible(False)
         self.ui_locale_layout.addWidget(self.load_note_tooltip_icon)
 
-        layout.addRow(_("Ui Language"), self.ui_locale_layout)
+        interface_layout.addRow(_("Ui Language"), self.ui_locale_layout)
 
         self.font_size_spin_box = QSpinBox(self)
         self.font_size_spin_box.setMinimum(8)
         self.font_size_spin_box.setMaximum(32)
         self.font_size_spin_box.setValue(self.font().pointSize())
         self.font_size_spin_box.valueChanged.connect(self.on_font_size_changed)
+        # Numeric fields keep their natural size instead of stretching the row.
+        self.font_size_spin_box.setMaximumWidth(90)
+        self.font_size_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
 
-        layout.addRow(_("Font Size"), self.font_size_spin_box)
+        interface_layout.addRow(_("Font Size"), self.font_size_spin_box)
 
         self.transcription_concurrency_spin_box = QSpinBox(self)
         self.transcription_concurrency_spin_box.setRange(
@@ -124,7 +164,11 @@ class GeneralPreferencesWidget(QWidget):
         self.transcription_concurrency_spin_box.valueChanged.connect(
             self.on_transcription_concurrency_changed
         )
-        layout.addRow(
+        self.transcription_concurrency_spin_box.setMaximumWidth(90)
+        self.transcription_concurrency_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        transcription_layout.addRow(
             _("Transcription concurrency"),
             self.transcription_concurrency_spin_box,
         )
@@ -135,15 +179,22 @@ class GeneralPreferencesWidget(QWidget):
         )
         self.openai_api_key_line_edit.focus_out.connect(self.on_openai_api_key_focus_out)
         self.openai_api_key_line_edit.setMinimumWidth(200)
+        self.openai_api_key_line_edit.setObjectName("OpenAIAPIKeyLineEdit")
 
         self.test_openai_api_key_button = QPushButton(_("Test"))
+        self.test_openai_api_key_button.setObjectName("TestOpenAIAPIKeyButton")
         self.test_openai_api_key_button.clicked.connect(
             self.on_click_test_openai_api_key_button
         )
         self.update_test_openai_api_key_button()
 
-        layout.addRow(_("OpenAI API key"), self.openai_api_key_line_edit)
-        layout.addRow("", self.test_openai_api_key_button)
+        # Inline, so the button keeps its natural size instead of being stretched
+        # across an otherwise empty row.
+        openai_api_key_row = QHBoxLayout()
+        openai_api_key_row.addWidget(self.openai_api_key_line_edit)
+        openai_api_key_row.addWidget(self.test_openai_api_key_button)
+
+        openai_layout.addRow(_("OpenAI API key"), openai_api_key_row)
 
         self.custom_openai_base_url = self.settings.value(
             key=Settings.Key.CUSTOM_OPENAI_BASE_URL, default_value=""
@@ -155,7 +206,9 @@ class GeneralPreferencesWidget(QWidget):
         )
         self.custom_openai_base_url_line_edit.setMinimumWidth(200)
         self.custom_openai_base_url_line_edit.setPlaceholderText("https://api.openai.com/v1")
-        layout.addRow(_("OpenAI base url"), self.custom_openai_base_url_line_edit)
+        openai_layout.addRow(
+            _("OpenAI base url"), self.custom_openai_base_url_line_edit
+        )
 
         self.translation_api_protocol_combo_box = QComboBox(self)
         self.translation_api_protocol_combo_box.setObjectName(
@@ -178,7 +231,9 @@ class GeneralPreferencesWidget(QWidget):
         self.translation_api_protocol_combo_box.currentIndexChanged.connect(
             self.on_translation_api_protocol_changed
         )
-        layout.addRow(_("OpenAI API protocol"), self.translation_api_protocol_combo_box)
+        openai_layout.addRow(
+            _("OpenAI API protocol"), self.translation_api_protocol_combo_box
+        )
 
         self.openai_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
@@ -190,7 +245,7 @@ class GeneralPreferencesWidget(QWidget):
         )
         self.openai_api_model_line_edit.setMinimumWidth(200)
         self.openai_api_model_line_edit.setPlaceholderText("whisper-1")
-        layout.addRow(_("OpenAI API model"), self.openai_api_model_line_edit)
+        openai_layout.addRow(_("OpenAI API model"), self.openai_api_model_line_edit)
 
         default_export_file_name = self.settings.get_default_export_file_template()
 
@@ -199,7 +254,9 @@ class GeneralPreferencesWidget(QWidget):
             self.on_default_export_file_name_changed
         )
         default_export_file_name_line_edit.setMinimumWidth(200)
-        layout.addRow(_("Default export file name"), default_export_file_name_line_edit)
+        export_layout.addRow(
+            _("Default export file name"), default_export_file_name_line_edit
+        )
 
         self.recording_export_enabled = self.settings.value(
             key=Settings.Key.RECORDING_TRANSCRIBER_EXPORT_ENABLED, default_value=False
@@ -209,7 +266,9 @@ class GeneralPreferencesWidget(QWidget):
         self.export_enabled_checkbox.setChecked(self.recording_export_enabled)
         self.export_enabled_checkbox.setObjectName("EnableRecordingExportCheckbox")
         self.export_enabled_checkbox.stateChanged.connect(self.on_recording_export_enable_changed)
-        layout.addRow("", self.export_enabled_checkbox)
+        # Spans both columns: the checkbox carries its own text, so an empty
+        # label column just shifted it out of alignment with everything else.
+        export_layout.addRow(self.export_enabled_checkbox)
 
         self.recording_export_folder_browse_button = QPushButton(_("Browse"))
         self.recording_export_folder_browse_button.clicked.connect(self.on_click_browse_export_folder)
@@ -230,7 +289,7 @@ class GeneralPreferencesWidget(QWidget):
         recording_export_folder_row.addWidget(self.recording_export_folder_line_edit)
         recording_export_folder_row.addWidget(self.recording_export_folder_browse_button)
 
-        layout.addRow(_("Export folder"), recording_export_folder_row)
+        export_layout.addRow(_("Export folder"), recording_export_folder_row)
 
         self.recording_transcriber_mode = QComboBox(self)
         for mode in RecordingTranscriberMode:
@@ -241,7 +300,7 @@ class GeneralPreferencesWidget(QWidget):
         )
         self.recording_transcriber_mode.currentIndexChanged.connect(self.on_recording_transcriber_mode_changed)
 
-        layout.addRow(_("Live recording mode"), self.recording_transcriber_mode)
+        export_layout.addRow(_("Live recording mode"), self.recording_transcriber_mode)
 
         export_note_label = QLabel(
             _("Note: Live recording export settings will be moved to the Advanced Settings in the Live Recording screen in a future version."),
@@ -249,7 +308,54 @@ class GeneralPreferencesWidget(QWidget):
         )
         export_note_label.setWordWrap(True)
         export_note_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        layout.addRow("", export_note_label)
+        # Spans both columns so the wrapped text is not squeezed into the narrow
+        # field column, where it overflowed the dialog.
+        export_layout.addRow(export_note_label)
+
+        # Sites like bilibili only serve their full set of formats to a logged-in
+        # client, so URL transcription needs a way to borrow the user's login.
+        self.cookies_from_browser_combo_box = QComboBox(self)
+        self.cookies_from_browser_combo_box.setObjectName("CookiesFromBrowserComboBox")
+        self.cookies_from_browser_combo_box.addItem(_("None"), "")
+        for browser in supported_browsers():
+            self.cookies_from_browser_combo_box.addItem(browser, browser)
+        saved_browser = self.settings.value(
+            key=Settings.Key.DOWNLOAD_COOKIES_FROM_BROWSER, default_value=""
+        )
+        browser_index = self.cookies_from_browser_combo_box.findData(
+            saved_browser or ""
+        )
+        self.cookies_from_browser_combo_box.setCurrentIndex(
+            browser_index if browser_index >= 0 else 0
+        )
+        self.cookies_from_browser_combo_box.setToolTip(
+            _("Use the login cookies of this browser when downloading from a URL. "
+              "Needed for member-only or age-restricted videos.")
+        )
+        self.cookies_from_browser_combo_box.currentIndexChanged.connect(
+            self.on_cookies_from_browser_changed
+        )
+        url_layout.addRow(_("Browser cookies"), self.cookies_from_browser_combo_box)
+
+        self.cookiefile_browse_button = QPushButton(_("Browse"))
+        self.cookiefile_browse_button.setObjectName("CookiefileBrowseButton")
+        self.cookiefile_browse_button.clicked.connect(self.on_click_browse_cookiefile)
+
+        cookiefile_row = QHBoxLayout()
+        self.cookiefile_line_edit = LineEdit(
+            self.settings.value(
+                key=Settings.Key.DOWNLOAD_COOKIEFILE, default_value=""
+            ),
+            self,
+        )
+        self.cookiefile_line_edit.setObjectName("CookiefileLineEdit")
+        self.cookiefile_line_edit.setMinimumWidth(200)
+        self.cookiefile_line_edit.setPlaceholderText(_("Optional cookies.txt file"))
+        self.cookiefile_line_edit.textChanged.connect(self.on_cookiefile_changed)
+        cookiefile_row.addWidget(self.cookiefile_line_edit)
+        cookiefile_row.addWidget(self.cookiefile_browse_button)
+
+        url_layout.addRow(_("Cookie file"), cookiefile_row)
 
         self.reduce_gpu_memory_enabled = self.settings.value(
             key=Settings.Key.REDUCE_GPU_MEMORY, default_value=False
@@ -263,7 +369,9 @@ class GeneralPreferencesWidget(QWidget):
               "Reduces GPU memory usage but may slightly decrease transcription quality.")
         )
         self.reduce_gpu_memory_checkbox.stateChanged.connect(self.on_reduce_gpu_memory_changed)
-        layout.addRow(_("Reduce GPU RAM"), self.reduce_gpu_memory_checkbox)
+        transcription_layout.addRow(
+            _("Reduce GPU RAM"), self.reduce_gpu_memory_checkbox
+        )
 
         self.force_cpu_enabled = self.settings.value(
             key=Settings.Key.FORCE_CPU, default_value=False
@@ -274,9 +382,33 @@ class GeneralPreferencesWidget(QWidget):
         self.force_cpu_checkbox.setObjectName("ForceCPUCheckbox")
         self.force_cpu_checkbox.setToolTip(_("Set this if larger models do not fit your GPU memory and Buzz crashes"))
         self.force_cpu_checkbox.stateChanged.connect(self.on_force_cpu_changed)
-        layout.addRow(_("Disable GPU"), self.force_cpu_checkbox)
+        transcription_layout.addRow(_("Disable GPU"), self.force_cpu_checkbox)
 
-        self.setLayout(layout)
+        content_layout.addStretch()
+
+        scroll_area = QScrollArea(self)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        scroll_area.setWidget(content)
+        root_layout.addWidget(scroll_area)
+
+    def on_cookies_from_browser_changed(self, _index: int):
+        browser = self.cookies_from_browser_combo_box.currentData() or ""
+        self.settings.set_value(Settings.Key.DOWNLOAD_COOKIES_FROM_BROWSER, browser)
+
+    def on_cookiefile_changed(self, text: str):
+        self.settings.set_value(Settings.Key.DOWNLOAD_COOKIEFILE, text.strip())
+
+    def on_click_browse_cookiefile(self):
+        path, _filter = QFileDialog.getOpenFileName(
+            self, _("Select Cookie File"), "", _("All Files (*)")
+        )
+        if path:
+            # textChanged fires from this, which persists the value.
+            self.cookiefile_line_edit.setText(path)
 
     def on_default_export_file_name_changed(self, text: str):
         self.settings.set_value(Settings.Key.DEFAULT_EXPORT_FILE_NAME, text)

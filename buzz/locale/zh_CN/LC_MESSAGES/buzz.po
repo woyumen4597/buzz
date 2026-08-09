@@ -155,7 +155,7 @@ msgstr "测试"
 
 #: buzz/widgets/preferences_dialog/general_preferences_widget.py
 msgid "OpenAI API key"
-msgstr "OpenAI API key"
+msgstr "OpenAI API 密钥"
 
 #: buzz/widgets/preferences_dialog/general_preferences_widget.py
 msgid "OpenAI base url"
@@ -1957,3 +1957,42 @@ msgstr "语音提取失败！请检查您的网络连接——可能需要下载
 
 #~ msgid "ID"
 #~ msgstr "ID"
+
+msgid "Interface"
+msgstr "界面"
+
+msgid "Transcription"
+msgstr "转录"
+
+msgid "OpenAI API"
+msgstr "OpenAI API"
+
+msgid "URL download"
+msgstr "URL 下载"
+
+msgid "Export and live recording"
+msgstr "导出与实时录制"
+
+msgid "Transcription concurrency"
+msgstr "转录并发数"
+
+msgid "OpenAI API protocol"
+msgstr "OpenAI API 协议"
+
+msgid "Browser cookies"
+msgstr "浏览器 Cookie"
+
+msgid "Cookie file"
+msgstr "Cookie 文件"
+
+msgid "Select Cookie File"
+msgstr "选择 Cookie 文件"
+
+msgid "Optional cookies.txt file"
+msgstr "可选的 cookies.txt 文件"
+
+msgid "None"
+msgstr "无"
+
+msgid "None"
+msgstr "无"

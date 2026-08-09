@@ -50,6 +50,9 @@ class Settings:
         FILE_TRANSCRIBER_WORD_LEVEL_TIMINGS = "file-transcriber/word-level-timings"
         FILE_TRANSCRIBER_EXPORT_FORMATS = "file-transcriber/export-formats"
 
+        DOWNLOAD_COOKIES_FROM_BROWSER = "file-transcriber/download-cookies-from-browser"
+        DOWNLOAD_COOKIEFILE = "file-transcriber/download-cookiefile"
+
         TRANSCRIPTION_RESIZER_CREATE_NEW_TRANSCRIPT = (
             "transcription-resizer/create-new-transcript"
         )

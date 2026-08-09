@@ -107,6 +107,8 @@ Defaults to [user_cache_dir](https://pypi.org/project/platformdirs/).
 
 **BUZZ_DOWNLOAD_COOKIEFILE** - Location of a [cookiefile](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp) to use for downloading private videos or as workaround for anti-bot protection.
 
+**BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER** - Read cookies straight from a local browser profile instead of a file, for downloading private videos or as workaround for anti-bot protection. Takes the same value as yt-dlp's `--cookies-from-browser`: `BROWSER[+KEYRING][:PROFILE][::CONTAINER]`, for example `BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER=chrome` or `BUZZ_DOWNLOAD_COOKIES_FROM_BROWSER=firefox:default`. Supported browsers are brave, chrome, chromium, edge, firefox, opera, safari, vivaldi and whale. Can be combined with `BUZZ_DOWNLOAD_COOKIEFILE`. Note that the browser must be logged in to the site on the exact domain of the URL you are transcribing, and Chromium-based browsers on macOS may prompt for keychain access.
+
 **BUZZ_FORCE_CPU** - Will force Buzz to use CPU and not GPU, useful for setups with older GPU if that is slower than GPU or GPU has issues. Example usage `BUZZ_FORCE_CPU=true`. Available since `1.2.1`
 
 **BUZZ_REDUCE_GPU_MEMORY** - Will use 8bit quantization for Huggingface, Faster Whisper and Whisper.cpp transcriptions to reduce required GPU memory. Example usage `BUZZ_REDUCE_GPU_MEMORY=true`. Available since `1.4.0`

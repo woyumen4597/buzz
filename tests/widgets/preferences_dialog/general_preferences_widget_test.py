@@ -40,13 +40,13 @@ class TestGeneralPreferencesWidget:
         widget = GeneralPreferencesWidget()
         qtbot.add_widget(widget)
 
-        test_button = widget.findChild(QPushButton)
+        test_button = widget.findChild(QPushButton, "TestOpenAIAPIKeyButton")
         assert isinstance(test_button, QPushButton)
 
         assert test_button.text() == _("Test")
         assert not test_button.isEnabled()
 
-        line_edit = widget.findChild(QLineEdit)
+        line_edit = widget.findChild(QLineEdit, "OpenAIAPIKeyLineEdit")
         assert isinstance(line_edit, QLineEdit)
         line_edit.setText("123")
 
@@ -70,7 +70,7 @@ class TestGeneralPreferencesWidget:
         widget = GeneralPreferencesWidget()
         qtbot.add_widget(widget)
 
-        test_button = widget.findChild(QPushButton)
+        test_button = widget.findChild(QPushButton, "TestOpenAIAPIKeyButton")
         assert isinstance(test_button, QPushButton)
 
         test_button.click()

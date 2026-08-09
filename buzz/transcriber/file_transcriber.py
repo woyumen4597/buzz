@@ -15,6 +15,10 @@ from yt_dlp.utils import DownloadCancelled
 
 from buzz import whisper_audio
 from buzz.assets import APP_BASE_DIR
+from buzz.transcriber.download_cookies import (
+    apply_cookie_options,
+    parse_cookies_from_browser,
+)
 from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     get_output_file_path,
@@ -112,9 +116,7 @@ class FileTranscriber(QObject):
         self.completed.emit(segments)
 
     def _download_from_url(self) -> bool:
-        cookiefile = os.getenv("BUZZ_DOWNLOAD_COOKIEFILE")
-
-        extract_options = {
+        extract_options = apply_cookie_options({
             "logger": logging.getLogger(),
             # This probe only needs a title. Without these a season/playlist URL
             # (e.g. bilibili .../play/ss33378) makes yt-dlp recursively resolve
@@ -123,9 +125,7 @@ class FileTranscriber(QObject):
             "extract_flat": "in_playlist",
             "playlist_items": "1",
             "noplaylist": True,
-        }
-        if cookiefile:
-            extract_options["cookiefile"] = cookiefile
+        })
 
         info = None
         try:
@@ -184,8 +184,7 @@ class FileTranscriber(QObject):
             "match_filter": self._abort_download_if_stopped,
         }
 
-        if cookiefile:
-            options["cookiefile"] = cookiefile
+        apply_cookie_options(options)
 
         try:
             logging.debug(f"Downloading audio file from URL: {self.transcription_task.url}")
@@ -499,9 +498,7 @@ def download_video_to_cache(url: str, audio_wav_path: str) -> str:
         "outtmpl": os.path.join(directory, title),
         "logger": logging.getLogger(),
     }
-    cookiefile = os.getenv("BUZZ_DOWNLOAD_COOKIEFILE")
-    if cookiefile:
-        options["cookiefile"] = cookiefile
+    apply_cookie_options(options)
 
     try:
         with YoutubeDL(options) as ydl:
