@@ -26,8 +26,11 @@ from PyQt6.QtGui import QIcon
 
 from buzz.settings.settings import (
     DEFAULT_TRANSCRIPTION_CONCURRENCY,
+    DEFAULT_TRANSLATION_BATCH_SIZE,
     MAX_TRANSCRIPTION_CONCURRENCY,
+    MAX_TRANSLATION_BATCH_SIZE,
     MIN_TRANSCRIPTION_CONCURRENCY,
+    MIN_TRANSLATION_BATCH_SIZE,
     Settings,
 )
 from buzz.store.keyring_store import get_password, Key
@@ -233,6 +236,37 @@ class GeneralPreferencesWidget(QWidget):
         )
         openai_layout.addRow(
             _("OpenAI API protocol"), self.translation_api_protocol_combo_box
+        )
+
+        self.translation_batch_size_spin_box = QSpinBox(self)
+        self.translation_batch_size_spin_box.setObjectName(
+            "TranslationBatchSizeSpinBox"
+        )
+        self.translation_batch_size_spin_box.setRange(
+            MIN_TRANSLATION_BATCH_SIZE, MAX_TRANSLATION_BATCH_SIZE
+        )
+        self.translation_batch_size_spin_box.setValue(
+            self.settings.value(
+                Settings.Key.TRANSLATION_BATCH_SIZE,
+                DEFAULT_TRANSLATION_BATCH_SIZE,
+            )
+        )
+        self.translation_batch_size_spin_box.setToolTip(
+            _(
+                "Number of segments sent in one translation request. Larger "
+                "values mean fewer requests but a longer wait for the first "
+                "result. Character and token limits still apply."
+            )
+        )
+        self.translation_batch_size_spin_box.valueChanged.connect(
+            self.on_translation_batch_size_changed
+        )
+        self.translation_batch_size_spin_box.setMaximumWidth(90)
+        self.translation_batch_size_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        openai_layout.addRow(
+            _("Translation batch size"), self.translation_batch_size_spin_box
         )
 
         self.openai_api_model = self.settings.value(
@@ -462,6 +496,9 @@ class GeneralPreferencesWidget(QWidget):
         protocol = self.translation_api_protocol_combo_box.itemData(index)
         if protocol in {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}:
             self.settings.set_value(Settings.Key.TRANSLATION_API_PROTOCOL, protocol)
+
+    def on_translation_batch_size_changed(self, value: int):
+        self.settings.set_value(Settings.Key.TRANSLATION_BATCH_SIZE, value)
 
     def on_recording_export_enable_changed(self, state: int):
         self.recording_export_enabled = state == 2

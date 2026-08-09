@@ -2,7 +2,11 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QPushButton, QMessageBox, QLineEdit, QCheckBox
 
 from buzz.locale import _
-from buzz.settings.settings import DEFAULT_TRANSCRIPTION_CONCURRENCY, Settings
+from buzz.settings.settings import (
+    DEFAULT_TRANSCRIPTION_CONCURRENCY,
+    DEFAULT_TRANSLATION_BATCH_SIZE,
+    Settings,
+)
 from buzz.widgets.preferences_dialog.general_preferences_widget import (
     GeneralPreferencesWidget, ValidateOpenAIApiKeyJob
 )
@@ -154,6 +158,27 @@ class TestGeneralPreferencesWidget:
             )
 
             assert settings.value(key, "") == RESPONSES_PROTOCOL
+        finally:
+            settings.set_value(key, previous_value)
+
+    def test_translation_batch_size_preferences(self, qtbot):
+        settings = Settings()
+        key = Settings.Key.TRANSLATION_BATCH_SIZE
+        previous_value = settings.value(key, DEFAULT_TRANSLATION_BATCH_SIZE)
+        settings.set_value(key, DEFAULT_TRANSLATION_BATCH_SIZE)
+
+        try:
+            widget = GeneralPreferencesWidget()
+            qtbot.add_widget(widget)
+
+            assert (
+                widget.translation_batch_size_spin_box.value()
+                == DEFAULT_TRANSLATION_BATCH_SIZE
+            )
+
+            widget.translation_batch_size_spin_box.setValue(5)
+
+            assert settings.value(key, DEFAULT_TRANSLATION_BATCH_SIZE) == 5
         finally:
             settings.set_value(key, previous_value)
 

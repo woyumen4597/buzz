@@ -10,6 +10,13 @@ DEFAULT_TRANSCRIPTION_CONCURRENCY = 2
 MIN_TRANSCRIPTION_CONCURRENCY = 1
 MAX_TRANSCRIPTION_CONCURRENCY = 8
 
+# How many transcript segments go into a single translation request. Larger
+# batches mean fewer provider round trips but a longer wait before the first
+# result appears, and they are still capped by the char/token budgets.
+DEFAULT_TRANSLATION_BATCH_SIZE = 20
+MIN_TRANSLATION_BATCH_SIZE = 1
+MAX_TRANSLATION_BATCH_SIZE = 200
+
 
 class Settings:
     def __init__(self, application=""):
@@ -61,6 +68,7 @@ class Settings:
         CUSTOM_OPENAI_BASE_URL = "transcriber/custom-openai-base-url"
         OPENAI_API_MODEL = "transcriber/openai-api-model"
         TRANSLATION_API_PROTOCOL = "transcriber/translation-api-protocol"
+        TRANSLATION_BATCH_SIZE = "transcriber/translation-batch-size"
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"
 

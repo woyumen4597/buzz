@@ -12,14 +12,21 @@ from typing import Optional, List, Tuple
 import httpx
 from PyQt6.QtCore import QObject, pyqtSignal
 
-from buzz.settings.settings import Settings
+from buzz.settings.settings import (
+    DEFAULT_TRANSLATION_BATCH_SIZE,
+    MAX_TRANSLATION_BATCH_SIZE,
+    MIN_TRANSLATION_BATCH_SIZE,
+    Settings,
+)
 from buzz.store.keyring_store import get_password, Key
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
 
 
-# Count, character, and token caps keep each provider request bounded.
-BATCH_SIZE = 20
+# Count, character, and token caps keep each provider request bounded. The
+# count cap is user-configurable in Preferences; this is only the fallback for
+# callers that do not pass an explicit batch size.
+BATCH_SIZE = DEFAULT_TRANSLATION_BATCH_SIZE
 MAX_BATCH_CHARS = 3000
 # A character limit is not a token limit.  This conservative estimate keeps
 # multilingual input below the provider context limit without a tokenizer.
@@ -160,6 +167,21 @@ class Translator(QObject):
             ),
         )
         self.base_url = configured_base_url or DEFAULT_OPENAI_BASE_URL
+        # Env var wins over the stored preference so a run can be tuned without
+        # touching saved settings; both are clamped to the supported range.
+        self.batch_size = min(
+            MAX_TRANSLATION_BATCH_SIZE,
+            max(
+                MIN_TRANSLATION_BATCH_SIZE,
+                _env_int(
+                    "BUZZ_TRANSLATION_BATCH_SIZE",
+                    settings.value(
+                        Settings.Key.TRANSLATION_BATCH_SIZE,
+                        DEFAULT_TRANSLATION_BATCH_SIZE,
+                    ),
+                ),
+            ),
+        )
         self.api_protocol = _translation_api_protocol(
             settings.value(
                 Settings.Key.TRANSLATION_API_PROTOCOL,
@@ -782,10 +804,12 @@ class Translator(QObject):
         token_budget: Optional[int] = None,
         prompt_tokens: int = 0,
         max_tokens: Optional[int] = None,
+        batch_size: Optional[int] = None,
     ) -> List[List[Tuple[str, int]]]:
         """Split items by count, chars, and a conservative token estimate."""
         if max_tokens is not None:
             token_budget = max_tokens
+        batch_size = max(1, batch_size or BATCH_SIZE)
         token_budget = max(1, token_budget or MAX_BATCH_TOKENS)
         token_budget = max(1, token_budget - max(0, prompt_tokens))
         batches = []
@@ -796,7 +820,7 @@ class Translator(QObject):
             chars = len(item[0])
             tokens = Translator._estimate_tokens(item[0])
             if current and (
-                len(current) >= BATCH_SIZE
+                len(current) >= batch_size
                 or current_chars + chars > MAX_BATCH_CHARS
                 or current_tokens + tokens > token_budget
             ):
@@ -819,6 +843,7 @@ class Translator(QObject):
             items,
             token_budget=self.max_batch_tokens,
             prompt_tokens=self._estimate_tokens(self.transcription_options.llm_prompt),
+            batch_size=self.batch_size,
         )
         completed = {}
         pending = {}
@@ -867,6 +892,7 @@ class Translator(QObject):
             items,
             token_budget=self.max_batch_tokens,
             prompt_tokens=prompt_tokens,
+            batch_size=self.batch_size,
         ):
             generation, cancel_event = self._run_context()
             if self._is_cancelled(generation, cancel_event):
@@ -948,7 +974,7 @@ class Translator(QObject):
                     # Collect a short burst into one provider request.
                     batch = [item]
                     deadline = time.monotonic() + BATCH_WINDOW_SECONDS
-                    while len(batch) < BATCH_SIZE:
+                    while len(batch) < self.batch_size:
                         remaining = deadline - time.monotonic()
                         if remaining <= 0:
                             break

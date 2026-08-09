@@ -5,6 +5,12 @@ from unittest.mock import Mock, call, patch, MagicMock
 import httpx
 from PyQt6.QtCore import QThread
 
+from buzz.settings.settings import (
+    DEFAULT_TRANSLATION_BATCH_SIZE,
+    MAX_TRANSLATION_BATCH_SIZE,
+    MIN_TRANSLATION_BATCH_SIZE,
+    Settings,
+)
 from buzz.translator import (
     CHAT_COMPLETIONS_PROTOCOL,
     RESPONSES_PROTOCOL,
@@ -171,6 +177,74 @@ class TestSplitBatches:
             [items[0]],
             [items[1]],
         ]
+
+    def test_honours_explicit_batch_size(self):
+        items = [("a", i) for i in range(1, 6)]
+        assert Translator._split_batches(items, batch_size=2) == [
+            [items[0], items[1]],
+            [items[2], items[3]],
+            [items[4]],
+        ]
+
+    def test_falls_back_to_default_batch_size(self):
+        items = [("a", i) for i in range(1, DEFAULT_TRANSLATION_BATCH_SIZE + 2)]
+        batches = Translator._split_batches(items)
+        assert len(batches[0]) == DEFAULT_TRANSLATION_BATCH_SIZE
+        assert len(batches[1]) == 1
+
+
+class TestTranslationBatchSizeConfig:
+    def _make_translator(self):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        return Translator(options)
+
+    def test_defaults_to_configured_default(self, monkeypatch):
+        monkeypatch.delenv("BUZZ_TRANSLATION_BATCH_SIZE", raising=False)
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            translator = self._make_translator()
+        assert translator.batch_size == DEFAULT_TRANSLATION_BATCH_SIZE
+
+    def test_reads_stored_preference(self, monkeypatch):
+        monkeypatch.delenv("BUZZ_TRANSLATION_BATCH_SIZE", raising=False)
+
+        def fake_value(key, default_value=None, *args, **kwargs):
+            if key == Settings.Key.TRANSLATION_BATCH_SIZE:
+                return 7
+            return default_value
+
+        with patch("buzz.translator.Settings.value", side_effect=fake_value):
+            translator = self._make_translator()
+        assert translator.batch_size == 7
+
+    def test_env_var_overrides_preference(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_BATCH_SIZE", "3")
+
+        def fake_value(key, default_value=None, *args, **kwargs):
+            if key == Settings.Key.TRANSLATION_BATCH_SIZE:
+                return 50
+            return default_value
+
+        with patch("buzz.translator.Settings.value", side_effect=fake_value):
+            translator = self._make_translator()
+        assert translator.batch_size == 3
+
+    def test_clamps_out_of_range_values(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_BATCH_SIZE", "0")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            assert self._make_translator().batch_size == MIN_TRANSLATION_BATCH_SIZE
+
+        monkeypatch.setenv("BUZZ_TRANSLATION_BATCH_SIZE", "99999")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            assert self._make_translator().batch_size == MAX_TRANSLATION_BATCH_SIZE
 
 
 class TestTranslationRuntimeControls:
