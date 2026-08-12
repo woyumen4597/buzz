@@ -11,6 +11,15 @@ import string
 # Tests must also never depend on network availability.
 os.environ.setdefault("BUZZ_DISABLE_UPDATE_CHECK", "1")
 
+# Use the offscreen Qt platform on macOS to prevent the TSM (Text Services
+# Manager) noise: Qt's cocoa backend registers with com.apple.tsm.uiserver for
+# IME support, but that port is unreachable in headless test runs, producing
+# many "TSMSendMessageToUIServer: CFMessagePortSendRequest FAILED(-1)" lines.
+# offscreen keeps full widget/event functionality while skipping native text-
+# input initialisation entirely.  pytest-xvfb handles the equivalent on Linux.
+if platform.system() == "Darwin":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 import pytest
 
 # Set multiprocessing to use 'spawn' instead of 'fork' on Linux
