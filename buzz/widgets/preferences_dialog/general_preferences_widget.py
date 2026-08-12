@@ -27,10 +27,16 @@ from PyQt6.QtGui import QIcon
 from buzz.settings.settings import (
     DEFAULT_TRANSCRIPTION_CONCURRENCY,
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_CONCURRENCY,
+    DEFAULT_TRANSLATION_READ_TIMEOUT,
     MAX_TRANSCRIPTION_CONCURRENCY,
     MAX_TRANSLATION_BATCH_SIZE,
+    MAX_TRANSLATION_CONCURRENCY,
+    MAX_TRANSLATION_READ_TIMEOUT,
     MIN_TRANSCRIPTION_CONCURRENCY,
     MIN_TRANSLATION_BATCH_SIZE,
+    MIN_TRANSLATION_CONCURRENCY,
+    MIN_TRANSLATION_READ_TIMEOUT,
     Settings,
 )
 from buzz.store.keyring_store import get_password, Key
@@ -269,6 +275,69 @@ class GeneralPreferencesWidget(QWidget):
             _("Translation batch size"), self.translation_batch_size_spin_box
         )
 
+        self.translation_concurrency_spin_box = QSpinBox(self)
+        self.translation_concurrency_spin_box.setObjectName(
+            "TranslationConcurrencySpinBox"
+        )
+        self.translation_concurrency_spin_box.setRange(
+            MIN_TRANSLATION_CONCURRENCY, MAX_TRANSLATION_CONCURRENCY
+        )
+        self.translation_concurrency_spin_box.setValue(
+            self.settings.value(
+                Settings.Key.TRANSLATION_CONCURRENCY,
+                DEFAULT_TRANSLATION_CONCURRENCY,
+            )
+        )
+        self.translation_concurrency_spin_box.setToolTip(
+            _(
+                "Number of translation requests in flight at once. Higher "
+                "values finish sooner until the provider rate limit is "
+                "reached, but make rate limiting and timeouts more likely."
+            )
+        )
+        self.translation_concurrency_spin_box.valueChanged.connect(
+            self.on_translation_concurrency_changed
+        )
+        self.translation_concurrency_spin_box.setMaximumWidth(90)
+        self.translation_concurrency_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        openai_layout.addRow(
+            _("Translation concurrency"), self.translation_concurrency_spin_box
+        )
+
+        self.translation_read_timeout_spin_box = QSpinBox(self)
+        self.translation_read_timeout_spin_box.setObjectName(
+            "TranslationReadTimeoutSpinBox"
+        )
+        self.translation_read_timeout_spin_box.setRange(
+            MIN_TRANSLATION_READ_TIMEOUT, MAX_TRANSLATION_READ_TIMEOUT
+        )
+        self.translation_read_timeout_spin_box.setValue(
+            self.settings.value(
+                Settings.Key.TRANSLATION_READ_TIMEOUT,
+                DEFAULT_TRANSLATION_READ_TIMEOUT,
+            )
+        )
+        self.translation_read_timeout_spin_box.setSuffix(" s")
+        self.translation_read_timeout_spin_box.setToolTip(
+            _(
+                "Maximum seconds to wait for the first response token (and between "
+                "streamed chunks). Raise this when using a slow upstream that "
+                "frequently hits the default 30 s limit."
+            )
+        )
+        self.translation_read_timeout_spin_box.valueChanged.connect(
+            self.on_translation_read_timeout_changed
+        )
+        self.translation_read_timeout_spin_box.setMaximumWidth(90)
+        self.translation_read_timeout_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        openai_layout.addRow(
+            _("Translation read timeout"), self.translation_read_timeout_spin_box
+        )
+
         self.openai_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
         )
@@ -497,8 +566,14 @@ class GeneralPreferencesWidget(QWidget):
         if protocol in {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}:
             self.settings.set_value(Settings.Key.TRANSLATION_API_PROTOCOL, protocol)
 
+    def on_translation_read_timeout_changed(self, value: int):
+        self.settings.set_value(Settings.Key.TRANSLATION_READ_TIMEOUT, value)
+
     def on_translation_batch_size_changed(self, value: int):
         self.settings.set_value(Settings.Key.TRANSLATION_BATCH_SIZE, value)
+
+    def on_translation_concurrency_changed(self, value: int):
+        self.settings.set_value(Settings.Key.TRANSLATION_CONCURRENCY, value)
 
     def on_recording_export_enable_changed(self, state: int):
         self.recording_export_enabled = state == 2

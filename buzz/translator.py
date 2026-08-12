@@ -14,8 +14,14 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from buzz.settings.settings import (
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_CONCURRENCY,
+    DEFAULT_TRANSLATION_READ_TIMEOUT,
     MAX_TRANSLATION_BATCH_SIZE,
+    MAX_TRANSLATION_CONCURRENCY,
+    MAX_TRANSLATION_READ_TIMEOUT,
     MIN_TRANSLATION_BATCH_SIZE,
+    MIN_TRANSLATION_CONCURRENCY,
+    MIN_TRANSLATION_READ_TIMEOUT,
     Settings,
 )
 from buzz.store.keyring_store import get_password, Key
@@ -31,7 +37,9 @@ MAX_BATCH_CHARS = 3000
 # A character limit is not a token limit.  This conservative estimate keeps
 # multilingual input below the provider context limit without a tokenizer.
 MAX_BATCH_TOKENS = 2048
-MAX_CONCURRENT_REQUESTS = 2
+# Fallback only; the effective value is per-instance and user-configurable via
+# Preferences or BUZZ_TRANSLATION_CONCURRENCY.
+MAX_CONCURRENT_REQUESTS = DEFAULT_TRANSLATION_CONCURRENCY
 # After the first item arrives, wait briefly for more items so a burst of
 # enqueues becomes a few deterministic batch requests instead of racing
 # get_nowait() into per-item requests.
@@ -182,11 +190,40 @@ class Translator(QObject):
                 ),
             ),
         )
+        # Same precedence as batch_size: env var wins over the stored
+        # preference, and both are clamped to the supported range.
+        self.max_concurrent_requests = min(
+            MAX_TRANSLATION_CONCURRENCY,
+            max(
+                MIN_TRANSLATION_CONCURRENCY,
+                _env_int(
+                    "BUZZ_TRANSLATION_CONCURRENCY",
+                    settings.value(
+                        Settings.Key.TRANSLATION_CONCURRENCY,
+                        DEFAULT_TRANSLATION_CONCURRENCY,
+                    ),
+                ),
+            ),
+        )
         self.api_protocol = _translation_api_protocol(
             settings.value(
                 Settings.Key.TRANSLATION_API_PROTOCOL,
                 CHAT_COMPLETIONS_PROTOCOL,
             )
+        )
+        # Same precedence as batch_size / concurrency.
+        self.read_timeout = min(
+            MAX_TRANSLATION_READ_TIMEOUT,
+            max(
+                MIN_TRANSLATION_READ_TIMEOUT,
+                _env_int(
+                    "BUZZ_TRANSLATION_READ_TIMEOUT",
+                    settings.value(
+                        Settings.Key.TRANSLATION_READ_TIMEOUT,
+                        DEFAULT_TRANSLATION_READ_TIMEOUT,
+                    ),
+                ),
+            ),
         )
 
         # ponytail: per-task llm_model wins, fall back to global preferences model.
@@ -194,10 +231,30 @@ class Translator(QObject):
             "BUZZ_TRANSLATION_API_MODEL"
         ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
+        # Log the resolved throughput knobs so a run's effective settings can be
+        # confirmed from the log. No credentials or base URL here.
+        logging.debug(
+            "Translation config resolved: batch_size=%s, concurrency=%s, "
+            "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, read_timeout=%ss",
+            self.batch_size,
+            self.max_concurrent_requests,
+            requests_per_minute,
+            self.max_batch_tokens,
+            self.api_protocol,
+            self.read_timeout,
+        )
+
     def _client(self) -> httpx.Client:
         with self._client_lock:
             if self._client_instance is None:
-                self._client_instance = httpx.Client(timeout=REQUEST_TIMEOUT)
+                self._client_instance = httpx.Client(
+                    timeout=httpx.Timeout(
+                        connect=REQUEST_TIMEOUT.connect,
+                        read=self.read_timeout,
+                        write=REQUEST_TIMEOUT.write,
+                        pool=REQUEST_TIMEOUT.pool,
+                    )
+                )
             return self._client_instance
 
     def _close_client(self) -> None:
@@ -847,7 +904,7 @@ class Translator(QObject):
         )
         completed = {}
         pending = {}
-        executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+        executor = ThreadPoolExecutor(max_workers=self.max_concurrent_requests)
         generation, cancel_event = self._capture_generation()
         try:
             for index, batch in enumerate(batches):
@@ -925,7 +982,7 @@ class Translator(QObject):
             self._stopping = False
             if self._cancel_event.is_set():
                 self._cancel_event = threading.Event()
-        executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+        executor = ThreadPoolExecutor(max_workers=self.max_concurrent_requests)
         pending = {}
         completed_in_order = {}
         next_sequence = 0
@@ -951,7 +1008,7 @@ class Translator(QObject):
                     cancel_seen = True
 
                 while (
-                    len(pending) < MAX_CONCURRENT_REQUESTS
+                    len(pending) < self.max_concurrent_requests
                     and not stop_after_pending
                     and not cancel_seen
                 ):
@@ -1015,7 +1072,7 @@ class Translator(QObject):
                         executor.shutdown(wait=False, cancel_futures=True)
                         break
                     executor.shutdown(wait=False, cancel_futures=True)
-                    executor = ThreadPoolExecutor(max_workers=MAX_CONCURRENT_REQUESTS)
+                    executor = ThreadPoolExecutor(max_workers=self.max_concurrent_requests)
                     with self._state_lock:
                         self._cancelled = False
                     completed_in_order.clear()

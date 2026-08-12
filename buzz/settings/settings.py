@@ -17,6 +17,22 @@ DEFAULT_TRANSLATION_BATCH_SIZE = 20
 MIN_TRANSLATION_BATCH_SIZE = 1
 MAX_TRANSLATION_BATCH_SIZE = 200
 
+# How many translation requests may be in flight at once. Raising this only
+# helps until the requests-per-minute rate limiter becomes the binding
+# constraint, and higher values make provider rate limiting and read timeouts
+# more likely, so the default stays conservative.
+DEFAULT_TRANSLATION_CONCURRENCY = 2
+MIN_TRANSLATION_CONCURRENCY = 1
+MAX_TRANSLATION_CONCURRENCY = 16
+
+# Read timeout for each translation HTTP request, in seconds. This is the
+# maximum gap between two consecutive response chunks (or time to first byte
+# when streaming). Raise it when using a slow upstream that needs more than
+# the default 30 s to start generating.
+DEFAULT_TRANSLATION_READ_TIMEOUT = 60
+MIN_TRANSLATION_READ_TIMEOUT = 10
+MAX_TRANSLATION_READ_TIMEOUT = 300
+
 
 class Settings:
     def __init__(self, application=""):
@@ -69,6 +85,8 @@ class Settings:
         OPENAI_API_MODEL = "transcriber/openai-api-model"
         TRANSLATION_API_PROTOCOL = "transcriber/translation-api-protocol"
         TRANSLATION_BATCH_SIZE = "transcriber/translation-batch-size"
+        TRANSLATION_CONCURRENCY = "transcriber/translation-concurrency"
+        TRANSLATION_READ_TIMEOUT = "transcriber/translation-read-timeout"
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"
 
