@@ -331,24 +331,8 @@ class ExportTranscriptionMenu(QMenu):
             )
             return
 
-        segments = self._get_segments()
         srt_fd, srt_path = tempfile.mkstemp(suffix=".srt", text=True)
         os.close(srt_fd)
-        try:
-            write_output(
-                path=srt_path,
-                segments=segments,
-                output_format=OutputFormat.SRT,
-                segment_key=segment_key,
-            )
-        except Exception as e:
-            logging.error("Writing temp SRT failed: %s", e)
-            self._cleanup_srt(srt_path)
-            QMessageBox.critical(
-                self, _("Export Video"),
-                _("Failed to prepare subtitles: {}").format(e),
-            )
-            return
 
         # Language metadata is only written when it is known to match the text
         # (the source language); translated subtitles have no known target.
@@ -373,6 +357,8 @@ class ExportTranscriptionMenu(QMenu):
         proc.mode = mode
         proc.media_file = media_file
         proc.subtitle_language = subtitle_language
+        proc.segments = self._get_segments()
+        proc.segment_key = segment_key
         proc.output_tail = deque(maxlen=20)
         proc.canceled = False
         prog.canceled.connect(lambda: self._on_export_canceled(proc))
@@ -457,6 +443,22 @@ class ExportTranscriptionMenu(QMenu):
         # codecs (probe failed) try stream copy and fall back on failure.
         copy_video = video_codec in _COPY_VIDEO_CODECS if video_codec else True
         copy_audio = audio_codec in _COPY_AUDIO_CODECS if audio_codec else True
+        segments = self._segments_within_duration(proc.segments, proc.duration_ms)
+        try:
+            write_output(
+                path=proc.srt_path,
+                segments=segments,
+                output_format=OutputFormat.SRT,
+                segment_key=proc.segment_key,
+            )
+        except Exception as exc:
+            logging.error("Writing temp SRT failed: %s", exc)
+            self._cleanup_srt(proc.srt_path)
+            QMessageBox.critical(
+                self, _("Export Video"),
+                _("Failed to prepare subtitles: {}").format(exc),
+            )
+            return
         proc.dialog.setRange(0, 100)
         proc.dialog.setValue(0)
         self._start_ffmpeg(
@@ -464,6 +466,23 @@ class ExportTranscriptionMenu(QMenu):
             copy_video=copy_video, copy_audio=copy_audio,
             subtitle_language=proc.subtitle_language,
         )
+
+    @staticmethod
+    def _segments_within_duration(
+        segments: list[Segment], duration_ms: int
+    ) -> list[Segment]:
+        if duration_ms <= 0:
+            return segments
+        return [
+            Segment(
+                start=segment.start,
+                end=min(segment.end, duration_ms),
+                text=segment.text,
+                translation=segment.translation,
+            )
+            for segment in segments
+            if segment.start < duration_ms
+        ]
 
     def _on_export_canceled(self, proc: QProcess):
         proc.canceled = True

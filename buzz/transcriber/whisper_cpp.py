@@ -135,6 +135,10 @@ class WhisperCpp:
         ffmpeg_cmd = [
             "ffmpeg",
             "-i", file_path,
+            # Some AAC files have packet timestamps that do not match their
+            # decoded sample count. Keep the WAV on the media timeline so
+            # whisper-cli timestamps remain aligned with the video.
+            "-af", "aresample=16000:async=1000:first_pts=0",
             "-ar", "16000",
             "-ac", "1",
             "-y",

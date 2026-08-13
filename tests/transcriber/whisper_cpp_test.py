@@ -14,6 +14,15 @@ from tests.model_loader import get_model_path
 
 
 class TestWhisperCpp:
+    def test_convert_to_wav_synchronizes_to_media_timestamps(self):
+        with patch(
+            "buzz.transcriber.whisper_cpp.subprocess.run"
+        ) as run_mock:
+            assert WhisperCpp._convert_to_wav("/fake/video.mp4") == "/fake/video.mp4.wav"
+
+        cmd = run_mock.call_args.args[0]
+        assert cmd[cmd.index("-af") + 1] == "aresample=16000:async=1000:first_pts=0"
+
     def test_transcribe(self):
         transcription_options = TranscriptionOptions(
             language="fr",

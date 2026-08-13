@@ -9,7 +9,7 @@ from pytestqt.qtbot import QtBot
 from buzz.db.entity.transcription import Transcription
 from buzz.db.entity.transcription_segment import TranscriptionSegment
 from buzz.model_loader import ModelType, WhisperModelSize
-from buzz.transcriber.transcriber import Task
+from buzz.transcriber.transcriber import Segment, Task
 from buzz.widgets.transcription_viewer.export_transcription_menu import (
     ExportTranscriptionMenu,
     MP4_BURNED,
@@ -288,6 +288,44 @@ class TestExportTranscriptionMenu:
         assert start_ffmpeg.call_args.kwargs == {
             "copy_video": False, "copy_audio": False, "subtitle_language": None,
         }
+        widget._cleanup_srt(start_ffmpeg.call_args.args[3])
+
+    def test_video_export_clips_subtitles_to_media_duration(
+        self,
+        tmp_path: pathlib.Path,
+        qtbot: QtBot,
+        transcription,
+        transcription_service,
+        mocker,
+    ):
+        source_path = tmp_path / "movie.mp4"
+        source_path.touch()
+        transcription.file = str(source_path)
+        widget = self._make_widget(transcription, transcription_service)
+        qtbot.add_widget(widget)
+        mocker.patch.object(
+            widget,
+            "_get_segments",
+            return_value=[
+                Segment(100, 11_000, "ends at video end"),
+                Segment(12_000, 13_000, "outside video"),
+            ],
+        )
+        mocker.patch(
+            "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+            return_value=(str(tmp_path / "out.mp4"), ""),
+        )
+
+        proc, start_ffmpeg = self._export_and_probe(
+            widget, MP4_SOFT, "text", mocker, probe_payload(duration="10.0")
+        )
+
+        assert "00:00:00,100 --> 00:00:10,000" in pathlib.Path(
+            proc.srt_path
+        ).read_text(encoding="utf-8")
+        assert "outside video" not in pathlib.Path(proc.srt_path).read_text(
+            encoding="utf-8"
+        )
         widget._cleanup_srt(start_ffmpeg.call_args.args[3])
 
     @pytest.mark.parametrize("payload", [b"", b"not json"])
