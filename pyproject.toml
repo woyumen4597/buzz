@@ -163,6 +163,12 @@ torchaudio = [
 [[tool.uv.index]]
 name = "nvidia"
 url = "https://pypi.ngc.nvidia.com/"
+# 必须 explicit = true:否则在 unsafe-best-match 下,解析任何包(包括项目自身的
+# build-system.requires)都会去查询这个源,而 NGC 镜像在国内网络经常不可达
+# (DNS 解析超时/TLS 握手失败),导致 uv sync 直接报错。当前没有任何 source
+# 显式引用 "nvidia",设为 explicit 后该源在正常解析中完全不会被查询;
+# 未来若某个依赖需要它,在 [tool.uv.sources] 里加 index = "nvidia" 即可。
+explicit = true
 
 [[tool.uv.index]]
 name = "pytorch-cu129"
