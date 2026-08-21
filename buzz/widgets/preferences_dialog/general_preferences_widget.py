@@ -219,6 +219,24 @@ class GeneralPreferencesWidget(QWidget):
             _("OpenAI base url"), self.custom_openai_base_url_line_edit
         )
 
+        self.translation_proxy = self.settings.value(
+            Settings.Key.TRANSLATION_PROXY, default_value=""
+        )
+        self.translation_proxy_line_edit = LineEdit(self.translation_proxy, self)
+        self.translation_proxy_line_edit.textChanged.connect(
+            self.on_translation_proxy_changed
+        )
+        self.translation_proxy_line_edit.setMinimumWidth(200)
+        self.translation_proxy_line_edit.setPlaceholderText(
+            "http://127.0.0.1:10808"
+        )
+        self.translation_proxy_line_edit.setToolTip(
+            _("Optional HTTP or HTTPS proxy used for LLM translation requests")
+        )
+        openai_layout.addRow(
+            _("Translation proxy"), self.translation_proxy_line_edit
+        )
+
         self.translation_api_protocol_combo_box = QComboBox(self)
         self.translation_api_protocol_combo_box.setObjectName(
             "TranslationAPIProtocolComboBox"
@@ -558,6 +576,9 @@ class GeneralPreferencesWidget(QWidget):
     def on_custom_openai_base_url_changed(self, text: str):
         self.settings.set_value(Settings.Key.CUSTOM_OPENAI_BASE_URL, text)
 
+    def on_translation_proxy_changed(self, text: str):
+        self.settings.set_value(Settings.Key.TRANSLATION_PROXY, text.strip())
+
     def on_openai_api_model_changed(self, text: str):
         self.settings.set_value(Settings.Key.OPENAI_API_MODEL, text)
 
@@ -663,6 +684,10 @@ class ValidateOpenAIApiKeyJob(QRunnable):
             ),
         )
         base_url = configured_base_url or DEFAULT_OPENAI_BASE_URL
+        configured_proxy = os.getenv("BUZZ_TRANSLATION_PROXY")
+        if configured_proxy is None:
+            configured_proxy = settings.value(Settings.Key.TRANSLATION_PROXY, "")
+        proxy = str(configured_proxy or "").strip() or None
         model = os.getenv(
             "BUZZ_TRANSLATION_API_MODEL",
             settings.value(key=Settings.Key.OPENAI_API_MODEL, default_value=""),
@@ -694,7 +719,10 @@ class ValidateOpenAIApiKeyJob(QRunnable):
             }
 
         try:
-            resp = httpx.post(url, headers=headers, json=body, timeout=20)
+            request_kwargs = {"headers": headers, "json": body, "timeout": 20}
+            if proxy:
+                request_kwargs["proxy"] = proxy
+            resp = httpx.post(url, **request_kwargs)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
             return

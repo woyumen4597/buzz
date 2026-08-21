@@ -175,8 +175,12 @@ class Translator(QObject):
             ),
         )
         self.base_url = configured_base_url or DEFAULT_OPENAI_BASE_URL
-        # Env var wins over the stored preference so a run can be tuned without
-        # touching saved settings; both are clamped to the supported range.
+        configured_proxy = os.getenv("BUZZ_TRANSLATION_PROXY")
+        if configured_proxy is None:
+            configured_proxy = settings.value(Settings.Key.TRANSLATION_PROXY, "")
+        self.proxy = str(configured_proxy or "").strip() or None
+        # Env var wins over the stored preference so a desktop launch can be
+        # configured without touching saved settings.
         self.batch_size = min(
             MAX_TRANSLATION_BATCH_SIZE,
             max(
@@ -247,14 +251,17 @@ class Translator(QObject):
     def _client(self) -> httpx.Client:
         with self._client_lock:
             if self._client_instance is None:
-                self._client_instance = httpx.Client(
-                    timeout=httpx.Timeout(
+                client_kwargs = {
+                    "timeout": httpx.Timeout(
                         connect=REQUEST_TIMEOUT.connect,
                         read=self.read_timeout,
                         write=REQUEST_TIMEOUT.write,
                         pool=REQUEST_TIMEOUT.pool,
                     )
-                )
+                }
+                if self.proxy:
+                    client_kwargs["proxy"] = self.proxy
+                self._client_instance = httpx.Client(**client_kwargs)
             return self._client_instance
 
     def _close_client(self) -> None:

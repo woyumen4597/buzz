@@ -87,6 +87,7 @@ class Settings:
         TRANSLATION_BATCH_SIZE = "transcriber/translation-batch-size"
         TRANSLATION_CONCURRENCY = "transcriber/translation-concurrency"
         TRANSLATION_READ_TIMEOUT = "transcriber/translation-read-timeout"
+        TRANSLATION_PROXY = "transcriber/translation-proxy"
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"
 

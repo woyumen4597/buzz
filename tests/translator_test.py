@@ -7,8 +7,11 @@ from PyQt6.QtCore import QThread
 
 from buzz.settings.settings import (
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_CONCURRENCY,
     MAX_TRANSLATION_BATCH_SIZE,
+    MAX_TRANSLATION_CONCURRENCY,
     MIN_TRANSLATION_BATCH_SIZE,
+    MIN_TRANSLATION_CONCURRENCY,
     Settings,
 )
 from buzz.translator import (
@@ -247,6 +250,103 @@ class TestTranslationBatchSizeConfig:
             assert self._make_translator().batch_size == MAX_TRANSLATION_BATCH_SIZE
 
 
+class TestTranslationConcurrencyConfig:
+    def _make_translator(self):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        return Translator(options)
+
+    def test_defaults_to_configured_default(self, monkeypatch):
+        monkeypatch.delenv("BUZZ_TRANSLATION_CONCURRENCY", raising=False)
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            translator = self._make_translator()
+        assert translator.max_concurrent_requests == DEFAULT_TRANSLATION_CONCURRENCY
+
+    def test_reads_stored_preference(self, monkeypatch):
+        monkeypatch.delenv("BUZZ_TRANSLATION_CONCURRENCY", raising=False)
+
+        def fake_value(key, default_value=None, *args, **kwargs):
+            if key == Settings.Key.TRANSLATION_CONCURRENCY:
+                return 6
+            return default_value
+
+        with patch("buzz.translator.Settings.value", side_effect=fake_value):
+            translator = self._make_translator()
+        assert translator.max_concurrent_requests == 6
+
+    def test_env_var_overrides_preference(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_CONCURRENCY", "5")
+
+        def fake_value(key, default_value=None, *args, **kwargs):
+            if key == Settings.Key.TRANSLATION_CONCURRENCY:
+                return 2
+            return default_value
+
+        with patch("buzz.translator.Settings.value", side_effect=fake_value):
+            translator = self._make_translator()
+        assert translator.max_concurrent_requests == 5
+
+    def test_clamps_out_of_range_values(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_CONCURRENCY", "0")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            assert (
+                self._make_translator().max_concurrent_requests
+                == MIN_TRANSLATION_CONCURRENCY
+            )
+
+        monkeypatch.setenv("BUZZ_TRANSLATION_CONCURRENCY", "99999")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            assert (
+                self._make_translator().max_concurrent_requests
+                == MAX_TRANSLATION_CONCURRENCY
+            )
+
+
+class TestTranslationProxyConfig:
+    def _make_translator(self):
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        return Translator(options)
+
+    def test_reads_proxy_from_environment(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROXY", "http://127.0.0.1:10808")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            translator = self._make_translator()
+        assert translator.proxy == "http://127.0.0.1:10808"
+
+    def test_environment_proxy_overrides_stored_preference(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROXY", "http://env-proxy:8080")
+
+        def fake_value(key, default_value=None, *args, **kwargs):
+            if key == Settings.Key.TRANSLATION_PROXY:
+                return "http://stored-proxy:8080"
+            return default_value
+
+        with patch("buzz.translator.Settings.value", side_effect=fake_value):
+            translator = self._make_translator()
+        assert translator.proxy == "http://env-proxy:8080"
+
+    def test_passes_proxy_to_httpx_client(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROXY", "http://127.0.0.1:10808")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ), patch("buzz.translator.httpx.Client") as client_class:
+            translator = self._make_translator()
+            translator._client()
+        assert client_class.call_args.kwargs["proxy"] == "http://127.0.0.1:10808"
+
+
 class TestTranslationRuntimeControls:
     def _make_translator(self):
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
@@ -416,6 +516,10 @@ class TestTranslateItemsSync:
     def test_runs_two_batches_concurrently_and_preserves_order(self, qtbot):
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
         translator = Translator(options)
+        # Concurrency and batch size are user-configurable, so pin both here;
+        # this test is about ordering, not about the configured defaults.
+        translator.max_concurrent_requests = 2
+        translator.batch_size = 20
         barrier = threading.Barrier(2, timeout=2)
         lock = threading.Lock()
         state = {"active": 0, "max_active": 0, "broken": False, "sizes": []}
@@ -442,6 +546,44 @@ class TestTranslateItemsSync:
         assert state["max_active"] == 2
         assert sorted(state["sizes"]) == [20, 20]
         assert [tid for _, tid in results] == list(range(40))
+
+    def test_configured_concurrency_raises_batches_in_flight(self, monkeypatch, qtbot):
+        monkeypatch.setenv("BUZZ_TRANSLATION_CONCURRENCY", "4")
+        monkeypatch.delenv("BUZZ_TRANSLATION_BATCH_SIZE", raising=False)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        with patch(
+            "buzz.translator.Settings.value",
+            side_effect=lambda key, default_value=None, *a, **kw: default_value,
+        ):
+            translator = Translator(options)
+        assert translator.max_concurrent_requests == 4
+
+        # Only releases once all four batches are in flight at the same time,
+        # so it cannot pass while concurrency is capped at 2.
+        barrier = threading.Barrier(4, timeout=5)
+        lock = threading.Lock()
+        state = {"active": 0, "max_active": 0, "broken": False}
+
+        def translate(batch):
+            with lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                state["broken"] = True
+            finally:
+                with lock:
+                    state["active"] -= 1
+            return [(f"t-{tid}", tid) for _, tid in batch]
+
+        items = [("text", tid) for tid in range(80)]
+        with patch.object(translator, "_translate_batch", side_effect=translate):
+            results = translator.translate_items_sync(items)
+
+        assert state["broken"] is False
+        assert state["max_active"] == 4
+        assert [tid for _, tid in results] == list(range(80))
 
 
 class TestBatchRecovery:
