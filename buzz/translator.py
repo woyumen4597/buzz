@@ -257,16 +257,12 @@ class Translator(QObject):
             "BUZZ_TRANSLATION_API_MODEL"
         ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
-        # Reasoning effort for the responses protocol. DeepSeek enables
-        # thinking by default and counts reasoning tokens against
+        # Reasoning effort for OpenAI-compatible reasoning models. DeepSeek
+        # enables thinking by default and counts reasoning tokens against
         # max_output_tokens, so a thinking-heavy batch can exhaust the whole
-        # output budget before any visible text is produced — the stream then
-        # ends with response.incomplete and no output_text.delta, surfacing as
-        # "empty stream" failures. Translation is a deterministic rewriting
-        # task, so default to no reasoning for DeepSeek; "none" disables
-        # thinking, "minimal"/"low"/"medium"/"high"/"max" select an effort.
-        # BUZZ_TRANSLATION_REASONING_EFFORT overrides the default; any value
-        # outside the allowed set is ignored (upstream then uses its default).
+        # output budget before any visible text is produced. DSH configures
+        # gpt-5.6 models with high reasoning effort; match that default here.
+        # BUZZ_TRANSLATION_REASONING_EFFORT overrides the model default.
         self.reasoning_effort = os.getenv(
             "BUZZ_TRANSLATION_REASONING_EFFORT", ""
         ).strip().lower()
@@ -281,6 +277,8 @@ class Translator(QObject):
                 # deepseek-chat and friends default thinking ON upstream;
                 # deepseek-reasoner forces thinking and ignores this knob.
                 self.reasoning_effort = "none"
+            elif model_lower.startswith("gpt-5.6-"):
+                self.reasoning_effort = "high"
 
         # Log the resolved throughput knobs so a run's effective settings can be
         # confirmed from the log. No credentials or base URL here.
@@ -486,6 +484,7 @@ class Translator(QObject):
                 # the whole completion before sending a byte, so a large batch
                 # blows the read timeout on time-to-first-byte alone.
                 "stream": True,
+                "store": False,
                 "input": [
                     {
                         "role": "system",
@@ -501,7 +500,11 @@ class Translator(QObject):
                 # DeepSeek defaults thinking ON and counts reasoning tokens
                 # against max_output_tokens; "none" keeps the whole budget for
                 # the visible translation output.
-                body["reasoning"] = {"effort": self.reasoning_effort}
+                reasoning = {"effort": self.reasoning_effort}
+                if (self.llm_model or "").lower().startswith("gpt-5.6-"):
+                    reasoning["summary"] = "auto"
+                    body["include"] = ["reasoning.encrypted_content"]
+                body["reasoning"] = reasoning
             if json_mode:
                 body["text"] = {"format": {"type": "json_object"}}
         else:
@@ -513,6 +516,7 @@ class Translator(QObject):
                 # the 30s read timeout a per-chunk gap instead of a hard cap on
                 # the entire generation.
                 "stream": True,
+                "stream_options": {"include_usage": True},
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
@@ -520,6 +524,11 @@ class Translator(QObject):
             }
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
+            if (
+                self.reasoning_effort
+                and (self.llm_model or "").lower().startswith("gpt-5.6-")
+            ):
+                body["reasoning_effort"] = self.reasoning_effort
         return url, headers, body
 
     def _extract_text(self, data: dict) -> Optional[str]:
@@ -731,7 +740,9 @@ class Translator(QObject):
         user_bytes = len(user_content.encode("utf-8")) if user_content else 0
         system_bytes = len(system.encode("utf-8")) if system else 0
         n_segments = user_content.count("[") if user_content else 0  # batch marker count
-        t_sent = t_last_touch = None
+        attempt_start = attempt_sent = attempt_headers = None
+        attempt_mode = "unknown"
+        attempt_read_timeout = self.read_timeout
 
         def _diag(exc_type: str, status=None, attempts: int = 0,
                   incomplete_reason: Optional[str] = None):
@@ -740,11 +751,16 @@ class Translator(QObject):
                 f"{exc_type} status={status} attempts={attempts}",
                 f"elapsed={now - t_start:.1f}s",
                 f"user={user_bytes}B system={system_bytes}B seg_markers={n_segments}",
+                f"attempt_elapsed={(now - attempt_start):.1f}s" if attempt_start else "",
+                f"mode={attempt_mode} read_timeout={attempt_read_timeout}s",
             ]
+            parts = [part for part in parts if part]
             if incomplete_reason:
                 parts.append(f"incomplete_reason={incomplete_reason}")
-            if t_sent is not None:
-                parts.append(f"to_first_byte={(t_last_touch or now) - t_sent:.1f}s")
+            if attempt_sent is not None:
+                parts.append(
+                    f"to_first_byte={(attempt_headers or now) - attempt_sent:.1f}s"
+                )
             logging.error("Translation diag: " + " | ".join(parts))
 
         for attempt in range(MAX_ATTEMPTS):
@@ -756,8 +772,16 @@ class Translator(QObject):
                 # Stream so the read timeout is per-chunk (30s between chunks)
                 # rather than one deadline for the whole body — slow-first-byte
                 # gateways and long responses no longer share the same tight cap.
-                t_sent = time.monotonic()
+                attempt_start = time.monotonic()
+                attempt_sent = time.monotonic()
+                attempt_headers = None
                 request_body = dict(body)
+                attempt_mode = "stream" if request_body.get("stream") else "buffered"
+                attempt_read_timeout = (
+                    self.read_timeout
+                    if request_body.get("stream")
+                    else min(self.read_timeout, REQUEST_TIMEOUT.read)
+                )
                 stream_options = {
                     "headers": headers,
                     "json": request_body,
@@ -773,9 +797,9 @@ class Translator(QObject):
                         pool=REQUEST_TIMEOUT.pool,
                     )
                 with self._client().stream("POST", url, **stream_options) as resp:
-                    t_last_touch = time.monotonic()
+                    attempt_headers = time.monotonic()
                     resp.raise_for_status()
-                    t_last_touch = time.monotonic()
+                    attempt_headers = time.monotonic()
                     text, incomplete_reason = self._read_stream(resp)
                     if text is not None:
                         self._set_last_request_status(None)
@@ -924,16 +948,16 @@ class Translator(QObject):
             f"{self.transcription_options.llm_prompt}\n\n"
             f"You will receive {len(missing)} numbered texts. "
             f"Process each one separately according to the instruction above "
-            f"and return a JSON object mapping each number to its processed text, "
-            f'e.g. {{"translations": {{"1": "processed text 1", "2": "processed text 2"}}}}. '
-            f"Respond with only that JSON object and nothing else."
+            f"and return each processed text on its own line using the exact "
+            f"format [number] translated text. Preserve the input numbering, "
+            f"do not add comments or notes, and respond with only those numbered "
+            f"lines."
         )
 
         generation, cancel_event = self._run_context()
         message_args = {
             "system": batch_prompt,
             "user_content": combined,
-            "json_mode": True,
         }
         if generation is not None or cancel_event is not None:
             message_args.update(generation=generation, cancel_event=cancel_event)

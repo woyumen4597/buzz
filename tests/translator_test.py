@@ -666,6 +666,7 @@ class TestTranslator:
                 "model": "gpt-4o-mini",
                 "max_tokens": 8192,
                 "stream": True,
+                "stream_options": {"include_usage": True},
                 "messages": [
                     {"role": "system", "content": "Translate this text:"},
                     {"role": "user", "content": "Hello"},
@@ -708,6 +709,7 @@ class TestTranslator:
                 "model": "gpt-4o-mini",
                 "max_output_tokens": 8192,
                 "stream": True,
+                "store": False,
                 "input": [
                     {
                         "role": "system",
@@ -723,6 +725,34 @@ class TestTranslator:
                 "text": {"format": {"type": "json_object"}},
             },
         )
+
+    @patch("buzz.translator.httpx.Client")
+    def test_gpt56_reasoning_matches_dsh(self, mock_client_class, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        request_body = mock_client.stream.call_args.kwargs["json"]
+        assert request_body["store"] is False
+        assert request_body["reasoning"] == {"effort": "high", "summary": "auto"}
+        assert request_body["include"] == ["reasoning.encrypted_content"]
 
     @patch("buzz.translator.time.sleep")
     @patch("buzz.translator.httpx.Client")
@@ -757,6 +787,41 @@ class TestTranslator:
         assert mock_client.stream.call_args_list[1].kwargs["json"]["input"] == (
             "Translate this text:\n\nHello"
         )
+
+    @patch("buzz.translator.time.sleep")
+    @patch("buzz.translator.httpx.Client")
+    def test_retry_diagnostics_use_current_attempt_timestamps(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch, caplog
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            _failing_response(502),
+            httpx.ReadTimeout("read timed out"),
+            httpx.ReadTimeout("read timed out"),
+            httpx.ReadTimeout("read timed out"),
+        ]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        caplog.set_level("ERROR")
+        assert translator._messages("Translate this text:", "Hello") is None
+        timeout_records = [
+            record.message for record in caplog.records if "ReadTimeout" in record.message
+        ]
+        assert timeout_records
+        assert all("to_first_byte=-" not in message for message in timeout_records)
 
     @patch("buzz.translator.httpx.Client")
     def test_http_5xx_batch_is_retried_in_smaller_batches(
@@ -796,7 +861,9 @@ class TestTranslator:
         assert calls["count"] == 3
 
     @patch('buzz.translator.httpx.Client')
-    def test_batch_request_uses_json_mode(self, mock_client_class, qtbot, monkeypatch):
+    def test_batch_request_avoids_structured_json_mode(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
         monkeypatch.setenv(
             "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
@@ -804,9 +871,7 @@ class TestTranslator:
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
 
         mock_client = Mock()
-        mock_client.stream.return_value = _stream_response(
-            '{"translations": {}}'
-        )
+        mock_client.stream.return_value = _stream_response("[1] translated")
         mock_client_class.return_value = mock_client
 
         options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
@@ -815,9 +880,9 @@ class TestTranslator:
             AdvancedSettingsDialog(transcription_options=options, parent=None),
         )
 
-        translator._messages("Translate:", "Hello", json_mode=True)
+        assert translator._translate_batch([("Hello", 1)]) == [("translated", 1)]
         request_body = mock_client.stream.call_args.kwargs["json"]
-        assert request_body["response_format"] == {"type": "json_object"}
+        assert "response_format" not in request_body
 
     @patch('buzz.translator.httpx.Client')
     def test_deepseek_responses_defaults_to_no_reasoning(
