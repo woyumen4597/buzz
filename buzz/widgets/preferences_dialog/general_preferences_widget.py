@@ -748,13 +748,20 @@ class ValidateOpenAIApiKeyJob(QRunnable):
             body = {
                 "model": model,
                 "max_output_tokens": 8,
-                "input": "hi",
+                "stream": True,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}],
+                    }
+                ],
             }
         else:
             url = _chat_completions_url(base_url)
             body = {
                 "model": model,
                 "max_tokens": 8,
+                "stream": True,
                 "messages": [{"role": "user", "content": "hi"}],
             }
 

@@ -724,6 +724,77 @@ class TestTranslator:
             },
         )
 
+    @patch("buzz.translator.time.sleep")
+    @patch("buzz.translator.httpx.Client")
+    def test_retryable_stream_error_falls_back_to_buffered_request(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            _failing_response(502),
+            _stream_response("AI Translated", protocol=RESPONSES_PROTOCOL),
+        ]
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        assert mock_client.stream.call_count == 2
+        assert mock_client.stream.call_args_list[0].kwargs["json"]["stream"] is True
+        assert mock_client.stream.call_args_list[1].kwargs["json"]["stream"] is False
+        assert mock_client.stream.call_args_list[1].kwargs["json"]["input"] == (
+            "Translate this text:\n\nHello"
+        )
+
+    @patch("buzz.translator.httpx.Client")
+    def test_http_5xx_batch_is_retried_in_smaller_batches(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+        calls = {"count": 0}
+
+        def translate_request(*args, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                translator._set_last_request_status(502)
+                return None
+            translator._set_last_request_status(None)
+            return '{"translations": {"1": "一", "2": "二"}}'
+
+        with patch.object(translator, "_messages", side_effect=translate_request):
+            result = translator._translate_batch(
+                [("one", 1), ("two", 2), ("three", 3), ("four", 4)]
+            )
+
+        assert result == [("一", 1), ("二", 2), ("一", 3), ("二", 4)]
+        assert calls["count"] == 3
+
     @patch('buzz.translator.httpx.Client')
     def test_batch_request_uses_json_mode(self, mock_client_class, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")

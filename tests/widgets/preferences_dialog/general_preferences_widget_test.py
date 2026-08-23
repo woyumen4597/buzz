@@ -245,7 +245,17 @@ class TestTestOpenAIApiKeyJob:
                 "Authorization": "Bearer test_key",
                 "Content-Type": "application/json",
             },
-            json={"model": "", "max_output_tokens": 8, "input": "hi"},
+            json={
+                 "model": "",
+                 "max_output_tokens": 8,
+                 "stream": True,
+                 "input": [
+                     {
+                         "role": "user",
+                         "content": [{"type": "input_text", "text": "hi"}],
+                     }
+                 ],
+             },
             timeout=20,
         )
 

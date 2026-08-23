@@ -287,7 +287,7 @@ class Translator(QObject):
         logging.debug(
             "Translation config resolved: batch_size=%s, concurrency=%s, "
             "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, "
-            "read_timeout=%ss, max_output_tokens=%s, reasoning=%s",
+            "read_timeout=%ss, max_output_tokens=%s, reasoning=%s, model=%s",
             self.batch_size,
             self.max_concurrent_requests,
             requests_per_minute,
@@ -296,6 +296,7 @@ class Translator(QObject):
             self.read_timeout,
             self.max_output_tokens,
             self.reasoning_effort or "default",
+            self.llm_model or "<empty>",
         )
 
     def _client(self) -> httpx.Client:
@@ -357,6 +358,12 @@ class Translator(QObject):
         else:
             self._thread_context.generation = generation
             self._thread_context.cancel_event = cancel_event
+
+    def _last_request_status(self) -> Optional[int]:
+        return getattr(self._thread_context, "last_request_status", None)
+
+    def _set_last_request_status(self, status: Optional[int]) -> None:
+        self._thread_context.last_request_status = status
 
     def _run_batch_group(
         self,
@@ -715,6 +722,7 @@ class Translator(QObject):
         if generation is None and cancel_event is None:
             generation, cancel_event = self._run_context()
         url, headers, body = self._build_request(system, user_content, json_mode)
+        self._set_last_request_status(None)
 
         # Failure diagnostics: emitted ONLY when a request fails, so the success
         # path stays silent. Body sizes plus time-to-first-byte are what tell a
@@ -749,14 +757,28 @@ class Translator(QObject):
                 # rather than one deadline for the whole body — slow-first-byte
                 # gateways and long responses no longer share the same tight cap.
                 t_sent = time.monotonic()
-                with self._client().stream(
-                    "POST", url, headers=headers, json=body
-                ) as resp:
+                request_body = dict(body)
+                stream_options = {
+                    "headers": headers,
+                    "json": request_body,
+                }
+                if request_body.get("stream") is False:
+                    # Some OpenAI-compatible relays accept the minimal string
+                    # input but queue or proxy a structured Responses request
+                    # indefinitely. Keep the compatibility fallback bounded.
+                    stream_options["timeout"] = httpx.Timeout(
+                        connect=REQUEST_TIMEOUT.connect,
+                        read=min(self.read_timeout, REQUEST_TIMEOUT.read),
+                        write=REQUEST_TIMEOUT.write,
+                        pool=REQUEST_TIMEOUT.pool,
+                    )
+                with self._client().stream("POST", url, **stream_options) as resp:
                     t_last_touch = time.monotonic()
                     resp.raise_for_status()
                     t_last_touch = time.monotonic()
                     text, incomplete_reason = self._read_stream(resp)
                     if text is not None:
+                        self._set_last_request_status(None)
                         return text
                     # An HTTP 200 with an empty/malformed SSE body is a
                     # transient provider/proxy failure, not a successful
@@ -799,6 +821,7 @@ class Translator(QObject):
                     )
             except httpx.HTTPStatusError as e:
                 status = getattr(e.response, "status_code", "unknown")
+                self._set_last_request_status(status if isinstance(status, int) else None)
                 _diag("HTTPStatusError", status=status, attempts=attempt + 1)
                 logging.error("Translation error! HTTP %s", status)
                 retryable_status = (
@@ -810,6 +833,16 @@ class Translator(QObject):
                     or not retryable_status
                 ):
                     return None
+                if retryable_status and body.get("stream") is True:
+                    body["stream"] = False
+                    if self.api_protocol == RESPONSES_PROTOCOL:
+                        body["input"] = f"{system}\n\n{user_content}"
+                        body.pop("text", None)
+                    logging.warning(
+                        "Translation streaming request returned HTTP %s; "
+                        "retrying with a buffered compatibility payload",
+                        status,
+                    )
                 self._backoff(attempt, e.response, generation, cancel_event)
             except httpx.TransportError as e:
                 # Transient network failures are retried; only the final attempt
@@ -908,6 +941,34 @@ class Translator(QObject):
             **message_args,
         )
         if not response_text:
+            failed_status = self._last_request_status()
+            if (
+                isinstance(failed_status, int)
+                and failed_status >= 500
+                and len(missing) > 1
+            ):
+                midpoint = max(1, len(missing) // 2)
+                logging.warning(
+                    "Translation batch failed with HTTP %s; retrying %d items "
+                    "as smaller batches",
+                    failed_status,
+                    len(missing),
+                )
+                recovered = []
+                for chunk in (missing[:midpoint], missing[midpoint:]):
+                    recovered.extend(
+                        self._translate_batch(
+                            [(transcript, tid) for _, transcript, tid in chunk]
+                        )
+                    )
+                recovered_by_id = {tid: text for text, tid in recovered}
+                return [
+                    (
+                        by_index.get(index, recovered_by_id.get(tid, "")),
+                        tid,
+                    )
+                    for index, (_, tid) in enumerate(items)
+                ]
             return [
                 (by_index.get(index, ""), tid)
                 for index, (_, tid) in enumerate(items)
