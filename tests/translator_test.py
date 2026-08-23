@@ -18,6 +18,8 @@ from buzz.translator import (
     CHAT_COMPLETIONS_PROTOCOL,
     RESPONSES_PROTOCOL,
     Translator,
+    _compress_repetitive_translation_input,
+    _sanitize_translation_input,
 )
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
@@ -87,7 +89,67 @@ def _success_response(content):
     return resp
 
 
-class TestParseBatchResponse:
+class TestRepetitiveTranslationInput:
+    def test_compresses_repeated_asr_filler(self):
+        compressed, diagnostic = _compress_repetitive_translation_input(
+            "어허허허허허허허허허허허허허허허"
+        )
+        assert compressed == "어허허허허허허…"
+        assert diagnostic["kind"] == "repeated_character"
+        assert diagnostic["repetitions"] >= 12
+
+        compressed, diagnostic = _compress_repetitive_translation_input(
+            "어, 어, 어, 어, 어, 어, 어."
+        )
+        assert compressed == "어, 어, 어…"
+        assert diagnostic["kind"] == "repeated_token"
+
+    def test_quarantines_malformed_unicode(self):
+        malformed = "ì\x9c¼ì\x95\x84ã \x8f" * 4
+        cleaned, diagnostic = _sanitize_translation_input(malformed)
+
+        assert "\x8f" not in cleaned
+        assert diagnostic["kind"] == "malformed_unicode"
+        assert diagnostic["quarantine"] is True
+        assert diagnostic["control_count"] > 0
+
+    def test_quarantined_batch_item_does_not_affect_safe_items(self):
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(options)
+        translator._messages = Mock(return_value="[1] safe translation")
+        malformed = "ì\x9c¼ì\x95\x84ã \x8f" * 4
+
+        result = translator._translate_batch(
+            [(malformed, 741), ("normal text", 744)]
+        )
+
+        sent_user_content = translator._messages.call_args.kwargs["user_content"]
+        assert malformed not in sent_user_content
+        assert "normal text" in sent_user_content
+        assert result == [("", 741), ("safe translation", 744)]
+
+    def test_batch_request_uses_compressed_repetitive_input(self):
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(options)
+        translator._messages = Mock(return_value="[1] 一\n[2] 二\n[3] 三")
+        repeated = "어허허허허허허허허허허허허허허허"
+
+        result = translator._translate_batch(
+            [(repeated, 741), ("어, 어, 어, 어, 어, 어, 어.", 742), ("normal text", 744)]
+        )
+
+        sent_user_content = translator._messages.call_args.kwargs["user_content"]
+        assert repeated not in sent_user_content
+        assert "어허허허허허허…" in sent_user_content
+        assert "어, 어, 어…" in sent_user_content
+        assert "normal text" in sent_user_content
+        assert [transcript_id for _, transcript_id in result] == [741, 742, 744]
+
+
     def test_simple_batch(self):
         response = "[1] Hello\n[2] World"
         result = Translator._parse_batch_response(response, 2)
@@ -753,6 +815,10 @@ class TestTranslator:
         assert request_body["store"] is False
         assert request_body["reasoning"] == {"effort": "high", "summary": "auto"}
         assert request_body["include"] == ["reasoning.encrypted_content"]
+        assert request_body["input"][0] == {
+            "role": "developer",
+            "content": "Translate this text:",
+        }
 
     @patch("buzz.translator.time.sleep")
     @patch("buzz.translator.httpx.Client")
@@ -822,6 +888,108 @@ class TestTranslator:
         ]
         assert timeout_records
         assert all("to_first_byte=-" not in message for message in timeout_records)
+
+    @patch("buzz.translator.httpx.Client")
+    def test_sse_done_sentinel_stops_reading_before_connection_eof(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+
+        done_sent = threading.Event()
+        release_connection = threading.Event()
+
+        def lines_with_open_connection():
+            for line in _sse_lines("AI Translated"):
+                if line == "data: [DONE]":
+                    done_sent.set()
+                yield line
+            release_connection.wait(2)
+
+        response = _stream_response(lines=[])
+        response.iter_lines.side_effect = lines_with_open_connection
+        mock_client = Mock()
+        mock_client.stream.return_value = response
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                translator._messages("Translate this text:", "Hello")
+            )
+        )
+        worker.start()
+        try:
+            assert done_sent.wait(2)
+            qtbot.wait_until(lambda: not worker.is_alive(), timeout=1000)
+        finally:
+            release_connection.set()
+            worker.join(2)
+
+        assert not worker.is_alive()
+        assert result == ["AI Translated"]
+
+    @patch("buzz.translator.httpx.Client")
+    def test_responses_completed_event_stops_reading_before_connection_eof(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        completed_sent = threading.Event()
+        release_connection = threading.Event()
+
+        def responses_lines_with_open_connection():
+            yield (
+                'data: {"type":"response.output_text.delta",'
+                '"delta":"AI Translated"}'
+            )
+            completed_sent.set()
+            yield 'data: {"type":"response.completed"}'
+            release_connection.wait(2)
+
+        response = _stream_response(lines=[])
+        response.iter_lines.side_effect = responses_lines_with_open_connection
+        mock_client = Mock()
+        mock_client.stream.return_value = response
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-5.6-luna", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+        result = []
+        worker = threading.Thread(
+            target=lambda: result.append(
+                translator._messages("Translate this text:", "Hello")
+            )
+        )
+        worker.start()
+        try:
+            assert completed_sent.wait(2)
+            qtbot.wait_until(lambda: not worker.is_alive(), timeout=1000)
+        finally:
+            release_connection.set()
+            worker.join(2)
+
+        assert not worker.is_alive()
+        assert result == ["AI Translated"]
 
     @patch("buzz.translator.httpx.Client")
     def test_http_5xx_batch_is_retried_in_smaller_batches(

@@ -5,6 +5,7 @@ import logging
 import queue
 import threading
 import time
+import unicodedata
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 
@@ -50,16 +51,125 @@ BATCH_WINDOW_SECONDS = 0.1
 MAX_ATTEMPTS = 4
 DEFAULT_REQUESTS_PER_MINUTE = 60.0
 TRANSLATION_CACHE_SIZE = 1024
-
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
-# Must stay below the viewer's graceful shutdown wait so closing the window
-# never has to terminate the worker thread mid-request. Read timeout stays
-# 30s (within the 35s shutdown budget); the connect timeout is shorter so a
-# dead/hung proxy fails fast and the retry can reach a healthy path sooner
-# instead of burning the full budget each attempt.
+# Keep the fixed buffered-compatibility fallback below the viewer's graceful
+# shutdown wait so closing the window never has to terminate a worker thread
+# mid-request. Streaming calls use the user-configured read timeout as the
+# maximum gap between response chunks.
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
 RESPONSES_PROTOCOL = "responses"
+
+
+def _compress_repetitive_translation_input(text: str) -> Tuple[str, Optional[dict]]:
+    """Bound pathological ASR repetition while preserving normal transcript text.
+
+    Returns the text sent to the model and a small diagnostic record when a
+    compression was applied. Only a dominant repeated run/token is changed;
+    ordinary sentences and short laughter/disfluencies remain untouched.
+    """
+    text = str(text or "")
+    if len(text) < 16:
+        return text, None
+
+    token_parts = re.findall(r"[^\s,，、。.!！?？]+", text)
+    if (
+        len(token_parts) >= 4
+        and len(set(token_parts)) == 1
+        and len(token_parts[0]) <= 12
+    ):
+        unit = token_parts[0]
+        compressed = f"{unit}, {unit}, {unit}…"
+        return compressed, {
+            "kind": "repeated_token",
+            "unit": unit,
+            "repetitions": len(token_parts),
+            "original_chars": len(text),
+            "compressed_chars": len(compressed),
+        }
+
+    repeated_matches = list(re.finditer(r"(?P<char>[^\W\d_])(?P=char){7,}", text))
+    for match in sorted(repeated_matches, key=lambda item: len(item.group()), reverse=True):
+        run_length = len(match.group())
+        if run_length < 12 or run_length < len(text) * 0.5:
+            continue
+        char = match.group("char")
+        compressed = text[: match.start()] + char * 6 + "…" + text[match.end() :]
+        return compressed, {
+            "kind": "repeated_character",
+            "unit": char,
+            "repetitions": run_length,
+            "original_chars": len(text),
+            "compressed_chars": len(compressed),
+        }
+    return text, None
+
+
+def _sanitize_translation_input(text: str) -> Tuple[str, Optional[dict]]:
+    """Remove harmless invisible characters and quarantine malformed text.
+
+    Any control/replacement character is treated as unsafe for an LLM batch.
+    The segment is returned with those characters removed, but callers use the
+    quarantine flag to keep it out of the outbound request.
+    """
+    original = str(text or "")
+    cleaned_chars = []
+    control_count = 0
+    replacement_count = 0
+    zero_width_count = 0
+    for char in original:
+        codepoint = ord(char)
+        if char == "\ufffd":
+            replacement_count += 1
+            continue
+        if codepoint in {0x200B, 0x200C, 0x200D, 0xFEFF}:
+            zero_width_count += 1
+            continue
+        if unicodedata.category(char).startswith("C") and char not in "\n\r\t":
+            control_count += 1
+            continue
+        cleaned_chars.append(char)
+    cleaned = unicodedata.normalize("NFC", "".join(cleaned_chars))
+    if cleaned == original:
+        return cleaned, None
+    return cleaned, {
+        "kind": "malformed_unicode" if control_count or replacement_count else "invisible_character",
+        "original_chars": len(original),
+        "cleaned_chars": len(cleaned),
+        "control_count": control_count,
+        "replacement_count": replacement_count,
+        "zero_width_count": zero_width_count,
+        "quarantine": bool(control_count or replacement_count),
+    }
+
+
+def _log_input_sanitization(transcript_id: int, diagnostic: dict) -> None:
+    level = logging.warning if diagnostic["quarantine"] else logging.debug
+    level(
+        "Sanitized translation input id=%s kind=%s chars=%s->%s "
+        "controls=%s replacements=%s zero_width=%s quarantine=%s",
+        transcript_id,
+        diagnostic["kind"],
+        diagnostic["original_chars"],
+        diagnostic["cleaned_chars"],
+        diagnostic["control_count"],
+        diagnostic["replacement_count"],
+        diagnostic["zero_width_count"],
+        diagnostic["quarantine"],
+    )
+
+
+def _log_repetition_compression(transcript_id: int, diagnostic: dict) -> None:
+    logging.warning(
+        "Compressed repetitive translation input id=%s kind=%s unit=%r "
+        "repetitions=%s chars=%s->%s",
+        transcript_id,
+        diagnostic["kind"],
+        diagnostic["unit"],
+        diagnostic["repetitions"],
+        diagnostic["original_chars"],
+        diagnostic["compressed_chars"],
+    )
 
 
 def _chat_completions_url(base_url: str) -> str:
@@ -232,7 +342,6 @@ class Translator(QObject):
                 ),
             ),
         )
-
         # Cap on generated tokens per request. Providers like DeepSeek count
         # reasoning tokens against this budget, so a hardcoded 4096 lets a
         # thinking-heavy batch exhaust the cap before any visible output is
@@ -285,13 +394,15 @@ class Translator(QObject):
         logging.debug(
             "Translation config resolved: batch_size=%s, concurrency=%s, "
             "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, "
-            "read_timeout=%ss, max_output_tokens=%s, reasoning=%s, model=%s",
+            "read_timeout=%ss, proxy=%s, max_output_tokens=%s, "
+            "reasoning=%s, model=%s",
             self.batch_size,
             self.max_concurrent_requests,
             requests_per_minute,
             self.max_batch_tokens,
             self.api_protocol,
             self.read_timeout,
+            "enabled" if self.proxy else "disabled",
             self.max_output_tokens,
             self.reasoning_effort or "default",
             self.llm_model or "<empty>",
@@ -477,18 +588,24 @@ class Translator(QObject):
         }
         if self.api_protocol == RESPONSES_PROTOCOL:
             url = _responses_url(self.base_url)
+            system_role = "developer" if self.reasoning_effort else "system"
+            system_content = (
+                system
+                if self.reasoning_effort
+                else [{"type": "input_text", "text": system}]
+            )
             body = {
                 "model": self.llm_model,
                 "max_output_tokens": self.max_output_tokens,
-                # Ask the upstream to stream. Without this the gateway buffers
+                # Ask the upstream to stream.
                 # the whole completion before sending a byte, so a large batch
                 # blows the read timeout on time-to-first-byte alone.
                 "stream": True,
                 "store": False,
                 "input": [
                     {
-                        "role": "system",
-                        "content": [{"type": "input_text", "text": system}],
+                        "role": system_role,
+                        "content": system_content,
                     },
                     {
                         "role": "user",
@@ -563,7 +680,9 @@ class Translator(QObject):
         logging.error("Translation error! Unexpected response shape")
         return None
 
-    def _read_stream(self, resp: httpx.Response) -> Tuple[Optional[str], Optional[str]]:
+    def _read_stream(
+        self, resp: httpx.Response, stream_state: Optional[dict] = None
+    ) -> Tuple[Optional[str], Optional[str]]:
         """Accumulate an SSE response body into the full text.
 
         Falls back to whole-body JSON when the gateway ignores `stream: true`
@@ -578,17 +697,33 @@ class Translator(QObject):
         event_types = []
         saw_events = False
         incomplete_reason = None
+        terminal_event = None
 
         for line in resp.iter_lines():
             if not line:
                 continue
+            if stream_state is not None:
+                stream_state["lines"] = stream_state.get("lines", 0) + 1
+                if "first_line_at" not in stream_state:
+                    stream_state["first_line_at"] = time.monotonic()
             if not line.startswith("data:"):
                 # Not SSE — remember it in case this is a buffered JSON body.
                 raw_lines.append(line)
                 continue
             saw_events = True
+            if stream_state is not None:
+                stream_state["data_lines"] = stream_state.get("data_lines", 0) + 1
             payload = line[len("data:") :].strip()
-            if not payload or payload == "[DONE]":
+            if payload == "[DONE]":
+                # OpenAI-compatible relays may send the terminal sentinel but
+                # keep the underlying HTTP connection alive. Waiting for EOF
+                # here turns a completed translation into a read timeout.
+                terminal_event = "[DONE]"
+                if stream_state is not None:
+                    stream_state["terminal"] = terminal_event
+                logging.debug("Received SSE terminal event: [DONE]")
+                break
+            if not payload:
                 continue
             try:
                 event = json.loads(payload)
@@ -596,6 +731,10 @@ class Translator(QObject):
                 continue
             if not isinstance(event, dict):
                 continue
+            if stream_state is not None:
+                stream_state["json_events"] = stream_state.get("json_events", 0) + 1
+                stream_state["last_event_type"] = event.get("type") or "untyped"
+                stream_state["last_event_at"] = time.monotonic()
             event_type = event.get("type")
             if isinstance(event_type, str) and event_type not in event_types:
                 event_types.append(event_type)
@@ -605,12 +744,32 @@ class Translator(QObject):
                     reason = details.get("reason")
                     if isinstance(reason, str):
                         incomplete_reason = reason
-            chunks.append(self._stream_delta(event))
+            if event_type in {
+                "response.completed",
+                "response.incomplete",
+                "response.failed",
+                "response.cancelled",
+            }:
+                terminal_event = event_type
+                if stream_state is not None:
+                    stream_state["terminal"] = terminal_event
+                logging.debug("Received SSE terminal event: %s", event_type)
+                break
+            delta = self._stream_delta(event)
+            chunks.append(delta)
+            if stream_state is not None and delta:
+                stream_state["text_chars"] = stream_state.get("text_chars", 0) + len(delta)
+                stream_state["last_text_at"] = time.monotonic()
 
         if saw_events:
             text = "".join(chunks)
             if text:
-                logging.debug("Received streamed translation (%d chars)", len(text))
+                logging.debug(
+                    "Received streamed translation (%d chars, events=%s, terminal=%s)",
+                    len(text),
+                    ",".join(event_types) or "none",
+                    terminal_event or "EOF",
+                )
                 if incomplete_reason:
                     # Text arrived but the stream ended before completion
                     # (e.g. JSON cut off mid-object on token exhaustion). The
@@ -712,11 +871,14 @@ class Translator(QObject):
         response: Optional[httpx.Response] = None,
         generation: Optional[int] = None,
         cancel_event: Optional[threading.Event] = None,
+        deadline: Optional[float] = None,
     ) -> None:
         delay = min(2 ** attempt, 8.0)
         retry_after = self._retry_after_seconds(response)
         if retry_after is not None:
             delay = max(delay, min(retry_after, 30.0))
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
         self._sleep(delay, generation, cancel_event)
 
     def _messages(
@@ -740,9 +902,10 @@ class Translator(QObject):
         user_bytes = len(user_content.encode("utf-8")) if user_content else 0
         system_bytes = len(system.encode("utf-8")) if system else 0
         n_segments = user_content.count("[") if user_content else 0  # batch marker count
-        attempt_start = attempt_sent = attempt_headers = None
+        attempt_start = attempt_sent = None
         attempt_mode = "unknown"
         attempt_read_timeout = self.read_timeout
+        stream_state = {}
 
         def _diag(exc_type: str, status=None, attempts: int = 0,
                   incomplete_reason: Optional[str] = None):
@@ -755,12 +918,26 @@ class Translator(QObject):
                 f"mode={attempt_mode} read_timeout={attempt_read_timeout}s",
             ]
             parts = [part for part in parts if part]
+            if stream_state:
+                parts.append(
+                    "sse_lines=%s data_lines=%s json_events=%s text_chars=%s "
+                    "last_event=%s terminal=%s"
+                    % (
+                        stream_state.get("lines", 0),
+                        stream_state.get("data_lines", 0),
+                        stream_state.get("json_events", 0),
+                        stream_state.get("text_chars", 0),
+                        stream_state.get("last_event_type", "none"),
+                        stream_state.get("terminal", "none"),
+                    )
+                )
             if incomplete_reason:
                 parts.append(f"incomplete_reason={incomplete_reason}")
-            if attempt_sent is not None:
-                parts.append(
-                    f"to_first_byte={(attempt_headers or now) - attempt_sent:.1f}s"
-                )
+            first_line_at = stream_state.get("first_line_at")
+            if first_line_at is not None:
+                parts.append(f"to_first_event={first_line_at - attempt_sent:.1f}s")
+            elif attempt_sent is not None:
+                parts.append("to_first_event=not_seen")
             logging.error("Translation diag: " + " | ".join(parts))
 
         for attempt in range(MAX_ATTEMPTS):
@@ -769,12 +946,12 @@ class Translator(QObject):
             if not self._acquire_rate_limit(generation, cancel_event):
                 return None
             try:
-                # Stream so the read timeout is per-chunk (30s between chunks)
-                # rather than one deadline for the whole body — slow-first-byte
-                # gateways and long responses no longer share the same tight cap.
+                # Streaming keeps read_timeout as the maximum gap between chunks,
+                # matching DSH's idle-timeout behavior rather than imposing a
+                # wall-clock limit on an actively producing response.
                 attempt_start = time.monotonic()
                 attempt_sent = time.monotonic()
-                attempt_headers = None
+                stream_state = {}
                 request_body = dict(body)
                 attempt_mode = "stream" if request_body.get("stream") else "buffered"
                 attempt_read_timeout = (
@@ -796,43 +973,44 @@ class Translator(QObject):
                         write=REQUEST_TIMEOUT.write,
                         pool=REQUEST_TIMEOUT.pool,
                     )
-                with self._client().stream("POST", url, **stream_options) as resp:
-                    attempt_headers = time.monotonic()
-                    resp.raise_for_status()
-                    attempt_headers = time.monotonic()
-                    text, incomplete_reason = self._read_stream(resp)
-                    if text is not None:
-                        self._set_last_request_status(None)
-                        return text
-                    # An HTTP 200 with an empty/malformed SSE body is a
-                    # transient provider/proxy failure, not a successful
-                    # translation. Keep it inside the retry loop instead of
-                    # returning None immediately and losing items.
-                    _diag(
-                        "EmptyTranslationStream",
-                        status=resp.status_code,
-                        attempts=attempt + 1,
-                        incomplete_reason=incomplete_reason,
-                    )
-                    if incomplete_reason == "max_output_tokens":
-                        # Distinct cause: the upstream burned the whole output
-                        # budget (typically on reasoning tokens) before any
-                        # visible text. Retrying usually won't help unless the
-                        # budget grows or reasoning is disabled.
-                        logging.warning(
-                            "Translation output token budget exhausted "
-                            "(max_output_tokens=%s, incomplete_reason=%s), "
-                            "attempt %d/%d",
-                            self.max_output_tokens,
-                            incomplete_reason,
-                            attempt + 1,
-                            MAX_ATTEMPTS,
+
+                try:
+                    with self._client().stream("POST", url, **stream_options) as resp:
+                        resp.raise_for_status()
+                        text, incomplete_reason = self._read_stream(resp, stream_state)
+                        if text is not None:
+                            self._set_last_request_status(None)
+                            return text
+                        # An HTTP 200 with an empty/malformed SSE body is a
+                        # transient provider/proxy failure, not a successful
+                        # translation. Keep it inside the retry loop instead of
+                        # returning None immediately and losing items.
+                        _diag(
+                            "EmptyTranslationStream",
+                            status=resp.status_code,
+                            attempts=attempt + 1,
+                            incomplete_reason=incomplete_reason,
                         )
-                    else:
-                        logging.warning(
-                            "Translation returned an empty stream, attempt %d/%d",
-                            attempt + 1, MAX_ATTEMPTS,
-                        )
+                        if incomplete_reason == "max_output_tokens":
+                            # Distinct cause: the upstream burned the whole output
+                            # budget (typically on reasoning tokens) before any
+                            # visible text. Retrying usually won't help unless the
+                            # budget grows or reasoning is disabled.
+                            logging.warning(
+                                "Translation output token budget exhausted "
+                                "(max_output_tokens=%s, incomplete_reason=%s), "
+                                "attempt %d/%d",
+                                self.max_output_tokens,
+                                incomplete_reason,
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                            )
+                        else:
+                            logging.warning(
+                                "Translation returned an empty stream, attempt %d/%d",
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                            )
                     if (
                         self._is_cancelled(generation, cancel_event)
                         or attempt == MAX_ATTEMPTS - 1
@@ -843,6 +1021,8 @@ class Translator(QObject):
                         generation=generation,
                         cancel_event=cancel_event,
                     )
+                finally:
+                    pass
             except httpx.HTTPStatusError as e:
                 status = getattr(e.response, "status_code", "unknown")
                 self._set_last_request_status(status if isinstance(status, int) else None)
@@ -867,7 +1047,12 @@ class Translator(QObject):
                         "retrying with a buffered compatibility payload",
                         status,
                     )
-                self._backoff(attempt, e.response, generation, cancel_event)
+                self._backoff(
+                    attempt,
+                    e.response,
+                    generation,
+                    cancel_event,
+                )
             except httpx.TransportError as e:
                 # Transient network failures are retried; only the final attempt
                 # is an error, earlier ones are just progress noise.
@@ -880,7 +1065,11 @@ class Translator(QObject):
                     or attempt == MAX_ATTEMPTS - 1
                 ):
                     return None
-                self._backoff(attempt, generation=generation, cancel_event=cancel_event)
+                self._backoff(
+                    attempt,
+                    generation=generation,
+                    cancel_event=cancel_event,
+                )
             except httpx.StreamError as e:
                 # StreamError (e.g. ResponseNotRead) subclasses RuntimeError, not
                 # TransportError, so it used to fall through to the catch-all below
@@ -896,7 +1085,11 @@ class Translator(QObject):
                     or attempt == MAX_ATTEMPTS - 1
                 ):
                     return None
-                self._backoff(attempt, generation=generation, cancel_event=cancel_event)
+                self._backoff(
+                    attempt,
+                    generation=generation,
+                    cancel_event=cancel_event,
+                )
             except Exception as e:
                 _diag(type(e).__name__, status=None, attempts=attempt + 1)
                 logging.error("Translation error! %s", type(e).__name__)
@@ -909,9 +1102,23 @@ class Translator(QObject):
         if cached is not None:
             return cached, transcript_id
         generation, cancel_event = self._run_context()
+        translation_input, sanitize_diagnostic = _sanitize_translation_input(transcript)
+        if sanitize_diagnostic:
+            _log_input_sanitization(transcript_id, sanitize_diagnostic)
+        if sanitize_diagnostic and sanitize_diagnostic["quarantine"]:
+            logging.warning(
+                "Quarantined malformed single translation id=%s",
+                transcript_id,
+            )
+            return "", transcript_id
+        translation_input, diagnostic = _compress_repetitive_translation_input(
+            translation_input
+        )
+        if diagnostic:
+            _log_repetition_compression(transcript_id, diagnostic)
         message_args = {
             "system": self.transcription_options.llm_prompt,
-            "user_content": transcript,
+            "user_content": translation_input,
         }
         if generation is not None or cancel_event is not None:
             message_args.update(generation=generation, cancel_event=cancel_event)
@@ -939,9 +1146,40 @@ class Translator(QObject):
         if not missing:
             return [(by_index.get(index, ""), tid) for index, (_, tid) in enumerate(items)]
 
+        request_inputs = {}
+        safe_missing = []
+        for index, transcript, tid in missing:
+            translation_input, sanitize_diagnostic = _sanitize_translation_input(
+                transcript
+            )
+            if sanitize_diagnostic:
+                _log_input_sanitization(tid, sanitize_diagnostic)
+            if sanitize_diagnostic and sanitize_diagnostic["quarantine"]:
+                by_index[index] = ""
+                logging.warning(
+                    "Quarantined malformed batch item id=%s; "
+                    "remaining items continue",
+                    tid,
+                )
+                continue
+            translation_input, diagnostic = _compress_repetitive_translation_input(
+                translation_input
+            )
+            if diagnostic:
+                _log_repetition_compression(tid, diagnostic)
+            request_inputs[index] = translation_input
+            safe_missing.append((index, transcript, tid))
+        missing = safe_missing
+        if not missing:
+            return [
+                (by_index.get(index, ""), tid)
+                for index, (_, tid) in enumerate(items)
+            ]
+
         numbered_parts = []
-        for i, (_, transcript, _) in enumerate(missing, 1):
-            numbered_parts.append(f"[{i}] {transcript}")
+        for i, (index, _, _) in enumerate(missing, 1):
+            translation_input = request_inputs[index]
+            numbered_parts.append(f"[{i}] {translation_input}")
         combined = "\n".join(numbered_parts)
 
         batch_prompt = (
