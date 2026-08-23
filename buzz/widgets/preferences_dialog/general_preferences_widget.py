@@ -28,14 +28,17 @@ from buzz.settings.settings import (
     DEFAULT_TRANSCRIPTION_CONCURRENCY,
     DEFAULT_TRANSLATION_BATCH_SIZE,
     DEFAULT_TRANSLATION_CONCURRENCY,
+    DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS,
     DEFAULT_TRANSLATION_READ_TIMEOUT,
     MAX_TRANSCRIPTION_CONCURRENCY,
     MAX_TRANSLATION_BATCH_SIZE,
     MAX_TRANSLATION_CONCURRENCY,
+    MAX_TRANSLATION_MAX_OUTPUT_TOKENS,
     MAX_TRANSLATION_READ_TIMEOUT,
     MIN_TRANSCRIPTION_CONCURRENCY,
     MIN_TRANSLATION_BATCH_SIZE,
     MIN_TRANSLATION_CONCURRENCY,
+    MIN_TRANSLATION_MAX_OUTPUT_TOKENS,
     MIN_TRANSLATION_READ_TIMEOUT,
     Settings,
 )
@@ -356,6 +359,40 @@ class GeneralPreferencesWidget(QWidget):
             _("Translation read timeout"), self.translation_read_timeout_spin_box
         )
 
+        self.translation_max_output_tokens_spin_box = QSpinBox(self)
+        self.translation_max_output_tokens_spin_box.setObjectName(
+            "TranslationMaxOutputTokensSpinBox"
+        )
+        self.translation_max_output_tokens_spin_box.setRange(
+            MIN_TRANSLATION_MAX_OUTPUT_TOKENS, MAX_TRANSLATION_MAX_OUTPUT_TOKENS
+        )
+        self.translation_max_output_tokens_spin_box.setSingleStep(1024)
+        self.translation_max_output_tokens_spin_box.setValue(
+            self.settings.value(
+                Settings.Key.TRANSLATION_MAX_OUTPUT_TOKENS,
+                DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS,
+            )
+        )
+        self.translation_max_output_tokens_spin_box.setToolTip(
+            _(
+                "Upper bound on generated tokens per translation request. "
+                "Reasoning providers (e.g. DeepSeek) count thinking tokens "
+                "against this budget, so a value too low can end the response "
+                "before any translation is produced."
+            )
+        )
+        self.translation_max_output_tokens_spin_box.valueChanged.connect(
+            self.on_translation_max_output_tokens_changed
+        )
+        self.translation_max_output_tokens_spin_box.setMaximumWidth(110)
+        self.translation_max_output_tokens_spin_box.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed
+        )
+        openai_layout.addRow(
+            _("Translation max output tokens"),
+            self.translation_max_output_tokens_spin_box,
+        )
+
         self.openai_api_model = self.settings.value(
             key=Settings.Key.OPENAI_API_MODEL, default_value="whisper-1"
         )
@@ -589,6 +626,9 @@ class GeneralPreferencesWidget(QWidget):
 
     def on_translation_read_timeout_changed(self, value: int):
         self.settings.set_value(Settings.Key.TRANSLATION_READ_TIMEOUT, value)
+
+    def on_translation_max_output_tokens_changed(self, value: int):
+        self.settings.set_value(Settings.Key.TRANSLATION_MAX_OUTPUT_TOKENS, value)
 
     def on_translation_batch_size_changed(self, value: int):
         self.settings.set_value(Settings.Key.TRANSLATION_BATCH_SIZE, value)

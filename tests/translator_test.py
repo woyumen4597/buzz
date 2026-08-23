@@ -664,7 +664,7 @@ class TestTranslator:
             },
             json={
                 "model": "gpt-4o-mini",
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "stream": True,
                 "messages": [
                     {"role": "system", "content": "Translate this text:"},
@@ -706,7 +706,7 @@ class TestTranslator:
             },
             json={
                 "model": "gpt-4o-mini",
-                "max_output_tokens": 4096,
+                "max_output_tokens": 8192,
                 "stream": True,
                 "input": [
                     {
@@ -747,6 +747,222 @@ class TestTranslator:
         translator._messages("Translate:", "Hello", json_mode=True)
         request_body = mock_client.stream.call_args.kwargs["json"]
         assert request_body["response_format"] == {"type": "json_object"}
+
+    @patch('buzz.translator.httpx.Client')
+    def test_deepseek_responses_defaults_to_no_reasoning(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """DeepSeek defaults thinking ON and counts it against
+        max_output_tokens; the responses request must opt out so the token
+        budget goes to visible translation output."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "deepseek-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.deepseek.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "翻译", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-chat", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        translator._messages("Translate this text:", "Hello")
+        request_body = mock_client.stream.call_args.kwargs["json"]
+        assert request_body["reasoning"] == {"effort": "none"}
+        assert request_body["max_output_tokens"] == 8192
+
+    @patch('buzz.translator.httpx.Client')
+    def test_deepseek_reasoner_does_not_force_reasoning_off(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """deepseek-reasoner always reasons; sending effort=none would be
+        ignored or rejected, so leave the reasoning knob out entirely."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "deepseek-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.deepseek.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "翻译", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-reasoner", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        translator._messages("Translate this text:", "Hello")
+        request_body = mock_client.stream.call_args.kwargs["json"]
+        assert "reasoning" not in request_body
+
+    @patch('buzz.translator.httpx.Client')
+    def test_reasoning_effort_env_override(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """BUZZ_TRANSLATION_REASONING_EFFORT wins over the DeepSeek default."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "deepseek-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.deepseek.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        monkeypatch.setenv("BUZZ_TRANSLATION_REASONING_EFFORT", "medium")
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "翻译", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-chat", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        translator._messages("Translate this text:", "Hello")
+        request_body = mock_client.stream.call_args.kwargs["json"]
+        assert request_body["reasoning"] == {"effort": "medium"}
+
+    @patch('buzz.translator.httpx.Client')
+    def test_max_output_tokens_env_override(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        monkeypatch.setenv("BUZZ_TRANSLATION_MAX_OUTPUT_TOKENS", "16384")
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        translator._messages("Translate this text:", "Hello")
+        request_body = mock_client.stream.call_args.kwargs["json"]
+        assert request_body["max_output_tokens"] == 16384
+        # Non-DeepSeek endpoints keep the legacy behavior: no reasoning knob.
+        assert "reasoning" not in request_body
+
+    def test_read_stream_reports_incomplete_reason(self, qtbot, monkeypatch):
+        """A response.incomplete event surfaces its reason so the caller can
+        tell "max_output_tokens" apart from a transient empty stream."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-chat", llm_prompt="Translate:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        lines = [
+            'data: {"type":"response.created"}',
+            'data: {"type":"response.reasoning_text.delta","delta":"thinking..."}',
+            'data: {"type":"response.reasoning_text.done"}',
+            'data: {"type":"response.incomplete",'
+            '"incomplete_details":{"reason":"max_output_tokens"}}',
+        ]
+        resp = _stream_response(lines=lines, protocol=RESPONSES_PROTOCOL)
+
+        text, incomplete_reason = translator._read_stream(resp)
+        assert text is None
+        assert incomplete_reason == "max_output_tokens"
+
+    def test_read_stream_incomplete_with_partial_text(self, qtbot, monkeypatch):
+        """Truncated output still carries the incomplete reason so batch JSON
+        parse failures can be traced back to a token-budget cutoff."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-chat", llm_prompt="Translate:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        lines = [
+            'data: {"type":"response.output_text.delta","delta":"{\\"translations\\": {"}',
+            'data: {"type":"response.incomplete",'
+            '"incomplete_details":{"reason":"max_output_tokens"}}',
+        ]
+        resp = _stream_response(lines=lines, protocol=RESPONSES_PROTOCOL)
+
+        text, incomplete_reason = translator._read_stream(resp)
+        assert text == '{"translations": {'
+        assert incomplete_reason == "max_output_tokens"
+
+    @patch('buzz.translator.time.sleep')
+    @patch('buzz.translator.httpx.Client')
+    def test_messages_reports_max_output_tokens_diagnostic(
+        self, mock_client_class, mock_sleep, qtbot, monkeypatch, caplog
+    ):
+        """Empty stream caused by max_output_tokens logs a distinct warning
+        instead of the generic empty-stream message."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "deepseek-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.deepseek.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        incomplete_lines = [
+            'data: {"type":"response.created"}',
+            'data: {"type":"response.reasoning_text.delta","delta":"thinking..."}',
+            'data: {"type":"response.reasoning_text.done"}',
+            'data: {"type":"response.incomplete",'
+            '"incomplete_details":{"reason":"max_output_tokens"}}',
+        ]
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            _stream_response(lines=incomplete_lines, protocol=RESPONSES_PROTOCOL),
+            _stream_response("翻译", protocol=RESPONSES_PROTOCOL),
+        ]
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="deepseek-chat", llm_prompt="Translate:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate:", "Hello") == "翻译"
+        assert mock_client.stream.call_count == 2
+        assert any(
+            "token budget exhausted" in record.message
+            and "max_output_tokens" in record.message
+            for record in caplog.records
+        )
 
     @patch('buzz.translator.httpx.Client')
     @patch('buzz.translator.queue.Queue', autospec=True)

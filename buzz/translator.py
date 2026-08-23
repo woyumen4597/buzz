@@ -15,12 +15,15 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from buzz.settings.settings import (
     DEFAULT_TRANSLATION_BATCH_SIZE,
     DEFAULT_TRANSLATION_CONCURRENCY,
+    DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS,
     DEFAULT_TRANSLATION_READ_TIMEOUT,
     MAX_TRANSLATION_BATCH_SIZE,
     MAX_TRANSLATION_CONCURRENCY,
+    MAX_TRANSLATION_MAX_OUTPUT_TOKENS,
     MAX_TRANSLATION_READ_TIMEOUT,
     MIN_TRANSLATION_BATCH_SIZE,
     MIN_TRANSLATION_CONCURRENCY,
+    MIN_TRANSLATION_MAX_OUTPUT_TOKENS,
     MIN_TRANSLATION_READ_TIMEOUT,
     Settings,
 )
@@ -230,22 +233,69 @@ class Translator(QObject):
             ),
         )
 
+        # Cap on generated tokens per request. Providers like DeepSeek count
+        # reasoning tokens against this budget, so a hardcoded 4096 lets a
+        # thinking-heavy batch exhaust the cap before any visible output is
+        # emitted and the stream ends with response.incomplete (the
+        # "empty stream" failure). Same env-over-settings precedence as above.
+        self.max_output_tokens = min(
+            MAX_TRANSLATION_MAX_OUTPUT_TOKENS,
+            max(
+                MIN_TRANSLATION_MAX_OUTPUT_TOKENS,
+                _env_int(
+                    "BUZZ_TRANSLATION_MAX_OUTPUT_TOKENS",
+                    settings.value(
+                        Settings.Key.TRANSLATION_MAX_OUTPUT_TOKENS,
+                        DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS,
+                    ),
+                ),
+            ),
+        )
+
         # ponytail: per-task llm_model wins, fall back to global preferences model.
         self.llm_model = self.transcription_options.llm_model or os.getenv(
             "BUZZ_TRANSLATION_API_MODEL"
         ) or settings.value(Settings.Key.OPENAI_API_MODEL, "")
 
+        # Reasoning effort for the responses protocol. DeepSeek enables
+        # thinking by default and counts reasoning tokens against
+        # max_output_tokens, so a thinking-heavy batch can exhaust the whole
+        # output budget before any visible text is produced — the stream then
+        # ends with response.incomplete and no output_text.delta, surfacing as
+        # "empty stream" failures. Translation is a deterministic rewriting
+        # task, so default to no reasoning for DeepSeek; "none" disables
+        # thinking, "minimal"/"low"/"medium"/"high"/"max" select an effort.
+        # BUZZ_TRANSLATION_REASONING_EFFORT overrides the default; any value
+        # outside the allowed set is ignored (upstream then uses its default).
+        self.reasoning_effort = os.getenv(
+            "BUZZ_TRANSLATION_REASONING_EFFORT", ""
+        ).strip().lower()
+        if not self.reasoning_effort:
+            base_url_lower = (self.base_url or "").lower()
+            model_lower = (self.llm_model or "").lower()
+            if (
+                "deepseek" in base_url_lower
+                and "reasoner" not in model_lower
+                and "r1" not in model_lower
+            ):
+                # deepseek-chat and friends default thinking ON upstream;
+                # deepseek-reasoner forces thinking and ignores this knob.
+                self.reasoning_effort = "none"
+
         # Log the resolved throughput knobs so a run's effective settings can be
         # confirmed from the log. No credentials or base URL here.
         logging.debug(
             "Translation config resolved: batch_size=%s, concurrency=%s, "
-            "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, read_timeout=%ss",
+            "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, "
+            "read_timeout=%ss, max_output_tokens=%s, reasoning=%s",
             self.batch_size,
             self.max_concurrent_requests,
             requests_per_minute,
             self.max_batch_tokens,
             self.api_protocol,
             self.read_timeout,
+            self.max_output_tokens,
+            self.reasoning_effort or "default",
         )
 
     def _client(self) -> httpx.Client:
@@ -424,7 +474,7 @@ class Translator(QObject):
             url = _responses_url(self.base_url)
             body = {
                 "model": self.llm_model,
-                "max_output_tokens": 4096,
+                "max_output_tokens": self.max_output_tokens,
                 # Ask the upstream to stream. Without this the gateway buffers
                 # the whole completion before sending a byte, so a large batch
                 # blows the read timeout on time-to-first-byte alone.
@@ -440,13 +490,18 @@ class Translator(QObject):
                     },
                 ],
             }
+            if self.reasoning_effort:
+                # DeepSeek defaults thinking ON and counts reasoning tokens
+                # against max_output_tokens; "none" keeps the whole budget for
+                # the visible translation output.
+                body["reasoning"] = {"effort": self.reasoning_effort}
             if json_mode:
                 body["text"] = {"format": {"type": "json_object"}}
         else:
             url = _chat_completions_url(self.base_url)
             body = {
                 "model": self.llm_model,
-                "max_tokens": 4096,
+                "max_tokens": self.max_output_tokens,
                 # See the note in the responses branch: streaming is what makes
                 # the 30s read timeout a per-chunk gap instead of a hard cap on
                 # the entire generation.
@@ -492,15 +547,21 @@ class Translator(QObject):
         logging.error("Translation error! Unexpected response shape")
         return None
 
-    def _read_stream(self, resp: httpx.Response) -> Optional[str]:
+    def _read_stream(self, resp: httpx.Response) -> Tuple[Optional[str], Optional[str]]:
         """Accumulate an SSE response body into the full text.
 
         Falls back to whole-body JSON when the gateway ignores `stream: true`
         and answers with a plain completion object instead of an event stream.
+        Returns (text, incomplete_reason): the second element is the upstream
+        `incomplete_details.reason` when the stream ended with a
+        `response.incomplete` event (e.g. "max_output_tokens" on DeepSeek when
+        the token budget is exhausted), else None.
         """
         chunks: List[str] = []
         raw_lines: List[str] = []
+        event_types = []
         saw_events = False
+        incomplete_reason = None
 
         for line in resp.iter_lines():
             if not line:
@@ -519,22 +580,52 @@ class Translator(QObject):
                 continue
             if not isinstance(event, dict):
                 continue
+            event_type = event.get("type")
+            if isinstance(event_type, str) and event_type not in event_types:
+                event_types.append(event_type)
+            if event_type == "response.incomplete":
+                details = event.get("incomplete_details")
+                if isinstance(details, dict):
+                    reason = details.get("reason")
+                    if isinstance(reason, str):
+                        incomplete_reason = reason
             chunks.append(self._stream_delta(event))
 
         if saw_events:
             text = "".join(chunks)
             if text:
                 logging.debug("Received streamed translation (%d chars)", len(text))
-                return text
-            logging.error("Translation error! Empty event stream")
-            return None
+                if incomplete_reason:
+                    # Text arrived but the stream ended before completion
+                    # (e.g. JSON cut off mid-object on token exhaustion). The
+                    # caller may still parse it, but truncated JSON is likely.
+                    logging.warning(
+                        "Streamed translation ended incomplete "
+                        "(incomplete_reason=%s, %d chars received)",
+                        incomplete_reason,
+                        len(text),
+                    )
+                return text, incomplete_reason
+            if incomplete_reason:
+                logging.error(
+                    "Translation error! Empty event stream (events=%s, "
+                    "incomplete_reason=%s)",
+                    ",".join(event_types) or "untyped",
+                    incomplete_reason,
+                )
+            else:
+                logging.error(
+                    "Translation error! Empty event stream (events=%s)",
+                    ",".join(event_types) or "untyped",
+                )
+            return None, incomplete_reason
 
         # No SSE framing at all: treat the body as one JSON document.
         try:
-            return self._extract_text(json.loads("".join(raw_lines)))
+            return self._extract_text(json.loads("".join(raw_lines))), None
         except (ValueError, TypeError):
             logging.error("Translation error! Unparsable response body")
-            return None
+            return None, None
 
     def _stream_delta(self, event: dict) -> str:
         """Pull the incremental text out of one SSE event."""
@@ -634,13 +725,16 @@ class Translator(QObject):
         n_segments = user_content.count("[") if user_content else 0  # batch marker count
         t_sent = t_last_touch = None
 
-        def _diag(exc_type: str, status=None, attempts: int = 0):
+        def _diag(exc_type: str, status=None, attempts: int = 0,
+                  incomplete_reason: Optional[str] = None):
             now = time.monotonic()
             parts = [
                 f"{exc_type} status={status} attempts={attempts}",
                 f"elapsed={now - t_start:.1f}s",
                 f"user={user_bytes}B system={system_bytes}B seg_markers={n_segments}",
             ]
+            if incomplete_reason:
+                parts.append(f"incomplete_reason={incomplete_reason}")
             if t_sent is not None:
                 parts.append(f"to_first_byte={(t_last_touch or now) - t_sent:.1f}s")
             logging.error("Translation diag: " + " | ".join(parts))
@@ -661,7 +755,48 @@ class Translator(QObject):
                     t_last_touch = time.monotonic()
                     resp.raise_for_status()
                     t_last_touch = time.monotonic()
-                    return self._read_stream(resp)
+                    text, incomplete_reason = self._read_stream(resp)
+                    if text is not None:
+                        return text
+                    # An HTTP 200 with an empty/malformed SSE body is a
+                    # transient provider/proxy failure, not a successful
+                    # translation. Keep it inside the retry loop instead of
+                    # returning None immediately and losing items.
+                    _diag(
+                        "EmptyTranslationStream",
+                        status=resp.status_code,
+                        attempts=attempt + 1,
+                        incomplete_reason=incomplete_reason,
+                    )
+                    if incomplete_reason == "max_output_tokens":
+                        # Distinct cause: the upstream burned the whole output
+                        # budget (typically on reasoning tokens) before any
+                        # visible text. Retrying usually won't help unless the
+                        # budget grows or reasoning is disabled.
+                        logging.warning(
+                            "Translation output token budget exhausted "
+                            "(max_output_tokens=%s, incomplete_reason=%s), "
+                            "attempt %d/%d",
+                            self.max_output_tokens,
+                            incomplete_reason,
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                        )
+                    else:
+                        logging.warning(
+                            "Translation returned an empty stream, attempt %d/%d",
+                            attempt + 1, MAX_ATTEMPTS,
+                        )
+                    if (
+                        self._is_cancelled(generation, cancel_event)
+                        or attempt == MAX_ATTEMPTS - 1
+                    ):
+                        return None
+                    self._backoff(
+                        attempt,
+                        generation=generation,
+                        cancel_event=cancel_event,
+                    )
             except httpx.HTTPStatusError as e:
                 status = getattr(e.response, "status_code", "unknown")
                 _diag("HTTPStatusError", status=status, attempts=attempt + 1)

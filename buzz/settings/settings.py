@@ -33,6 +33,16 @@ DEFAULT_TRANSLATION_READ_TIMEOUT = 60
 MIN_TRANSLATION_READ_TIMEOUT = 10
 MAX_TRANSLATION_READ_TIMEOUT = 300
 
+# Upper bound on generated tokens per translation request. Providers like
+# DeepSeek count reasoning tokens against this budget, so a thinking-heavy
+# batch can exhaust the cap before emitting any visible output (the stream
+# then ends with response.incomplete). The default is well above the old
+# hardcoded 4096 so reasoning plus output both fit, and it stays configurable
+# for providers with tighter limits.
+DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS = 8192
+MIN_TRANSLATION_MAX_OUTPUT_TOKENS = 256
+MAX_TRANSLATION_MAX_OUTPUT_TOKENS = 65536
+
 
 class Settings:
     def __init__(self, application=""):
@@ -87,6 +97,7 @@ class Settings:
         TRANSLATION_BATCH_SIZE = "transcriber/translation-batch-size"
         TRANSLATION_CONCURRENCY = "transcriber/translation-concurrency"
         TRANSLATION_READ_TIMEOUT = "transcriber/translation-read-timeout"
+        TRANSLATION_MAX_OUTPUT_TOKENS = "transcriber/translation-max-output-tokens"
         TRANSLATION_PROXY = "transcriber/translation-proxy"
         CUSTOM_FASTER_WHISPER_ID = "transcriber/custom-faster-whisper-id"
         HUGGINGFACE_MODEL_ID = "transcriber/huggingface-model-id"

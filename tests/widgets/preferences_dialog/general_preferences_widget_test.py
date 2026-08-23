@@ -5,6 +5,7 @@ from buzz.locale import _
 from buzz.settings.settings import (
     DEFAULT_TRANSCRIPTION_CONCURRENCY,
     DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS,
     Settings,
 )
 from buzz.widgets.preferences_dialog.general_preferences_widget import (
@@ -179,6 +180,27 @@ class TestGeneralPreferencesWidget:
             widget.translation_batch_size_spin_box.setValue(5)
 
             assert settings.value(key, DEFAULT_TRANSLATION_BATCH_SIZE) == 5
+        finally:
+            settings.set_value(key, previous_value)
+
+    def test_translation_max_output_tokens_preferences(self, qtbot):
+        settings = Settings()
+        key = Settings.Key.TRANSLATION_MAX_OUTPUT_TOKENS
+        previous_value = settings.value(key, DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS)
+        settings.set_value(key, DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS)
+
+        try:
+            widget = GeneralPreferencesWidget()
+            qtbot.add_widget(widget)
+
+            assert (
+                widget.translation_max_output_tokens_spin_box.value()
+                == DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS
+            )
+
+            widget.translation_max_output_tokens_spin_box.setValue(16384)
+
+            assert settings.value(key, DEFAULT_TRANSLATION_MAX_OUTPUT_TOKENS) == 16384
         finally:
             settings.set_value(key, previous_value)
 
