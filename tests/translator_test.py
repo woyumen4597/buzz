@@ -3,6 +3,7 @@ import time
 from unittest.mock import Mock, call, patch, MagicMock
 
 import httpx
+import pytest
 from PyQt6.QtCore import QThread
 
 from buzz.settings.settings import (
@@ -20,6 +21,7 @@ from buzz.translator import (
     Translator,
     _compress_repetitive_translation_input,
     _sanitize_translation_input,
+    _TranslationStreamTimeout,
 )
 from buzz.transcriber.transcriber import TranscriptionOptions
 from buzz.widgets.transcriber.advanced_settings_dialog import AdvancedSettingsDialog
@@ -222,6 +224,61 @@ class TestRepetitiveTranslationInput:
         response = '{"translations": {"1": "see [2] for details", "2": "done"}}'
         result = Translator._parse_batch_response(response, 2)
         assert result == ["see [2] for details", "done"]
+
+    def test_read_stream_stops_at_responses_output_text_done(self, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        response = _stream_response(
+            lines=[
+                'data: {"type":"response.output_text.delta","delta":"translated"}',
+                'data: {"type":"response.output_text.done"}',
+                'data: {"type":"response.completed"}',
+            ],
+            protocol=RESPONSES_PROTOCOL,
+        )
+
+        text, incomplete_reason = translator._read_stream(response)
+
+        assert text == "translated"
+        assert incomplete_reason is None
+
+    def test_read_stream_stops_at_chat_finish_reason(self, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        response = _stream_response(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"translated"}}]}',
+                'data: {"choices":[{"delta":{"content":"!"},"finish_reason":"stop"}]}',
+                'data: [DONE]',
+            ]
+        )
+
+        text, incomplete_reason = translator._read_stream(response)
+
+        assert text == "translated!"
+        assert incomplete_reason is None
+
+    def test_read_stream_deadline_aborts_continuous_output(self, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        response = _stream_response(
+            lines=[
+                'data: {"choices":[{"delta":{"content":"partial"}}]}',
+                'data: {"choices":[{"delta":{"content":"more"}}]}',
+            ]
+        )
+        state = {}
+        # The first line is consumed; the next check observes an expired
+        # deadline, matching a provider that keeps producing without completion.
+        with patch("buzz.translator.time.monotonic", side_effect=[0, 0, 0, 0, 2]):
+            with pytest.raises(_TranslationStreamTimeout):
+                translator._read_stream(response, state, stream_deadline=1)
+
+        assert state["text_chars"] == len("partial")
+        assert state["termination"] == "max_duration"
 
 
 class TestSplitBatches:
@@ -440,6 +497,7 @@ class TestTranslationRuntimeControls:
 
     def test_queue_emits_completed_batch_without_head_of_line_blocking(self, qtbot):
         translator = self._make_translator()
+        translator.batch_size = 20
         for tid in range(40):
             translator.queue.put((f"text-{tid}", tid))
         translator.queue.put(None)
@@ -716,7 +774,7 @@ class TestTranslator:
         )
 
         assert translator._messages("Translate this text:", "Hello") == "AI Translated"
-        mock_client_class.assert_called_once_with(timeout=httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0))
+        mock_client_class.assert_called_once_with(timeout=httpx.Timeout(connect=10.0, read=60, write=30.0, pool=10.0))
         mock_client.stream.assert_called_once_with(
             "POST",
             "https://api.openai.com/v1/chat/completions",
@@ -1471,6 +1529,39 @@ class TestTranslator:
 
         # Note: translator and translation_thread will be automatically deleted
         # via the deleteLater() connections set up earlier
+
+    @patch("buzz.translator.httpx.Client")
+    def test_messages_retries_stream_deadline(self, mock_client_class, qtbot, monkeypatch):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            _stream_response("ignored"),
+            _stream_response("translated"),
+        ]
+        mock_client_class.return_value = mock_client
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+        translator._backoff = Mock()
+        with patch.object(
+            translator,
+            "_read_stream",
+            side_effect=[
+                _TranslationStreamTimeout("missing terminal"),
+                ("translated", None),
+            ],
+        ) as read_stream:
+            assert translator._messages("Translate:", "Hello") == "translated"
+
+        assert read_stream.call_count == 2
+        assert read_stream.call_args.args[2] > time.monotonic()
+
+        assert mock_client.stream.call_count == 2
+        assert translator._backoff.call_count == 1
 
     @patch('buzz.translator.time.sleep')
     @patch('buzz.translator.httpx.Client')

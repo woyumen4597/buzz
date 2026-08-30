@@ -51,6 +51,10 @@ BATCH_WINDOW_SECONDS = 0.1
 MAX_ATTEMPTS = 4
 DEFAULT_REQUESTS_PER_MINUTE = 60.0
 TRANSLATION_CACHE_SIZE = 1024
+# A provider may keep sending output deltas without ever sending a terminal
+# event. The HTTP read timeout cannot catch that because every delta refreshes
+# the idle timer, so bound the complete request as well.
+MAX_TRANSLATION_REQUEST_DURATION = 180.0
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 # Keep the fixed buffered-compatibility fallback below the viewer's graceful
 # shutdown wait so closing the window never has to terminate a worker thread
@@ -59,6 +63,10 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
 RESPONSES_PROTOCOL = "responses"
+
+
+class _TranslationStreamTimeout(httpx.StreamError):
+    """Raised when a streamed response never reaches a terminal event."""
 
 
 def _compress_repetitive_translation_input(text: str) -> Tuple[str, Optional[dict]]:
@@ -394,7 +402,7 @@ class Translator(QObject):
         logging.debug(
             "Translation config resolved: batch_size=%s, concurrency=%s, "
             "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, "
-            "read_timeout=%ss, proxy=%s, max_output_tokens=%s, "
+            "read_timeout=%ss, max_request_duration=%ss, proxy=%s, max_output_tokens=%s, "
             "reasoning=%s, model=%s",
             self.batch_size,
             self.max_concurrent_requests,
@@ -402,6 +410,7 @@ class Translator(QObject):
             self.max_batch_tokens,
             self.api_protocol,
             self.read_timeout,
+            MAX_TRANSLATION_REQUEST_DURATION,
             "enabled" if self.proxy else "disabled",
             self.max_output_tokens,
             self.reasoning_effort or "default",
@@ -556,6 +565,7 @@ class Translator(QObject):
     ) -> bool:
         if self._rate_per_second <= 0:
             return not self._is_cancelled(generation, cancel_event)
+        wait_started = None
         while True:
             with self._rate_lock:
                 now = time.monotonic()
@@ -567,8 +577,20 @@ class Translator(QObject):
                 self._rate_updated = now
                 if self._rate_tokens >= 1.0:
                     self._rate_tokens -= 1.0
+                    if wait_started is not None:
+                        logging.debug(
+                            "Translation rate limit wait finished elapsed=%.1fs",
+                            time.monotonic() - wait_started,
+                        )
                     return not self._is_cancelled(generation, cancel_event)
                 delay = (1.0 - self._rate_tokens) / self._rate_per_second
+            if wait_started is None:
+                wait_started = time.monotonic()
+                logging.debug(
+                    "Translation rate limit waiting rpm=%.1f delay=%.1fs",
+                    self._rate_per_second * 60.0,
+                    delay,
+                )
             if self._is_cancelled(generation, cancel_event):
                 return False
             delay = min(delay, 0.5)
@@ -681,7 +703,10 @@ class Translator(QObject):
         return None
 
     def _read_stream(
-        self, resp: httpx.Response, stream_state: Optional[dict] = None
+        self,
+        resp: httpx.Response,
+        stream_state: Optional[dict] = None,
+        stream_deadline: Optional[float] = None,
     ) -> Tuple[Optional[str], Optional[str]]:
         """Accumulate an SSE response body into the full text.
 
@@ -691,6 +716,9 @@ class Translator(QObject):
         `incomplete_details.reason` when the stream ended with a
         `response.incomplete` event (e.g. "max_output_tokens" on DeepSeek when
         the token budget is exhausted), else None.
+
+        ``stream_deadline`` protects against a provider that keeps emitting
+        deltas but never sends a terminal event.
         """
         chunks: List[str] = []
         raw_lines: List[str] = []
@@ -700,6 +728,13 @@ class Translator(QObject):
         terminal_event = None
 
         for line in resp.iter_lines():
+            if stream_deadline is not None and time.monotonic() >= stream_deadline:
+                if stream_state is not None:
+                    stream_state["terminal"] = "duration_timeout"
+                    stream_state["termination"] = "max_duration"
+                raise _TranslationStreamTimeout(
+                    "translation stream exceeded its total duration"
+                )
             if not line:
                 continue
             if stream_state is not None:
@@ -721,6 +756,7 @@ class Translator(QObject):
                 terminal_event = "[DONE]"
                 if stream_state is not None:
                     stream_state["terminal"] = terminal_event
+                    stream_state["termination"] = terminal_event
                 logging.debug("Received SSE terminal event: [DONE]")
                 break
             if not payload:
@@ -744,22 +780,46 @@ class Translator(QObject):
                     reason = details.get("reason")
                     if isinstance(reason, str):
                         incomplete_reason = reason
+            chat_finish_reason = None
+            if self.api_protocol != RESPONSES_PROTOCOL:
+                choices = event.get("choices")
+                if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                    chat_finish_reason = choices[0].get("finish_reason")
+            semantic_terminal = (
+                event_type == "response.output_text.done"
+            ) or bool(chat_finish_reason)
+            delta = self._stream_delta(event)
+            if delta:
+                chunks.append(delta)
+                if stream_state is not None:
+                    stream_state["text_chars"] = stream_state.get("text_chars", 0) + len(delta)
+                    stream_state["last_text_at"] = time.monotonic()
             if event_type in {
                 "response.completed",
                 "response.incomplete",
                 "response.failed",
                 "response.cancelled",
-            }:
-                terminal_event = event_type
+            } or semantic_terminal:
+                terminal_event = (
+                    event_type
+                    if event_type in {
+                        "response.completed",
+                        "response.incomplete",
+                        "response.failed",
+                        "response.cancelled",
+                    }
+                    else f"finish_reason:{chat_finish_reason}"
+                    if chat_finish_reason
+                    else event_type
+                )
                 if stream_state is not None:
                     stream_state["terminal"] = terminal_event
-                logging.debug("Received SSE terminal event: %s", event_type)
+                    stream_state["termination"] = terminal_event
+                logging.debug("Received SSE terminal event: %s", terminal_event)
                 break
-            delta = self._stream_delta(event)
-            chunks.append(delta)
-            if stream_state is not None and delta:
-                stream_state["text_chars"] = stream_state.get("text_chars", 0) + len(delta)
-                stream_state["last_text_at"] = time.monotonic()
+
+        if stream_state is not None and "termination" not in stream_state:
+            stream_state["termination"] = terminal_event or "eof"
 
         if saw_events:
             text = "".join(chunks)
@@ -899,6 +959,7 @@ class Translator(QObject):
         # path stays silent. Body sizes plus time-to-first-byte are what tell a
         # slow-generation stall apart from a genuine network fault.
         t_start = time.monotonic()
+        request_deadline = t_start + MAX_TRANSLATION_REQUEST_DURATION
         user_bytes = len(user_content.encode("utf-8")) if user_content else 0
         system_bytes = len(system.encode("utf-8")) if system else 0
         n_segments = user_content.count("[") if user_content else 0  # batch marker count
@@ -918,23 +979,27 @@ class Translator(QObject):
                 f"mode={attempt_mode} read_timeout={attempt_read_timeout}s",
             ]
             parts = [part for part in parts if part]
-            if stream_state:
-                parts.append(
-                    "sse_lines=%s data_lines=%s json_events=%s text_chars=%s "
-                    "last_event=%s terminal=%s"
-                    % (
-                        stream_state.get("lines", 0),
-                        stream_state.get("data_lines", 0),
-                        stream_state.get("json_events", 0),
-                        stream_state.get("text_chars", 0),
-                        stream_state.get("last_event_type", "none"),
-                        stream_state.get("terminal", "none"),
-                    )
+            parts.append(
+                "request_state=%s request_sent=%s http_status=%s "
+                "sse_lines=%s data_lines=%s json_events=%s text_chars=%s "
+                "last_event=%s terminal=%s termination=%s"
+                % (
+                    stream_state.get("request_state", "not_started"),
+                    "yes" if stream_state.get("request_sent") else "no",
+                    stream_state.get("http_status", "none"),
+                    stream_state.get("lines", 0),
+                    stream_state.get("data_lines", 0),
+                    stream_state.get("json_events", 0),
+                    stream_state.get("text_chars", 0),
+                    stream_state.get("last_event_type", "none"),
+                    stream_state.get("terminal", "none"),
+                    stream_state.get("termination", "none"),
                 )
+            )
             if incomplete_reason:
                 parts.append(f"incomplete_reason={incomplete_reason}")
             first_line_at = stream_state.get("first_line_at")
-            if first_line_at is not None:
+            if first_line_at is not None and attempt_sent is not None:
                 parts.append(f"to_first_event={first_line_at - attempt_sent:.1f}s")
             elif attempt_sent is not None:
                 parts.append("to_first_event=not_seen")
@@ -943,14 +1008,20 @@ class Translator(QObject):
         for attempt in range(MAX_ATTEMPTS):
             if self._is_cancelled(generation, cancel_event):
                 return None
+            if time.monotonic() >= request_deadline:
+                _diag("TranslationRequestDeadlineExceeded", attempts=attempt)
+                return None
             if not self._acquire_rate_limit(generation, cancel_event):
+                return None
+            if time.monotonic() >= request_deadline:
+                _diag("TranslationRequestDeadlineExceeded", attempts=attempt)
                 return None
             try:
                 # Streaming keeps read_timeout as the maximum gap between chunks,
-                # matching DSH's idle-timeout behavior rather than imposing a
-                # wall-clock limit on an actively producing response.
+                # while the absolute deadline below bounds a stream that keeps
+                # producing deltas without ever sending a terminal event.
                 attempt_start = time.monotonic()
-                attempt_sent = time.monotonic()
+                attempt_sent = None
                 stream_state = {}
                 request_body = dict(body)
                 attempt_mode = "stream" if request_body.get("stream") else "buffered"
@@ -958,6 +1029,20 @@ class Translator(QObject):
                     self.read_timeout
                     if request_body.get("stream")
                     else min(self.read_timeout, REQUEST_TIMEOUT.read)
+                )
+                stream_deadline = min(
+                    request_deadline,
+                    attempt_start + MAX_TRANSLATION_REQUEST_DURATION,
+                )
+                logging.debug(
+                    "Translation request start attempt=%d/%d mode=%s "
+                    "user=%dB system=%dB seg_markers=%d",
+                    attempt + 1,
+                    MAX_ATTEMPTS,
+                    attempt_mode,
+                    user_bytes,
+                    system_bytes,
+                    n_segments,
                 )
                 stream_options = {
                     "headers": headers,
@@ -976,8 +1061,25 @@ class Translator(QObject):
 
                 try:
                     with self._client().stream("POST", url, **stream_options) as resp:
+                        attempt_sent = time.monotonic()
+                        stream_state.update(
+                            request_state="headers_received",
+                            request_sent=True,
+                            http_status=getattr(resp, "status_code", "unknown"),
+                        )
+                        logging.debug(
+                            "Translation request sent attempt=%d/%d mode=%s status=%s",
+                            attempt + 1,
+                            MAX_ATTEMPTS,
+                            attempt_mode,
+                            getattr(resp, "status_code", "unknown"),
+                        )
                         resp.raise_for_status()
-                        text, incomplete_reason = self._read_stream(resp, stream_state)
+                        stream_state["request_state"] = "reading"
+                        text, incomplete_reason = self._read_stream(
+                            resp, stream_state, stream_deadline
+                        )
+                        stream_state["request_state"] = "completed"
                         if text is not None:
                             self._set_last_request_status(None)
                             return text
@@ -1020,6 +1122,7 @@ class Translator(QObject):
                         attempt,
                         generation=generation,
                         cancel_event=cancel_event,
+                        deadline=request_deadline,
                     )
                 finally:
                     pass
@@ -1052,6 +1155,7 @@ class Translator(QObject):
                     e.response,
                     generation,
                     cancel_event,
+                    request_deadline,
                 )
             except httpx.TransportError as e:
                 # Transient network failures are retried; only the final attempt
@@ -1069,6 +1173,7 @@ class Translator(QObject):
                     attempt,
                     generation=generation,
                     cancel_event=cancel_event,
+                    deadline=request_deadline,
                 )
             except httpx.StreamError as e:
                 # StreamError (e.g. ResponseNotRead) subclasses RuntimeError, not
@@ -1076,10 +1181,21 @@ class Translator(QObject):
                 # and kill the whole batch without a single retry. It means the
                 # body was cut short mid-flight, which is exactly as transient as
                 # a ReadTimeout — retry it the same way.
-                _diag(type(e).__name__, status=None, attempts=attempt + 1)
+                _diag(
+                    type(e).__name__,
+                    status=stream_state.get("http_status"),
+                    attempts=attempt + 1,
+                )
                 log = logging.error if attempt == MAX_ATTEMPTS - 1 else logging.warning
-                log("Translation stream failure (%s), attempt %d/%d",
-                    type(e).__name__, attempt + 1, MAX_ATTEMPTS)
+                if isinstance(e, _TranslationStreamTimeout):
+                    log(
+                        "Translation stream exceeded max duration, attempt %d/%d",
+                        attempt + 1,
+                        MAX_ATTEMPTS,
+                    )
+                else:
+                    log("Translation stream failure (%s), attempt %d/%d",
+                        type(e).__name__, attempt + 1, MAX_ATTEMPTS)
                 if (
                     self._is_cancelled(generation, cancel_event)
                     or attempt == MAX_ATTEMPTS - 1
@@ -1089,6 +1205,7 @@ class Translator(QObject):
                     attempt,
                     generation=generation,
                     cancel_event=cancel_event,
+                    deadline=request_deadline,
                 )
             except Exception as e:
                 _diag(type(e).__name__, status=None, attempts=attempt + 1)
