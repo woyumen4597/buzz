@@ -96,7 +96,7 @@ def _compress_repetitive_translation_input(text: str) -> Tuple[str, Optional[dic
             "compressed_chars": len(compressed),
         }
 
-    repeated_matches = list(re.finditer(r"(?P<char>[^\W\d_])(?P=char){7,}", text))
+    repeated_matches = list(re.finditer(r"(?P<char>\S)(?P=char){7,}", text))
     for match in sorted(repeated_matches, key=lambda item: len(item.group()), reverse=True):
         run_length = len(match.group())
         if run_length < 12 or run_length < len(text) * 0.5:
@@ -107,6 +107,38 @@ def _compress_repetitive_translation_input(text: str) -> Tuple[str, Optional[dic
             "kind": "repeated_character",
             "unit": char,
             "repetitions": run_length,
+            "original_chars": len(text),
+            "compressed_chars": len(compressed),
+        }
+
+    # ASR may repeat a short multi-character word without separators, e.g.
+    # "痛い痛い痛い..." or "あーあーあー...". The old character-only
+    # detector misses these because adjacent characters alternate. Look for a
+    # short prefix repeated enough times and covering most of the input.
+    repeated_runs = []
+    max_unit_length = min(12, len(text) // 4)
+    for unit_length in range(1, max_unit_length + 1):
+        unit = text[:unit_length]
+        repetitions = 0
+        while text[repetitions * unit_length : (repetitions + 1) * unit_length] == unit:
+            repetitions += 1
+        covered = repetitions * unit_length
+        if repetitions >= 4 and covered >= max(16, len(text) * 0.75):
+            repeated_runs.append((covered, repetitions, unit_length, unit))
+
+    if repeated_runs:
+        covered, repetitions, _, unit = max(
+            repeated_runs, key=lambda item: (item[0], item[1])
+        )
+        # A segment dominated by repeated short phrases is ASR noise rather
+        # than useful language. Do not preserve the repeated word: even three
+        # copies can trigger provider safety/output loops. Keep one neutral
+        # marker so the batch numbering and subtitle segment remain intact.
+        compressed = "…"
+        return compressed, {
+            "kind": "repeated_phrase",
+            "unit": unit,
+            "repetitions": repetitions,
             "original_chars": len(text),
             "compressed_chars": len(compressed),
         }
@@ -483,6 +515,12 @@ class Translator(QObject):
     def _set_last_request_status(self, status: Optional[int]) -> None:
         self._thread_context.last_request_status = status
 
+    def _last_request_failure(self) -> Optional[str]:
+        return getattr(self._thread_context, "last_request_failure", None)
+
+    def _set_last_request_failure(self, failure: Optional[str]) -> None:
+        self._thread_context.last_request_failure = failure
+
     def _run_batch_group(
         self,
         items: List[Tuple[str, int]],
@@ -780,6 +818,13 @@ class Translator(QObject):
                     reason = details.get("reason")
                     if isinstance(reason, str):
                         incomplete_reason = reason
+            if event_type == "response.failed" and stream_state is not None:
+                error = event.get("error")
+                if isinstance(error, dict):
+                    for key in ("type", "code"):
+                        value = error.get(key)
+                        if isinstance(value, str):
+                            stream_state[f"provider_error_{key}"] = value
             chat_finish_reason = None
             if self.api_protocol != RESPONSES_PROTOCOL:
                 choices = event.get("choices")
@@ -954,6 +999,7 @@ class Translator(QObject):
             generation, cancel_event = self._run_context()
         url, headers, body = self._build_request(system, user_content, json_mode)
         self._set_last_request_status(None)
+        self._set_last_request_failure(None)
 
         # Failure diagnostics: emitted ONLY when a request fails, so the success
         # path stays silent. Body sizes plus time-to-first-byte are what tell a
@@ -998,6 +1044,16 @@ class Translator(QObject):
             )
             if incomplete_reason:
                 parts.append(f"incomplete_reason={incomplete_reason}")
+            provider_error_type = stream_state.get("provider_error_type")
+            provider_error_code = stream_state.get("provider_error_code")
+            if provider_error_type or provider_error_code:
+                parts.append(
+                    "provider_error=%s"
+                    % "/".join(
+                        value for value in (provider_error_type, provider_error_code)
+                        if value
+                    )
+                )
             first_line_at = stream_state.get("first_line_at")
             if first_line_at is not None and attempt_sent is not None:
                 parts.append(f"to_first_event={first_line_at - attempt_sent:.1f}s")
@@ -1083,6 +1139,18 @@ class Translator(QObject):
                         if text is not None:
                             self._set_last_request_status(None)
                             return text
+                        if stream_state.get("terminal") == "response.failed":
+                            self._set_last_request_failure("response.failed")
+                            _diag(
+                                "EmptyTranslationStream",
+                                status=resp.status_code,
+                                attempts=attempt + 1,
+                            )
+                            logging.warning(
+                                "Translation provider returned response.failed; "
+                                "will fall back to smaller batches"
+                            )
+                            return None
                         # An HTTP 200 with an empty/malformed SSE body is a
                         # transient provider/proxy failure, not a successful
                         # translation. Keep it inside the retry loop instead of
@@ -1320,6 +1388,29 @@ class Translator(QObject):
             **message_args,
         )
         if not response_text:
+            if self._last_request_failure() == "response.failed" and len(missing) > 1:
+                midpoint = max(1, len(missing) // 2)
+                logging.warning(
+                    "Translation batch received response.failed; retrying %d items "
+                    "as smaller batches",
+                    len(missing),
+                )
+                recovered = []
+                for chunk in (missing[:midpoint], missing[midpoint:]):
+                    recovered.extend(
+                        self._translate_batch(
+                            [(transcript, tid) for _, transcript, tid in chunk]
+                        )
+                    )
+                recovered_by_id = {tid: text for text, tid in recovered}
+                return [
+                    (
+                        by_index.get(index, recovered_by_id.get(tid, "")),
+                        tid,
+                    )
+                    for index, (_, tid) in enumerate(items)
+                ]
+
             failed_status = self._last_request_status()
             if (
                 isinstance(failed_status, int)

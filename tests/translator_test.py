@@ -106,6 +106,22 @@ class TestRepetitiveTranslationInput:
         assert compressed == "어, 어, 어…"
         assert diagnostic["kind"] == "repeated_token"
 
+    def test_compresses_repeated_multicharacter_asr_text(self):
+        compressed, diagnostic = _compress_repetitive_translation_input(
+            "痛い" * 70 + "痛"
+        )
+        assert compressed == "…"
+        assert diagnostic["kind"] == "repeated_phrase"
+        assert diagnostic["repetitions"] >= 4
+
+        compressed, diagnostic = _compress_repetitive_translation_input("あー" * 219)
+        assert compressed == "…"
+        assert diagnostic["kind"] == "repeated_phrase"
+
+        compressed, diagnostic = _compress_repetitive_translation_input("あ" + "〜" * 218)
+        assert compressed == "あ〜〜〜〜〜〜…"
+        assert diagnostic["kind"] == "repeated_character"
+
     def test_quarantines_malformed_unicode(self):
         malformed = "ì\x9c¼ì\x95\x84ã \x8f" * 4
         cleaned, diagnostic = _sanitize_translation_input(malformed)
@@ -744,6 +760,27 @@ class TestBatchRecovery:
         with patch.object(translator, "_messages", return_value=None):
             results = translator._translate_batch([("a", 1), ("b", 2)])
         assert results == [("", 1), ("", 2)]
+
+    def test_provider_failure_splits_batch_to_isolate_item(self, qtbot):
+        translator = self._make_translator()
+
+        def messages(**kwargs):
+            if kwargs["user_content"].count("[") > 1:
+                translator._set_last_request_failure("response.failed")
+                return None
+            return "[1] single"
+
+        with patch.object(translator, "_messages", side_effect=messages):
+            results = translator._translate_batch(
+                [("a", 1), ("b", 2), ("c", 3), ("d", 4)]
+            )
+
+        assert results == [
+            ("single", 1),
+            ("single", 2),
+            ("single", 3),
+            ("single", 4),
+        ]
 
 
 class TestTranslator:
