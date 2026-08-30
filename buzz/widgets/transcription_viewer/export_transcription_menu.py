@@ -39,6 +39,58 @@ VIDEO_MODES = {
 # transcoded (libx264 video / AAC audio) to stay playable.
 _COPY_VIDEO_CODECS = {"h264", "avc1", "hevc", "h265"}
 _COPY_AUDIO_CODECS = {"aac", "mp3", "ac3", "alac", "opus"}
+# mov_text stores each subtitle cue in a 16-bit sample. Leave room for the
+# cue's timing/style overhead instead of allowing a large ASR repetition to
+# make the whole MP4 mux fail with "Result too large" (FFmpeg exit 222).
+_MAX_MP4_SUBTITLE_BYTES = 60000
+
+
+def _split_long_subtitle_segments(
+    segments: list[Segment], segment_key: str, max_bytes: int = _MAX_MP4_SUBTITLE_BYTES
+) -> list[Segment]:
+    """Split oversized subtitle cues while preserving their display duration."""
+    result: list[Segment] = []
+    for segment in segments:
+        text = (getattr(segment, segment_key, "") or "").strip()
+        if not text or len(text.encode("utf-8")) <= max_bytes:
+            result.append(segment)
+            continue
+
+        chunks = []
+        current = []
+        current_bytes = 0
+        for char in text:
+            char_bytes = len(char.encode("utf-8"))
+            if current and current_bytes + char_bytes > max_bytes:
+                chunks.append("".join(current))
+                current = []
+                current_bytes = 0
+            current.append(char)
+            current_bytes += char_bytes
+        if current:
+            chunks.append("".join(current))
+
+        total_chars = sum(len(chunk) for chunk in chunks)
+        duration = max(0, segment.end - segment.start)
+        elapsed_chars = 0
+        for index, chunk in enumerate(chunks):
+            start = segment.start + int(duration * elapsed_chars / total_chars)
+            elapsed_chars += len(chunk)
+            end = (
+                segment.end
+                if index == len(chunks) - 1
+                else segment.start + int(duration * elapsed_chars / total_chars)
+            )
+            values = {"text": segment.text, "translation": segment.translation}
+            values[segment_key] = chunk
+            result.append(Segment(start=start, end=max(start + 1, end), **values))
+        logging.warning(
+            "Split oversized %s subtitle cue into %d cues (%d bytes)",
+            segment_key,
+            len(chunks),
+            len(text.encode("utf-8")),
+        )
+    return result
 
 
 class TranslateExportMenu(QMenu):
@@ -444,6 +496,7 @@ class ExportTranscriptionMenu(QMenu):
         copy_video = video_codec in _COPY_VIDEO_CODECS if video_codec else True
         copy_audio = audio_codec in _COPY_AUDIO_CODECS if audio_codec else True
         segments = self._segments_within_duration(proc.segments, proc.duration_ms)
+        segments = _split_long_subtitle_segments(segments, proc.segment_key)
         try:
             write_output(
                 path=proc.srt_path,

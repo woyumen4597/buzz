@@ -14,6 +14,7 @@ from buzz.widgets.transcription_viewer.export_transcription_menu import (
     ExportTranscriptionMenu,
     MP4_BURNED,
     MP4_SOFT,
+    _split_long_subtitle_segments,
 )
 from tests.audio import test_audio_path
 
@@ -29,6 +30,24 @@ def probe_payload(duration="12.0", video_codec="h264", audio_codec="aac") -> byt
     return json.dumps(
         {"format": {"duration": duration}, "streams": streams}
     ).encode()
+
+
+def test_split_long_subtitle_segments_preserves_text_and_duration():
+    segment = Segment(
+        start=1000,
+        end=11000,
+        text="original",
+        translation="你好" * 20,
+    )
+
+    split = _split_long_subtitle_segments([segment], "translation", max_bytes=12)
+
+    assert len(split) > 1
+    assert "".join(item.translation for item in split) == segment.translation
+    assert all(len(item.translation.encode("utf-8")) <= 12 for item in split)
+    assert split[0].start == segment.start
+    assert split[-1].end == segment.end
+    assert all(item.end > item.start for item in split)
 
 
 class TestExportTranscriptionMenu:
