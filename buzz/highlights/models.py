@@ -72,6 +72,8 @@ class HighlightConfig:
     gif: bool = False
     gif_limit: int = 20
     keep_existing: bool = False
+    ignore_static_scenes: bool = True
+    static_motion_threshold: float = 1.5
 
     def __post_init__(self) -> None:
         numeric = (
@@ -82,6 +84,7 @@ class HighlightConfig:
             self.padding_seconds,
             self.scene_threshold,
             self.min_scene_duration_seconds,
+            self.static_motion_threshold,
         )
         if any(not math.isfinite(value) or value < 0 for value in numeric):
             raise ValueError("highlight durations and thresholds must be finite and non-negative")
@@ -93,6 +96,8 @@ class HighlightConfig:
             raise ValueError("scene_threshold must be between 0 and 1")
         if self.max_candidates < 0 or self.gif_limit < 0:
             raise ValueError("candidate limits must be non-negative")
+        if self.static_motion_threshold > 255:
+            raise ValueError("static_motion_threshold must be <= 255")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

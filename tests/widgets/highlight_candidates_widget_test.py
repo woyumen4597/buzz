@@ -41,6 +41,7 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert args.max_candidates == 50
     assert args.no_scene_detection is True
     assert args.no_previews is True
+    assert args.keep_static_scenes is False
 
 
 def test_highlight_widget_rejects_missing_video(qtbot):

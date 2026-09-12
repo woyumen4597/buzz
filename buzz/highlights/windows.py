@@ -52,13 +52,30 @@ def score_candidate(
     transcript_density_signal: float = 0.0,
     audio_activity_signal: float = 0.0,
     duration_quality_signal: float = 0.0,
+    motion_signal: float | None = None,
 ) -> float:
-    return max(0.0, min(1.0, (
-        0.50 * scene_signal
-        + 0.25 * transcript_density_signal
-        + 0.15 * audio_activity_signal
-        + 0.10 * duration_quality_signal
-    )))
+    """Combine heuristic signals into a review-priority score.
+
+    The four-argument form is kept compatible with the original heuristic.
+    When measured visual motion is supplied, it replaces the unused audio
+    placeholder with a real signal and makes visually active windows rank
+    above otherwise identical static windows.
+    """
+    if motion_signal is None:
+        value = (
+            0.50 * scene_signal
+            + 0.25 * transcript_density_signal
+            + 0.15 * audio_activity_signal
+            + 0.10 * duration_quality_signal
+        )
+    else:
+        value = (
+            0.40 * scene_signal
+            + 0.25 * transcript_density_signal
+            + 0.20 * motion_signal
+            + 0.15 * duration_quality_signal
+        )
+    return max(0.0, min(1.0, value))
 
 
 def duration_quality(duration_ms: int, config: HighlightConfig) -> float:
@@ -113,6 +130,54 @@ def parse_scene_timestamps(output: str) -> list[int]:
         if value >= 0:
             values.append(round(value * 1000))
     return sorted(set(values))
+
+
+def motion_analysis_command(ffmpeg: str, video_path: str) -> list[str]:
+    """Build a low-rate frame-difference scan for visual motion."""
+    filter_expr = "fps=1,scale=160:-2,tblend=all_mode=difference,signalstats,metadata=print"
+    return [
+        ffmpeg, "-hide_banner", "-nostats", "-i", video_path,
+        "-vf", filter_expr, "-an", "-f", "null", "-",
+    ]
+
+
+def parse_motion_samples(output: str) -> list[tuple[int, float]]:
+    """Parse ``metadata=print`` YAVG samples into (timestamp_ms, value)."""
+    samples: list[tuple[int, float]] = []
+    timestamp: int | None = None
+    for line in output.splitlines():
+        pts_time_match = re.search(r"pts_time[:=]\s*(-?\d+(?:\.\d+)?)", line)
+        pts_match = re.search(r"(?:^|\s)pts[:=]\s*(-?\d+(?:\.\d+)?)", line)
+        if pts_time_match:
+            try:
+                timestamp = round(float(pts_time_match.group(1)) * 1000)
+            except ValueError:
+                timestamp = None
+        elif pts_match:
+            # ``metadata=print`` normally includes pts_time; pts is only a
+            # fallback for synthetic/test output where it is already ms.
+            try:
+                timestamp = round(float(pts_match.group(1)))
+            except ValueError:
+                timestamp = None
+        value_match = re.search(r"lavfi\.signalstats\.YAVG=([0-9]+(?:\.[0-9]+)?)", line)
+        if value_match and timestamp is not None:
+            try:
+                samples.append((timestamp, float(value_match.group(1))))
+            except ValueError:
+                pass
+            timestamp = None
+    return samples
+
+
+def scan_motion(
+    ffmpeg: str, video_path: str, timeout: float | None = None
+) -> list[tuple[int, float]]:
+    process = subprocess.run(
+        motion_analysis_command(ffmpeg, video_path),
+        capture_output=True, text=True, check=True, timeout=timeout,
+    )
+    return parse_motion_samples(process.stderr + "\\n" + process.stdout)
 
 
 def scene_detection_command(
@@ -193,6 +258,9 @@ def combine_candidates(
         if duplicate is not None:
             duplicate.reasons = merge_reasons([*duplicate.reasons, *candidate.reasons])
             duplicate.score = max(duplicate.score, candidate.score)
+            if candidate.status == "ignore":
+                duplicate.status = "ignore"
+                duplicate.selected = False
             continue
         kept.append(candidate)
     kept.sort(key=lambda item: (item.start_ms, item.end_ms))
@@ -210,13 +278,40 @@ def combine_candidates(
     return kept
 
 
+def apply_motion_scores(
+    candidates: Iterable[Candidate],
+    motion_samples: Sequence[tuple[int, float]],
+    config: HighlightConfig,
+) -> list[Candidate]:
+    """Score candidates from sampled frame differences and flag static windows."""
+    samples = sorted(motion_samples)
+    for candidate in candidates:
+        values = [value for timestamp, value in samples if candidate.start_ms <= timestamp < candidate.end_ms]
+        average = sum(values) / len(values) if values else 0.0
+        motion_score = max(0.0, min(1.0, average / 32.0))
+        candidate.score = score_candidate(
+            scene_signal=1.0 if "scene_change" in candidate.reasons else 0.0,
+            duration_quality_signal=duration_quality(candidate.duration_ms, config),
+            motion_signal=motion_score,
+        )
+        if config.ignore_static_scenes and average < config.static_motion_threshold:
+            candidate.status = "ignore"
+            candidate.reasons = merge_reasons([*candidate.reasons, "static_scene"])
+        elif "static_scene" in candidate.reasons:
+            candidate.reasons = [reason for reason in candidate.reasons if reason != "static_scene"]
+    return list(candidates)
+
+
 def generate_candidates(
     video: VideoInfo,
     config: HighlightConfig | None = None,
     scene_changes_ms: Sequence[int] | None = None,
+    motion_samples: Sequence[tuple[int, float]] | None = None,
 ) -> list[Candidate]:
     config = config or HighlightConfig()
     candidates = fixed_window_candidates(video, config)
     if not config.no_scene_detection and scene_changes_ms is not None:
         candidates.extend(scene_candidates(video, scene_changes_ms, config))
+    if motion_samples:
+        apply_motion_scores(candidates, motion_samples, config)
     return combine_candidates(candidates, video, config)

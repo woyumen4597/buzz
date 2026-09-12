@@ -20,7 +20,7 @@ from .media import (
 )
 from .models import HighlightConfig
 from .subtitles import associate_subtitles, parse_srt_file
-from .windows import generate_candidates, scan_scene_changes
+from .windows import generate_candidates, scan_motion, scan_scene_changes
 
 LOG = logging.getLogger(__name__)
 
@@ -40,6 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-candidates", type=int, default=200)
     parser.add_argument("--no-scene-detection", action="store_true")
     parser.add_argument("--no-previews", action="store_true")
+    parser.add_argument("--keep-static-scenes", action="store_true", help="do not auto-ignore low-motion candidates")
     parser.add_argument("--gif", action="store_true")
     parser.add_argument("--gif-limit", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
@@ -60,6 +61,7 @@ def _config(args: argparse.Namespace) -> HighlightConfig:
         gif=args.gif,
         gif_limit=args.gif_limit,
         keep_existing=args.keep_existing,
+        ignore_static_scenes=not getattr(args, "keep_static_scenes", False),
     )
 
 
@@ -84,6 +86,7 @@ def run(
     warnings: list[str] = []
     errors: list[str] = []
     scene_points: list[int] | None = None
+    motion_samples: list[tuple[int, float]] = []
     scene_enabled = not config.no_scene_detection
     if not config.no_scene_detection:
         try:
@@ -93,8 +96,14 @@ def run(
             warnings.append(warning)
             LOG.warning(warning)
             scene_enabled = False
+    try:
+        motion_samples = scan_motion(ffmpeg, str(video_path))
+    except Exception as exc:
+        warning = f"motion analysis failed; using base scores: {exc}"
+        warnings.append(warning)
+        LOG.warning(warning)
 
-    candidates = generate_candidates(video, config, scene_points)
+    candidates = generate_candidates(video, config, scene_points, motion_samples)
     checkpoint = load_checkpoint(output_dir) if config.keep_existing else None
     if checkpoint:
         checkpoint_input = checkpoint.get("input", {})
@@ -107,6 +116,8 @@ def run(
             and checkpoint_config.get("window_seconds") == config.window_seconds
             and checkpoint_config.get("stride_seconds") == config.stride_seconds
             and checkpoint_config.get("max_candidates") == config.max_candidates
+            and checkpoint_config.get("ignore_static_scenes", False) == config.ignore_static_scenes
+            and checkpoint_config.get("static_motion_threshold", 1.5) == config.static_motion_threshold
         )
         if compatible:
             saved_candidates = {item.get("id"): item for item in checkpoint.get("candidates", [])}

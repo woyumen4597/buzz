@@ -125,8 +125,11 @@ class HighlightCandidatesWidget(QWidget):
 
         self.no_scene_detection = QCheckBox(_("Skip scene detection"), self)
         self.no_previews = QCheckBox(_("Skip MP4 previews for a faster first pass"), self)
+        self.ignore_static_scenes = QCheckBox(_("Auto-ignore mostly static scenes"), self)
+        self.ignore_static_scenes.setChecked(True)
         layout.addWidget(self.no_scene_detection)
         layout.addWidget(self.no_previews)
+        layout.addWidget(self.ignore_static_scenes)
 
         actions = QHBoxLayout()
         self.run_button = QPushButton(_("Generate candidates"), self)
@@ -211,11 +214,13 @@ class HighlightCandidatesWidget(QWidget):
             max_candidates=self.max_candidates.value(),
             no_scene_detection=self.no_scene_detection.isChecked(),
             no_previews=self.no_previews.isChecked(),
+            static_motion_threshold=1.5,
             gif=False,
             gif_limit=0,
             keep_existing=True,
             open_html=False,
             serve_html=True,
+            keep_static_scenes=not self.ignore_static_scenes.isChecked(),
             verbose=False,
         )
 
