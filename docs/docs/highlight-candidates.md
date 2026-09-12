@@ -1,0 +1,36 @@
+# 视频高光候选
+
+Buzz 主窗口现在包含“Video highlights”工作区 Tab。打开 Buzz 后，切换到该 Tab，选择视频文件，可选选择 SRT，调整窗口、步长和候选数量，然后点击“Generate candidates”。生成过程在后台执行，完成后点击“Open result”即可打开候选 HTML 页面。
+
+该页面是轻量入口，候选卡片、缩略图和预览仍在生成的静态 HTML 中查看，不会改变现有转写工作区。
+
+Buzz 也提供一个不依赖 Qt 主窗口的独立命令，用于生成供人工排查的视频候选片段。
+
+```bash
+uv run python -m buzz.highlights.cli video.mp4 \
+  --srt video.srt \
+  --output-dir video_highlights
+```
+
+也可以在安装后使用 `buzz-highlights` 命令。默认会检查 FFmpeg、生成固定时间窗口，并尝试进行画面场景变化扫描。场景扫描失败时会记录 warning 并自动退回固定窗口；使用 `--no-scene-detection` 可以主动关闭场景扫描。
+
+常用选项：
+
+- `--no-previews`：只生成缩略图和时间信息，适合第一轮快速扫描。
+- `--max-candidates 200`：限制候选数量。
+- `--window-seconds 20 --stride-seconds 10`：调整固定窗口。
+- `--gif --gif-limit 20`：为排名靠前的候选额外生成 GIF。
+- `--keep-existing`：复用输出目录中已有的缩略图和预览，并读取 `.highlight-progress.json` 继续未完成的候选。
+- `--open`：生成后尝试打开 `index.html`。
+
+GUI 页面会显示素材生成百分比，并提供“取消”按钮。点击“取消”会停止后续候选处理，已经完成的缩略图/预览和 `.highlight-progress.json` 会保留；下次使用相同视频、相同主要参数并保持“复用已有文件”时，会从已完成位置继续。GUI 默认开启复用已有文件。
+
+输出目录包含 `index.html`、`candidates.json`、`manifest.json`、`selected.json`、`clips.txt`、`thumbnails/` 和 `previews/`。HTML 页面可以按分数、时间和状态排序，按字幕关键词筛选，并将保留的候选状态保存到浏览器 `localStorage`。导出按钮会下载已选 JSON 和 FFmpeg 命令清单。
+
+页面可直接用浏览器打开。如果浏览器限制 `file://` 页面的视频加载，可在输出目录执行：
+
+```bash
+python -m http.server 8000
+```
+
+然后访问 `http://127.0.0.1:8000/`。

@@ -114,6 +114,7 @@ all = [
 
 [project.scripts]
 buzz = "buzz.buzz:main"
+buzz-highlights = "buzz.highlights.cli:main"
 
 [dependency-groups]
 dev = [

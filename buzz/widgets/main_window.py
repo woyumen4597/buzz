@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QFileDialog,
     QPushButton,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +64,7 @@ from buzz.widgets.main_window_toolbar import MainWindowToolbar
 from buzz.widgets.menu_bar import MenuBar
 from buzz.widgets.preferences_dialog.models.preferences import Preferences
 from buzz.widgets.transcriber.file_transcriber_widget import FileTranscriberWidget
+from buzz.widgets.highlight_candidates_widget import HighlightCandidatesWidget
 from buzz.widgets.transcription_task_folder_watcher import (
     TranscriptionTaskFolderWatcher,
     SUPPORTED_EXTENSIONS,
@@ -329,7 +331,12 @@ class MainWindow(QMainWindow):
         central_layout.addWidget(filter_bar)
         central_layout.addWidget(self.table_widget, 1)
 
-        self.setCentralWidget(central_widget)
+        self.highlight_candidates_widget = HighlightCandidatesWidget(self)
+        self.workspace_tabs = QTabWidget(self)
+        self.workspace_tabs.setObjectName("WorkspaceTabs")
+        self.workspace_tabs.addTab(central_widget, _("Transcriptions"))
+        self.workspace_tabs.addTab(self.highlight_candidates_widget, _("Video highlights"))
+        self.setCentralWidget(self.workspace_tabs)
         self.table_widget.model().modelReset.connect(self._update_task_count)
         self.table_widget.model().rowsInserted.connect(self._update_task_count)
         self.table_widget.model().rowsRemoved.connect(self._update_task_count)

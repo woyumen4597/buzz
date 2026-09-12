@@ -1996,3 +1996,123 @@ msgstr "无"
 
 msgid "None"
 msgstr "无"
+
+#: buzz/widgets/main_window.py
+msgid "Transcriptions"
+msgstr "转录"
+
+#: buzz/widgets/main_window.py
+msgid "Video highlights"
+msgstr "视频高光"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "BUZZ / VIDEO WORKSPACE"
+msgstr "BUZZ / 视频工作区"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Video highlight candidates"
+msgstr "视频高光候选"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Generate reviewable candidate clips and open the static browser when ready."
+msgstr "生成可供人工筛选的候选片段，完成后打开静态浏览页面。"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Choose a video file"
+msgstr "请选择视频文件"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Video"
+msgstr "视频"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Optional SRT transcript"
+msgstr "可选的 SRT 字幕文件"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Transcript (SRT)"
+msgstr "字幕（SRT）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Defaults to <video>_highlights"
+msgstr "默认为 <视频名>_highlights"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Output folder"
+msgstr "输出文件夹"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Window (seconds)"
+msgstr "窗口长度（秒）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Stride (seconds)"
+msgstr "步长（秒）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Maximum candidates"
+msgstr "最多候选数"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Skip scene detection"
+msgstr "跳过场景检测"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Skip MP4 previews for a faster first pass"
+msgstr "跳过 MP4 预览（加快首次生成）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Generate candidates"
+msgstr "生成候选"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Open result"
+msgstr "打开结果"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Cancel"
+msgstr "取消"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Canceling. Completed files will be kept for the next run..."
+msgstr "正在取消，已完成的文件会保留到下次继续生成……"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Choose a video to begin."
+msgstr "请选择视频开始。"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Choose video"
+msgstr "选择视频"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Video files (*.mp4 *.mov *.mkv *.avi *.m4v *.webm);;All files (*)"
+msgstr "视频文件 (*.mp4 *.mov *.mkv *.avi *.m4v *.webm);;所有文件 (*)"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Choose SRT transcript"
+msgstr "选择 SRT 字幕"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "SubRip subtitles (*.srt);;All files (*)"
+msgstr "SubRip 字幕 (*.srt);;所有文件 (*)"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Choose output folder"
+msgstr "选择输出文件夹"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Select an existing video file first."
+msgstr "请先选择一个存在的视频文件。"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Generating candidates. This may take a while..."
+msgstr "正在生成候选，可能需要一些时间……"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Candidates are ready: {}"
+msgstr "候选已生成：{}"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Candidate generation failed: {}"
+msgstr "候选生成失败：{}"
