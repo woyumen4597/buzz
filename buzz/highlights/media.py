@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Sequence
 
 from buzz.ffmpeg_video_player import _find_ffmpeg, _find_ffprobe, probe_video
 
@@ -161,11 +161,63 @@ def clip_command(
     video_path: str,
     candidate: Candidate,
     output_path: str,
+    has_audio: bool = True,
 ) -> list[str]:
     return [
         ffmpeg, "-y", "-ss", _seconds(candidate.start_ms), "-i", video_path,
-        "-t", _seconds(candidate.duration_ms), "-c:v", "libx264", "-c:a", "aac", output_path,
+        "-t", _seconds(candidate.duration_ms), "-c:v", "libx264",
+        *( ["-c:a", "aac"] if has_audio else ["-an"] ), output_path,
     ]
+
+
+def concat_command(ffmpeg: str, concat_file: str, output_path: str) -> list[str]:
+    return [
+        ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+        "-c", "copy", "-movflags", "+faststart", output_path,
+    ]
+
+
+def render_selected_video(
+    ffmpeg: str,
+    video_path: str,
+    candidates: Sequence[Candidate],
+    output_dir: Path,
+    has_audio: bool = True,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> Path:
+    """Create individual selected clips and concatenate them in timeline order."""
+    selected = sorted((candidate for candidate in candidates if candidate.selected), key=lambda item: item.start_ms)
+    if not selected:
+        raise ValueError("select at least one candidate before rendering")
+
+    clips_dir = output_dir / "clips"
+    clips_dir.mkdir(parents=True, exist_ok=True)
+    total = len(selected) + 1
+    concat_file = output_dir / ".highlight-concat.txt"
+    clip_paths: list[Path] = []
+    try:
+        for index, candidate in enumerate(selected, 1):
+            clip_path = clips_dir / f"clip_{index:04d}.mp4"
+            _run_atomic(
+                clip_command(ffmpeg, video_path, candidate, str(clip_path), has_audio=has_audio),
+                clip_path,
+            )
+            clip_paths.append(clip_path)
+            if progress_callback:
+                progress_callback(index, total, f"剪辑 {candidate.id}")
+
+        concat_lines = []
+        for clip_path in clip_paths:
+            escaped = str(clip_path.absolute()).replace("'", "'\\''")
+            concat_lines.append(f"file '{escaped}'")
+        concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
+        output_path = output_dir / "highlights.mp4"
+        _run_atomic(concat_command(ffmpeg, str(concat_file), str(output_path)), output_path)
+        if progress_callback:
+            progress_callback(total, total, "拼接完成")
+        return output_path
+    finally:
+        concat_file.unlink(missing_ok=True)
 
 
 def candidate_timestamp_label(candidate: Candidate) -> str:

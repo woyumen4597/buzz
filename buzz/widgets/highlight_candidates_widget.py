@@ -215,6 +215,7 @@ class HighlightCandidatesWidget(QWidget):
             gif_limit=0,
             keep_existing=True,
             open_html=False,
+            serve_html=True,
             verbose=False,
         )
 
@@ -282,7 +283,12 @@ class HighlightCandidatesWidget(QWidget):
         self._cancel_event = None
 
     def open_result(self):
-        if self._output_dir is not None:
+        if self._output_dir is None:
+            return
+        server_url = self._output_dir / ".highlight-server-url"
+        if server_url.is_file():
+            QDesktopServices.openUrl(QUrl(server_url.read_text(encoding="utf-8").strip() + "/index.html"))
+        else:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_dir / "index.html")))
 
     def closeEvent(self, event):

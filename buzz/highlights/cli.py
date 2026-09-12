@@ -10,7 +10,7 @@ import webbrowser
 from pathlib import Path
 from typing import Callable
 
-from .exporter import export_outputs, load_checkpoint, write_checkpoint
+from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
 from .media import (
     find_tools,
     generate_gif,
@@ -182,9 +182,21 @@ def run(
     export_config = config
     if not scene_enabled:
         export_config = HighlightConfig(**{**config.to_dict(), "no_scene_detection": True})
-    export_outputs(output_dir, candidates, video, export_config, str(video_path), errors, warnings)
-    if args.open_html:
-        webbrowser.open((output_dir / "index.html").as_uri())
+    render_server = None
+    if args.open_html or getattr(args, "serve_html", False):
+        render_server, _thread = serve_result_page(
+            output_dir, candidates, str(video_path), ffmpeg, has_audio=bool(video.audio_codec)
+        )
+    render_endpoint = f"http://127.0.0.1:{render_server.server_port}/render" if render_server else None
+    export_outputs(
+        output_dir, candidates, video, export_config, str(video_path), errors, warnings,
+        render_endpoint=render_endpoint,
+    )
+    if render_server:
+        result_url = f"http://127.0.0.1:{render_server.server_port}"
+        (output_dir / ".highlight-server-url").write_text(result_url + "\n", encoding="utf-8")
+        if args.open_html:
+            webbrowser.open(result_url + "/index.html")
     return output_dir
 
 

@@ -25,7 +25,7 @@ uv run python -m buzz.highlights.cli video.mp4 \
 
 GUI 页面会显示素材生成百分比，并提供“取消”按钮。点击“取消”会停止后续候选处理，已经完成的缩略图/预览和 `.highlight-progress.json` 会保留；下次使用相同视频、相同主要参数并保持“复用已有文件”时，会从已完成位置继续。GUI 默认开启复用已有文件。
 
-输出目录包含 `index.html`、`candidates.json`、`manifest.json`、`selected.json`、`clips.txt`、`thumbnails/` 和 `previews/`。HTML 页面可以按分数、时间和状态排序，按字幕关键词筛选，并将保留的候选状态保存到浏览器 `localStorage`。导出按钮会下载已选 JSON 和 FFmpeg 命令清单。
+输出目录包含 `index.html`、`candidates.json`、`manifest.json`、`selected.json`、`clips.txt`、`thumbnails/` 和 `previews/`。HTML 页面可以按分数、时间和状态排序，按字幕关键词筛选，并将保留的候选状态保存到浏览器 `localStorage`。导出按钮会下载已选 JSON 和 FFmpeg 命令清单。通过 Buzz GUI 打开的结果页还提供“生成最终视频”：它会按时间顺序裁剪所有“保留”片段并自动拼接为输出目录中的 `highlights.mp4`。生成过程不会删除原视频或被忽略的候选。
 
 页面可直接用浏览器打开。如果浏览器限制 `file://` 页面的视频加载，可在输出目录执行：
 
