@@ -224,7 +224,13 @@ def export_outputs(
     })
     _json(output_dir / "selected.json", [candidate.to_dict() for candidate in candidates if candidate.selected])
     export_clips_txt(output_dir / "clips.txt", [c for c in candidates if c.selected], video_path)
-    export_html(output_dir / "index.html", candidates, Path(video_path).name, video_path)
+    export_html(
+        output_dir / "index.html",
+        candidates,
+        Path(video_path).name,
+        video_path,
+        render_endpoint=render_endpoint,
+    )
     _json(output_dir / "manifest.json", {
         "input": {"path": str(Path(video_path).absolute()), "name": Path(video_path).name},
         "video": video.to_dict(), "config": config.to_dict(),
