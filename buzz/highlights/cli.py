@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shutil
 import sys
 import threading
 import webbrowser
@@ -13,6 +14,7 @@ from typing import Callable
 
 from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
 from .auto_edit import resolve_target_duration_seconds, selection_summary, select_auto_candidates
+from .output import automatic_output_path
 from .media import (
     find_tools,
     generate_gif,
@@ -86,7 +88,14 @@ def run(
         raise FileNotFoundError(f"input video does not exist: {video_path}")
     if not video_path.stat().st_size:
         raise ValueError(f"input video is empty: {video_path}")
-    output_dir = (args.output_dir or video_path.with_name(f"{video_path.stem}_highlights")).expanduser().absolute()
+    automatic_output = bool(getattr(args, "auto_edit", False))
+    cleanup_work_dir = automatic_output and args.output_dir is None
+    final_output_path = automatic_output_path(video_path) if automatic_output else None
+    output_dir = (
+        Path(args.output_dir).expanduser().absolute()
+        if args.output_dir
+        else video_path.with_name(f"{video_path.stem}_highlights")
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir():
         raise NotADirectoryError(str(output_dir))
@@ -160,6 +169,8 @@ def run(
     auto_selection = None
     if config.auto_edit:
         auto_selection = select_auto_candidates(candidates, config)
+        if not auto_selection.selected:
+            raise ValueError("no usable highlight candidates were found")
         (output_dir / "auto-selection.json").write_text(
             json.dumps({
                 **selection_summary(candidates, config),
@@ -239,7 +250,12 @@ def run(
             output_dir,
             has_audio=bool(video.audio_codec),
             progress_callback=render_progress,
+            output_path=final_output_path,
         )
+        # A successful one-click run leaves only the final MP4 beside the source.
+        if cleanup_work_dir:
+            shutil.rmtree(output_dir, ignore_errors=True)
+        return final_output_path
 
     export_config = config
     if not scene_enabled:
@@ -271,9 +287,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, NotADirectoryError, InterruptedError) as exc:
         parser.error(str(exc))
         return 2
-    message = f"Generated {output_dir / 'index.html'} ({len(list(output_dir.glob('thumbnails/*.jpg')))} thumbnails)"
     if getattr(args, "auto_edit", False):
-        message += f"; reel: {output_dir / 'highlights.mp4'}"
+        message = f"Generated reel: {output_dir}"
+    else:
+        message = f"Generated {output_dir / 'index.html'} ({len(list(output_dir.glob('thumbnails/*.jpg')))} thumbnails)"
     print(message)
     return 0
 

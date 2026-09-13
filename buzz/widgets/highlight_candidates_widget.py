@@ -284,6 +284,9 @@ class HighlightCandidatesWidget(QWidget):
     def open_result(self):
         if self._output_dir is None:
             return
+        if self._output_dir.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._output_dir)))
+            return
         server_url = self._output_dir / ".highlight-server-url"
         if server_url.is_file():
             QDesktopServices.openUrl(QUrl(server_url.read_text(encoding="utf-8").strip() + "/index.html"))

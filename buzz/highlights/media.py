@@ -184,6 +184,7 @@ def render_selected_video(
     output_dir: Path,
     has_audio: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    output_path: Path | None = None,
 ) -> Path:
     """Create individual selected clips and concatenate them in timeline order."""
     selected = sorted(
@@ -219,11 +220,11 @@ def render_selected_video(
             escaped = str(clip_path.absolute()).replace("'", "'\\''")
             concat_lines.append(f"file '{escaped}'")
         concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
-        output_path = output_dir / "highlights.mp4"
-        _run_atomic(concat_command(ffmpeg, str(concat_file), str(output_path)), output_path)
+        final_path = output_path or output_dir / "highlights.mp4"
+        _run_atomic(concat_command(ffmpeg, str(concat_file), str(final_path)), final_path)
         if progress_callback:
             progress_callback(total, total, "拼接完成")
-        return output_path
+        return final_path
     finally:
         concat_file.unlink(missing_ok=True)
 

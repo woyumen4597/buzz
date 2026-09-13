@@ -1,5 +1,13 @@
+from pathlib import Path
+
 from buzz.highlights.media import concat_command, gif_command, preview_command, render_selected_video, thumbnail_command
 from buzz.highlights.models import Candidate
+from buzz.highlights.output import automatic_output_path
+
+
+def test_automatic_output_path_uses_source_directory_and_suffix():
+    assert automatic_output_path("/tmp/a video.mp4") == Path("/tmp/a video_highlight.mp4")
+    assert automatic_output_path("/tmp/source.mov") == Path("/tmp/source_highlight.mp4")
 
 
 def test_commands_keep_paths_as_single_args():
@@ -61,3 +69,21 @@ def test_render_selected_video_sorts_by_timeline(tmp_path, monkeypatch):
     assert commands[0][3] == "0.000"
     assert commands[1][3] == "2.000"
     assert commands[2][2:6] == ["-f", "concat", "-safe", "0"]
+
+
+def test_render_selected_video_supports_final_output_path(tmp_path, monkeypatch):
+    candidate = Candidate("only", 0, 1_000, 0, 1_000, selected=True, status="keep")
+    commands = []
+
+    def fake_run(command, output_path):
+        commands.append(command)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"ok")
+
+    monkeypatch.setattr("buzz.highlights.media._run_atomic", fake_run)
+    final_path = tmp_path / "source_highlight.mp4"
+    output = render_selected_video(
+        "ffmpeg", "input.mp4", [candidate], tmp_path / "work", output_path=final_path
+    )
+    assert output == final_path
+    assert commands[-1][-1] == str(final_path)

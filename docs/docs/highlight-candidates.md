@@ -19,7 +19,7 @@ uv run buzz-highlights video.mp4 --srt video.srt \
   --auto-edit --output-dir video_highlights
 ```
 
-自动模式默认按源视频三分之一计算目标时长，片段数量不限，按评分和时间区间做非重叠选择，主体片段总时长尽量填满目标时长但不会超过目标。也可以用 `--target-duration 600` 指定 10 分钟；用 `--max-auto-clips 6` 才会限制片段数量。输出目录会生成 `highlights.mp4` 和 `auto-selection.json`。这是可解释的自动初剪，不是对内容高光的确定性判断。
+自动模式默认按源视频三分之一计算目标时长，片段数量不限，按评分和时间区间做非重叠选择，主体片段总时长尽量填满目标时长但不会超过目标。选中的片段始终按原视频开始时间排序后拼接。自动模式会直接在输入视频旁生成 `<原文件名>_highlight.mp4`，成功后自动删除默认中间工作目录；如果显式指定 `--output-dir`，该目录会保留供复核，最终 MP4 仍按输入视频命名规则输出。也可以用 `--target-duration 600` 指定 10 分钟；用 `--max-auto-clips 6` 才会限制片段数量。
 
 常用选项：
 
@@ -33,7 +33,7 @@ uv run buzz-highlights video.mp4 --srt video.srt \
 
 GUI 页面会显示素材生成百分比，并提供“取消”按钮。点击“取消”会停止后续候选处理，已经完成的缩略图/预览和 `.highlight-progress.json` 会保留；下次使用相同视频、相同主要参数并保持“复用已有文件”时，会从已完成位置继续。GUI 默认开启复用已有文件。
 
-输出目录包含 `index.html`、`candidates.json`、`manifest.json`、`selected.json`、`clips.txt`、`thumbnails/` 和 `previews/`。HTML 页面可以按分数、时间和状态排序，按字幕关键词筛选，并将保留的候选状态保存到浏览器 `localStorage`。导出按钮会下载已选 JSON 和 FFmpeg 命令清单。通过 Buzz GUI 打开的结果页还提供“生成最终视频”：它会按时间顺序裁剪所有“保留”片段并自动拼接为输出目录中的 `highlights.mp4`。生成过程不会删除原视频或被忽略的候选。
+手动候选模式的输出目录包含 `index.html`、`candidates.json`、`manifest.json`、`selected.json`、`clips.txt`、`thumbnails/` 和 `previews/`。HTML 页面可以按分数、时间和状态排序，按字幕关键词筛选，并将保留的候选状态保存到浏览器 `localStorage`。导出按钮会下载已选 JSON 和 FFmpeg 命令清单。通过结果页生成最终视频时，会按时间顺序裁剪所有“保留”片段并自动拼接为目录中的 `highlights.mp4`。自动一键模式不保留这些中间产物，只留下输入目录旁的最终 MP4。
 
 页面可直接用浏览器打开。如果浏览器限制 `file://` 页面的视频加载，可在输出目录执行：
 
