@@ -9,7 +9,7 @@ from typing import Iterable
 from .models import Candidate, HighlightConfig, interval_iou
 
 
-ALGORITHM_VERSION = "weighted-interval-budget-v2"
+ALGORITHM_VERSION = "weighted-interval-budget-v3"
 _BUDGET_QUANTUM_MS = 1000
 
 
