@@ -165,8 +165,11 @@ def clip_command(
 ) -> list[str]:
     return [
         ffmpeg, "-y", "-ss", _seconds(candidate.start_ms), "-i", video_path,
-        "-t", _seconds(candidate.duration_ms), "-c:v", "libx264",
-        *( ["-c:a", "aac"] if has_audio else ["-an"] ), output_path,
+        "-t", _seconds(candidate.duration_ms),
+        "-map", "0:v:0", *( ["-map", "0:a:0?"] if has_audio else [] ),
+        "-map", "0:s?", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        *( ["-c:a", "aac", "-b:a", "192k"] if has_audio else [] ),
+        "-c:s", "mov_text", output_path,
     ]
 
 

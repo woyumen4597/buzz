@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from buzz.highlights.media import concat_command, gif_command, preview_command, render_selected_video, thumbnail_command
+from buzz.highlights.media import (
+    clip_command,
+    concat_command,
+    gif_command,
+    preview_command,
+    render_selected_video,
+    thumbnail_command,
+)
 from buzz.highlights.models import Candidate
 from buzz.highlights.output import automatic_output_path
 
@@ -23,6 +30,31 @@ def test_preview_command_without_audio_uses_an():
     command = preview_command("ffmpeg", "in.mp4", 0, 1000, "out.mp4", has_audio=False)
     assert "-an" in command
     assert "-c:a" not in command
+
+
+def test_clip_command_uses_high_quality_encoding_and_preserves_subtitles():
+    candidate = Candidate("only", 1_000, 3_000, 1_000, 3_000)
+    command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4")
+    assert command[command.index("-map"):command.index("-c:v")] == [
+        "-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s?",
+    ]
+    assert command[command.index("-c:v"):command.index("-c:a")] == [
+        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+    ]
+    assert command[command.index("-c:a"):command.index("-c:s")] == [
+        "-c:a", "aac", "-b:a", "192k",
+    ]
+    assert command[command.index("-c:s"):command.index("out.mp4")] == [
+        "-c:s", "mov_text",
+    ]
+
+
+def test_clip_command_without_audio_does_not_map_audio():
+    candidate = Candidate("only", 0, 1_000, 0, 1_000)
+    command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4", has_audio=False)
+    assert "0:a:0?" not in command
+    assert "-an" not in command
+    assert "-map" in command and "0:s?" in command
 
 
 def test_gif_command_limits_duration():
