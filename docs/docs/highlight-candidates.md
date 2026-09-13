@@ -1,6 +1,6 @@
 # 视频高光候选
 
-Buzz 主窗口现在包含“Video highlights”工作区 Tab。打开 Buzz 后，切换到该 Tab，选择视频文件，可选选择 SRT，调整窗口、步长和候选数量，然后点击“Generate candidates”。GUI 默认开启“自动生成高光合集”：它会在目标时长预算内选择高分、互不重叠且非静止的片段，并直接输出 `highlights.mp4`；关闭该选项后仍可只生成候选 HTML 页面。生成过程在后台执行，完成后点击“Open result”即可打开候选页面。
+Buzz 主窗口现在包含“视频高光”工作区。打开 Buzz 后，切换到该 Tab，选择视频文件，可选选择 SRT，然后点击“生成高光合集”即可一键处理。默认目标时长为原视频的三分之一：1 小时视频约生成 20 分钟高光，2 小时视频约生成 40 分钟高光。窗口长度、步长和候选上限是内部分析策略，不需要在日常使用中调整。生成过程在后台执行，完成后点击“打开结果”即可查看成片和复核页面。
 
 该页面是轻量入口，候选卡片、缩略图和预览仍在生成的静态 HTML 中查看，不会改变现有转写工作区。候选分数是用于排序的启发式分数：结合场景变化、字幕密度、画面运动和窗口时长，不是模型对“高光”的确定性判断；没有字幕或运动信号时，同类候选出现相同分数是正常的。
 
@@ -16,18 +16,17 @@ uv run python -m buzz.highlights.cli video.mp4 \
 
 ```bash
 uv run buzz-highlights video.mp4 --srt video.srt \
-  --auto-edit --target-duration 60 --max-auto-clips 6 \
-  --output-dir video_highlights
+  --auto-edit --output-dir video_highlights
 ```
 
-自动模式会排除标记为忽略的候选，按评分和时间区间做非重叠选择，主体片段总时长不会超过目标时长；输出目录会生成 `highlights.mp4` 和 `auto-selection.json`。这是可解释的自动初剪，不是对内容高光的确定性判断。
+自动模式默认按源视频三分之一计算目标时长，片段数量不限，按评分和时间区间做非重叠选择，主体片段总时长尽量填满目标时长但不会超过目标。也可以用 `--target-duration 600` 指定 10 分钟；用 `--max-auto-clips 6` 才会限制片段数量。输出目录会生成 `highlights.mp4` 和 `auto-selection.json`。这是可解释的自动初剪，不是对内容高光的确定性判断。
 
 常用选项：
 
-- `--no-previews`：只生成缩略图和时间信息，适合第一轮快速扫描。
 - `--keep-static-scenes`：不自动将画面基本静止的候选标为“忽略”。默认会进行低帧率画面运动分析；静止候选不会删除，仍可在结果页手动改为“保留”。
-- `--max-candidates 200`：限制候选数量。
-- `--window-seconds 20 --stride-seconds 10`：调整固定窗口。
+- `--target-duration 600`：指定 10 分钟目标成片；不指定时按源视频三分之一计算。
+- `--max-auto-clips 6`：可选地限制自动成片中的片段数量，默认不限。
+- `--no-previews`：不生成预览文件，只生成成片和时间信息。
 - `--gif --gif-limit 20`：为排名靠前的候选额外生成 GIF。
 - `--keep-existing`：复用输出目录中已有的缩略图和预览，并读取 `.highlight-progress.json` 继续未完成的候选。
 - `--open`：生成后尝试打开 `index.html`。

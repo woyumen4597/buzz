@@ -2010,12 +2010,12 @@ msgid "BUZZ / VIDEO WORKSPACE"
 msgstr "BUZZ / 视频工作区"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Video highlight candidates"
-msgstr "视频高光候选"
+msgid "Automatic video highlights"
+msgstr "自动生成视频高光"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Generate reviewable candidate clips and open the static browser when ready."
-msgstr "生成可供人工筛选的候选片段，完成后打开静态浏览页面。"
+msgid "Choose a video and generate a highlight reel automatically. The default reel length is one third of the source video."
+msgstr "选择视频后一键生成高光合集，默认时长为原视频的三分之一。"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Choose a video file"
@@ -2066,20 +2066,24 @@ msgid "Auto-ignore mostly static scenes"
 msgstr "自动忽略画面基本静止的片段"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Automatic reel duration (seconds)"
-msgstr "自动成片时长（秒）"
+msgid "Highlight duration (seconds, 0 = automatic)"
+msgstr "高光时长（秒，0 = 自动按原视频三分之一）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Automatic: one third of source video"
+msgstr "自动：原视频的三分之一"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Maximum automatic clips"
 msgstr "自动成片最多片段数"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Automatically create a highlight reel"
-msgstr "自动生成高光合集"
+msgid "One-click automatic highlight reel"
+msgstr "一键自动生成高光合集"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Generate candidates"
-msgstr "生成候选"
+msgid "Generate highlight reel"
+msgstr "生成高光合集"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Open result"
@@ -2122,12 +2126,12 @@ msgid "Select an existing video file first."
 msgstr "请先选择一个存在的视频文件。"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Generating candidates. This may take a while..."
-msgstr "正在生成候选，可能需要一些时间……"
+msgid "Generating highlight reel. This may take a while..."
+msgstr "正在生成高光合集，可能需要一些时间……"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Candidates are ready: {}"
-msgstr "候选已生成：{}"
+msgid "Highlight reel is ready: {}"
+msgstr "高光合集已生成：{}"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Candidate generation failed: {}"

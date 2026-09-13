@@ -75,8 +75,8 @@ class HighlightConfig:
     ignore_static_scenes: bool = True
     static_motion_threshold: float = 1.5
     auto_edit: bool = False
-    target_duration_seconds: float = 60.0
-    max_auto_clips: int = 6
+    target_duration_seconds: float = 0.0
+    max_auto_clips: int = 0
     score_threshold: float = 0.0
 
     def __post_init__(self) -> None:

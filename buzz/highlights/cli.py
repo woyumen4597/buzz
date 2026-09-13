@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
-from .auto_edit import selection_summary, select_auto_candidates
+from .auto_edit import resolve_target_duration_seconds, selection_summary, select_auto_candidates
 from .media import (
     find_tools,
     generate_gif,
@@ -45,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-previews", action="store_true")
     parser.add_argument("--keep-static-scenes", action="store_true", help="do not auto-ignore low-motion candidates")
     parser.add_argument("--auto-edit", action="store_true", help="automatically select and render a highlight reel")
-    parser.add_argument("--target-duration", type=float, default=60.0, help="target reel duration in seconds")
-    parser.add_argument("--max-auto-clips", type=int, default=6, help="maximum clips in an automatic reel")
+    parser.add_argument("--target-duration", type=float, default=0.0, help="target reel duration in seconds; 0 uses one third of the source")
+    parser.add_argument("--max-auto-clips", type=int, default=0, help="maximum clips in an automatic reel; 0 means unlimited")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="minimum automatic selection score")
     parser.add_argument("--gif", action="store_true")
     parser.add_argument("--gif-limit", type=int, default=20)
@@ -70,8 +70,8 @@ def _config(args: argparse.Namespace) -> HighlightConfig:
         keep_existing=args.keep_existing,
         ignore_static_scenes=not getattr(args, "keep_static_scenes", False),
         auto_edit=getattr(args, "auto_edit", False),
-        target_duration_seconds=getattr(args, "target_duration", 60.0),
-        max_auto_clips=getattr(args, "max_auto_clips", 6),
+        target_duration_seconds=getattr(args, "target_duration", 0.0),
+        max_auto_clips=getattr(args, "max_auto_clips", 0),
         score_threshold=getattr(args, "score_threshold", 0.0),
     )
 
@@ -94,6 +94,11 @@ def run(
     ffmpeg, _ = find_tools()
     video = probe_media(str(video_path))
     config = _config(args)
+    if config.auto_edit:
+        config.target_duration_seconds = resolve_target_duration_seconds(
+            video.duration_ms, config.target_duration_seconds
+        )
+        config.max_candidates = 0
     warnings: list[str] = []
     errors: list[str] = []
     scene_points: list[int] | None = None
@@ -163,7 +168,9 @@ def run(
             encoding="utf-8",
         )
 
-    thumbnail_candidates = candidates
+    # Automatic mode is a one-click workflow: only the selected reel needs
+    # review assets. Manual mode keeps the full candidate browser behavior.
+    thumbnail_candidates = auto_selection.selected if auto_selection is not None else candidates
     preview_candidates = auto_selection.selected if auto_selection is not None else candidates
     preview_ids = {candidate.id for candidate in preview_candidates}
     thumbnail_dir = output_dir / "thumbnails"

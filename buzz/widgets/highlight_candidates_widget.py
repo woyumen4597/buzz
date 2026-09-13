@@ -77,12 +77,12 @@ class HighlightCandidatesWidget(QWidget):
         eyebrow.setObjectName("Eyebrow")
         layout.addWidget(eyebrow)
 
-        title = QLabel(_("Video highlight candidates"))
+        title = QLabel(_("Automatic video highlights"))
         title.setObjectName("PageTitle")
         layout.addWidget(title)
 
         subtitle = QLabel(
-            _("Generate reviewable candidate clips and open the static browser when ready.")
+            _("Choose a video and generate a highlight reel automatically. The default reel length is one third of the source video.")
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("PageSubtitle")
@@ -111,37 +111,31 @@ class HighlightCandidatesWidget(QWidget):
         self.output_input.setPlaceholderText(_("Defaults to <video>_highlights"))
         output_browse = QPushButton(_("Browse"), self)
         output_browse.clicked.connect(self._choose_output)
-        form.addRow(_("Output folder"), self._with_button(self.output_input, output_browse))
+        self.output_container = self._with_button(self.output_input, output_browse)
 
+        # Keep legacy tuning fields available to callers, but keep the main
+        # workflow focused on source, optional subtitles, and reel duration.
         self.window_seconds = self._double_spin(20.0, 1.0, 300.0)
-        form.addRow(_("Window (seconds)"), self.window_seconds)
         self.stride_seconds = self._double_spin(10.0, 0.5, 300.0)
-        form.addRow(_("Stride (seconds)"), self.stride_seconds)
         self.max_candidates = QSpinBox(self)
         self.max_candidates.setRange(1, 2000)
-        self.max_candidates.setValue(200)
-        form.addRow(_("Maximum candidates"), self.max_candidates)
-        self.target_duration = self._double_spin(60.0, 0.0, 3600.0)
-        form.addRow(_("Automatic reel duration (seconds)"), self.target_duration)
-        self.max_auto_clips = QSpinBox(self)
-        self.max_auto_clips.setRange(0, 100)
-        self.max_auto_clips.setValue(6)
-        form.addRow(_("Maximum automatic clips"), self.max_auto_clips)
+        self.max_candidates.setValue(2000)
+        self.target_duration = self._double_spin(0.0, 0.0, 24 * 3600.0)
+        self.target_duration.setSpecialValueText(_("Automatic: one third of source video"))
+        form.addRow(_("Highlight duration (seconds, 0 = automatic)"), self.target_duration)
         layout.addLayout(form)
 
-        self.no_scene_detection = QCheckBox(_("Skip scene detection"), self)
-        self.no_previews = QCheckBox(_("Skip MP4 previews for a faster first pass"), self)
-        self.ignore_static_scenes = QCheckBox(_("Auto-ignore mostly static scenes"), self)
-        self.ignore_static_scenes.setChecked(True)
-        self.auto_edit = QCheckBox(_("Automatically create a highlight reel"), self)
-        self.auto_edit.setChecked(True)
+        self.no_scene_detection = QCheckBox(_("Use only basic video analysis"), self)
+        self.no_scene_detection.setVisible(False)
+        self.no_previews = QCheckBox(_("Do not generate previews"), self)
+        self.no_previews.setVisible(False)
+        self.ignore_static_scenes = True
+        self.auto_edit = True
         layout.addWidget(self.no_scene_detection)
         layout.addWidget(self.no_previews)
-        layout.addWidget(self.ignore_static_scenes)
-        layout.addWidget(self.auto_edit)
 
         actions = QHBoxLayout()
-        self.run_button = QPushButton(_("Generate candidates"), self)
+        self.run_button = QPushButton(_("Generate highlight reel"), self)
         self.run_button.setDefault(True)
         self.run_button.clicked.connect(self.start_generation)
         actions.addWidget(self.run_button)
@@ -216,24 +210,24 @@ class HighlightCandidatesWidget(QWidget):
             video=video,
             output_dir=Path(output_text).expanduser() if output_text else None,
             srt=Path(srt_text).expanduser() if srt_text else None,
-            window_seconds=self.window_seconds.value(),
-            stride_seconds=self.stride_seconds.value(),
+            window_seconds=20.0,
+            stride_seconds=10.0,
             padding_seconds=1.5,
             scene_threshold=0.35,
             max_candidates=self.max_candidates.value(),
             no_scene_detection=self.no_scene_detection.isChecked(),
             no_previews=self.no_previews.isChecked(),
             static_motion_threshold=1.5,
-            auto_edit=self.auto_edit.isChecked(),
+            auto_edit=self.auto_edit,
             target_duration=self.target_duration.value(),
-            max_auto_clips=self.max_auto_clips.value(),
+            max_auto_clips=0,
             score_threshold=0.0,
             gif=False,
             gif_limit=0,
             keep_existing=True,
             open_html=False,
             serve_html=True,
-            keep_static_scenes=not self.ignore_static_scenes.isChecked(),
+            keep_static_scenes=not self.ignore_static_scenes,
             verbose=False,
         )
 
@@ -250,7 +244,7 @@ class HighlightCandidatesWidget(QWidget):
         self.run_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.progress_bar.setValue(0)
-        self.status_label.setText(_("Generating candidates. This may take a while..."))
+        self.status_label.setText(_("Generating highlight reel. This may take a while..."))
 
         self._cancel_event = threading.Event()
         self._thread = QThread(self)
@@ -279,7 +273,7 @@ class HighlightCandidatesWidget(QWidget):
         self.cancel_button.setEnabled(False)
         self.open_button.setEnabled(True)
         self.progress_bar.setValue(self.progress_bar.maximum())
-        self.status_label.setText(_("Candidates are ready: {}" ).format(output_dir))
+        self.status_label.setText(_("Highlight reel is ready: {}" ).format(output_dir))
 
     @pyqtSlot(str)
     def _generation_failed(self, message: str):

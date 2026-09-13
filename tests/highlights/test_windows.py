@@ -1,4 +1,4 @@
-from buzz.highlights.auto_edit import select_auto_candidates
+from buzz.highlights.auto_edit import resolve_target_duration_seconds, select_auto_candidates
 from buzz.highlights.models import Candidate, HighlightConfig, VideoInfo
 from buzz.highlights.windows import (
     apply_motion_scores,
@@ -52,6 +52,13 @@ def test_motion_scores_are_optional_when_analysis_has_no_samples():
     assert all(candidate.status == "unprocessed" for candidate in candidates)
 
 
+def test_auto_duration_defaults_to_one_third_of_source():
+    assert resolve_target_duration_seconds(3_600_000, 0) == 1200
+    assert resolve_target_duration_seconds(7_200_000, 0) == 2400
+    assert resolve_target_duration_seconds(3_600_000, 300) == 300
+    assert resolve_target_duration_seconds(3_600_000, 7200) == 3600
+
+
 def test_auto_selection_respects_budget_and_avoids_overlap():
     candidates = [
         Candidate("long", 0, 20_000, 0, 20_000, score=1.0),
@@ -73,6 +80,16 @@ def test_auto_selection_allows_adjacent_clips():
     ]
     result = select_auto_candidates(candidates, HighlightConfig(target_duration_seconds=10))
     assert [candidate.id for candidate in result.selected] == ["a", "b"]
+
+
+def test_auto_selection_has_no_default_clip_count_limit():
+    candidates = [
+        Candidate(str(index), index * 5_000, (index + 1) * 5_000, index * 5_000, (index + 1) * 5_000, score=0.5)
+        for index in range(4)
+    ]
+    result = select_auto_candidates(candidates, HighlightConfig(target_duration_seconds=20))
+    assert len(result.selected) == 4
+    assert result.total_duration_ms == 20_000
 
 
 def test_auto_selection_skips_ignored_candidates():

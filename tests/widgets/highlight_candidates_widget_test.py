@@ -18,7 +18,7 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     widget = HighlightCandidatesWidget()
     qtbot.add_widget(widget)
     assert widget.windowTitle() == ""
-    assert widget.run_button.text() == "生成候选"
+    assert widget.run_button.text() == "生成高光合集"
     assert widget.open_button.text() == "打开结果"
     assert widget.video_input.placeholderText() == "请选择视频文件"
     video = tmp_path / "video file.mp4"
@@ -26,9 +26,7 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     widget.video_input.setText(str(video))
     widget.srt_input.setText(str(tmp_path / "captions.srt"))
     widget.output_input.setText(str(tmp_path / "results"))
-    widget.window_seconds.setValue(30)
-    widget.stride_seconds.setValue(15)
-    widget.max_candidates.setValue(50)
+    widget.target_duration.setValue(300)
     widget.no_scene_detection.setChecked(True)
     widget.no_previews.setChecked(True)
 
@@ -36,9 +34,11 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert args.video == Path(video)
     assert args.srt == tmp_path / "captions.srt"
     assert args.output_dir == tmp_path / "results"
-    assert args.window_seconds == 30
-    assert args.stride_seconds == 15
-    assert args.max_candidates == 50
+    assert args.window_seconds == 20.0
+    assert args.stride_seconds == 10.0
+    assert args.max_candidates == 2000
+    assert args.target_duration == 300
+    assert args.max_auto_clips == 0
     assert args.no_scene_detection is True
     assert args.no_previews is True
     assert args.keep_static_scenes is False
