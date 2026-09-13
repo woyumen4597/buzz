@@ -25,7 +25,7 @@ from .media import (
 )
 from .models import HighlightConfig
 from .subtitles import associate_subtitles, parse_srt_file
-from .windows import generate_candidates, scan_motion, scan_scene_changes
+from .windows import generate_candidates, scan_audio_activity, scan_motion, scan_scene_changes
 
 LOG = logging.getLogger(__name__)
 
@@ -123,6 +123,7 @@ def run(
     errors: list[str] = []
     scene_points: list[int] | None = None
     motion_samples: list[tuple[int, float]] = []
+    audio_samples: list[tuple[int, float]] = []
     scene_enabled = not config.no_scene_detection
     if not config.no_scene_detection:
         try:
@@ -138,8 +139,15 @@ def run(
         warning = f"motion analysis failed; using base scores: {exc}"
         warnings.append(warning)
         LOG.warning(warning)
+    if video.audio_codec:
+        try:
+            audio_samples = scan_audio_activity(ffmpeg, str(video_path))
+        except Exception as exc:
+            warning = f"audio activity analysis failed; using visual scores: {exc}"
+            warnings.append(warning)
+            LOG.warning(warning)
 
-    candidates = generate_candidates(video, config, scene_points, motion_samples)
+    candidates = generate_candidates(video, config, scene_points, motion_samples, audio_samples)
     checkpoint = load_checkpoint(output_dir) if config.keep_existing else None
     if checkpoint:
         checkpoint_input = checkpoint.get("input", {})

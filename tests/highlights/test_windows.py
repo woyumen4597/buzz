@@ -2,6 +2,8 @@ from buzz.highlights.auto_edit import resolve_target_duration_seconds, select_au
 from buzz.highlights.models import Candidate, HighlightConfig, VideoInfo
 from buzz.highlights.windows import (
     apply_motion_scores,
+    audio_activity_command,
+    parse_audio_samples,
     combine_candidates,
     fixed_window_candidates,
     generate_candidates,
@@ -40,6 +42,30 @@ def test_scene_parser_deduplicates():
 def test_motion_parser_reads_metadata_samples():
     output = """frame:0 pts_time:1\n[Parsed_metadata] lavfi.signalstats.YAVG=0.5\nframe:1 pts_time:2\n[Parsed_metadata] lavfi.signalstats.YAVG=8.0\n"""
     assert parse_motion_samples(output) == [(1000, 0.5), (2000, 8.0)]
+
+
+def test_audio_activity_command_analyzes_audio_only():
+    command = audio_activity_command("ffmpeg", "input.mp4")
+    assert "-vn" in command
+    assert "astats=metadata=1:reset=1" in command[command.index("-af") + 1]
+
+
+def test_audio_parser_reads_rms_samples():
+    output = """pts_time:1\n[Parsed_ametadata] lavfi.astats.Overall.RMS_level=-42.0\npts_time:2\n[Parsed_ametadata] lavfi.astats.Overall.RMS_level=-12.0\n"""
+    assert parse_audio_samples(output) == [(1000, -42.0), (2000, -12.0)]
+
+
+def test_audio_activity_raises_score_for_loud_window():
+    config = HighlightConfig(ignore_static_scenes=False)
+    quiet = Candidate("quiet", 0, 5_000, 0, 5_000)
+    loud = Candidate("loud", 5_000, 10_000, 5_000, 10_000)
+    apply_motion_scores(
+        [quiet, loud],
+        [],
+        config,
+        audio_samples=[(0, -45.0), (5_000, -10.0)],
+    )
+    assert loud.score > quiet.score
 
 
 def test_motion_scores_rescue_brief_high_peak():

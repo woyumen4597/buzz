@@ -70,10 +70,11 @@ def score_candidate(
         )
     else:
         value = (
-            0.40 * scene_signal
-            + 0.25 * transcript_density_signal
+            0.30 * scene_signal
+            + 0.20 * transcript_density_signal
             + 0.20 * motion_signal
-            + 0.15 * duration_quality_signal
+            + 0.20 * audio_activity_signal
+            + 0.10 * duration_quality_signal
         )
     return max(0.0, min(1.0, value))
 
@@ -180,6 +181,53 @@ def scan_motion(
     return parse_motion_samples(process.stderr + "\\n" + process.stdout)
 
 
+def audio_activity_command(ffmpeg: str, video_path: str) -> list[str]:
+    """Build a one-second RMS loudness scan for speech/music activity."""
+    filter_expr = (
+        "aresample=16000,asetnsamples=n=16000:p=1,"
+        "astats=metadata=1:reset=1,"
+        "ametadata=print:key=lavfi.astats.Overall.RMS_level"
+    )
+    return [
+        ffmpeg, "-hide_banner", "-nostats", "-i", video_path,
+        "-vn", "-af", filter_expr, "-f", "null", "-",
+    ]
+
+
+def parse_audio_samples(output: str) -> list[tuple[int, float]]:
+    """Parse FFmpeg RMS dB samples into ``(timestamp_ms, loudness_db)``."""
+    samples: list[tuple[int, float]] = []
+    timestamp: int | None = None
+    for line in output.splitlines():
+        pts_match = re.search(r"pts_time[:=]\s*(-?\d+(?:\.\d+)?)", line)
+        if pts_match:
+            try:
+                timestamp = round(float(pts_match.group(1)) * 1000)
+            except ValueError:
+                timestamp = None
+        value_match = re.search(
+            r"(?:lavfi\.astats\.Overall\.RMS_level|RMS_level)=(-?\d+(?:\.\d+)?)",
+            line,
+        )
+        if value_match and timestamp is not None:
+            try:
+                samples.append((timestamp, float(value_match.group(1))))
+            except ValueError:
+                pass
+            timestamp = None
+    return samples
+
+
+def scan_audio_activity(
+    ffmpeg: str, video_path: str, timeout: float | None = None
+) -> list[tuple[int, float]]:
+    process = subprocess.run(
+        audio_activity_command(ffmpeg, video_path),
+        capture_output=True, text=True, check=True, timeout=timeout,
+    )
+    return parse_audio_samples(process.stderr + "\\n" + process.stdout)
+
+
 def scene_detection_command(
     ffmpeg: str, video_path: str, threshold: float = 0.35
 ) -> list[str]:
@@ -282,13 +330,23 @@ def apply_motion_scores(
     candidates: Iterable[Candidate],
     motion_samples: Sequence[tuple[int, float]],
     config: HighlightConfig,
+    audio_samples: Sequence[tuple[int, float]] | None = None,
 ) -> list[Candidate]:
-    """Score candidates from sampled frame differences and flag static windows."""
+    """Score candidates from visual motion and optional audio activity."""
     samples = sorted(motion_samples)
+    audio = sorted(audio_samples or [])
+    audio_values = sorted(value for _, value in audio)
+    audio_floor = audio_values[max(0, len(audio_values) // 10 - 1)] if audio_values else -60.0
+    audio_ceiling = audio_values[-1] if audio_values else audio_floor
+    audio_range = max(12.0, audio_ceiling - audio_floor)
     for candidate in candidates:
         values = [value for timestamp, value in samples if candidate.start_ms <= timestamp < candidate.end_ms]
         average = sum(values) / len(values) if values else 0.0
         peak = max(values, default=0.0)
+        loudness = [value for timestamp, value in audio if candidate.start_ms <= timestamp < candidate.end_ms]
+        audio_average = sum(loudness) / len(loudness) if loudness else audio_floor
+        audio_peak = max(loudness, default=audio_floor)
+        audio_signal = max(0.0, min(1.0, (0.65 * audio_average + 0.35 * audio_peak - audio_floor) / audio_range))
         sorted_values = sorted(values)
         upper_quartile = sorted_values[(len(sorted_values) - 1) * 3 // 4] if sorted_values else 0.0
         # Average motion is stable but can dilute a short reaction. Blend in
@@ -301,6 +359,7 @@ def apply_motion_scores(
         candidate.score = score_candidate(
             scene_signal=1.0 if "scene_change" in candidate.reasons else 0.0,
             duration_quality_signal=duration_quality(candidate.duration_ms, config),
+            audio_activity_signal=audio_signal,
             motion_signal=motion_score,
         )
         if "short_window" in candidate.reasons:
@@ -321,6 +380,7 @@ def generate_candidates(
     config: HighlightConfig | None = None,
     scene_changes_ms: Sequence[int] | None = None,
     motion_samples: Sequence[tuple[int, float]] | None = None,
+    audio_samples: Sequence[tuple[int, float]] | None = None,
 ) -> list[Candidate]:
     config = config or HighlightConfig()
     candidates = fixed_window_candidates(video, config)
@@ -343,6 +403,6 @@ def generate_candidates(
         )
     if not config.no_scene_detection and scene_changes_ms is not None:
         candidates.extend(scene_candidates(video, scene_changes_ms, config))
-    if motion_samples:
-        apply_motion_scores(candidates, motion_samples, config)
+    if motion_samples or audio_samples:
+        apply_motion_scores(candidates, motion_samples or [], config, audio_samples=audio_samples)
     return combine_candidates(candidates, video, config)
