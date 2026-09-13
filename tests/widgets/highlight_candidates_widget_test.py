@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from PyQt6.QtWidgets import QCheckBox, QSpinBox, QWidget
+
 from buzz.widgets.highlight_candidates_widget import HighlightCandidatesWidget
 from buzz.widgets.main_window import MainWindow
 
@@ -21,26 +23,28 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert widget.run_button.text() == "生成高光合集"
     assert widget.open_button.text() == "打开结果"
     assert widget.video_input.placeholderText() == "请选择视频文件"
+    assert widget.findChildren(QSpinBox) == []
+    assert widget.findChildren(QCheckBox) == []
+    form_container = widget.findChild(QWidget, "HighlightFormContainer")
+    assert form_container is not None
+    assert form_container.maximumWidth() == 820
     video = tmp_path / "video file.mp4"
     video.write_bytes(b"video")
     widget.video_input.setText(str(video))
     widget.srt_input.setText(str(tmp_path / "captions.srt"))
-    widget.output_input.setText(str(tmp_path / "results"))
     widget.target_duration.setValue(300)
-    widget.no_scene_detection.setChecked(True)
-    widget.no_previews.setChecked(True)
 
     args = widget._build_args()
     assert args.video == Path(video)
     assert args.srt == tmp_path / "captions.srt"
-    assert args.output_dir == tmp_path / "results"
+    assert args.output_dir is None
     assert args.window_seconds == 20.0
     assert args.stride_seconds == 10.0
-    assert args.max_candidates == 2000
+    assert args.max_candidates == 0
     assert args.target_duration == 300
     assert args.max_auto_clips == 0
-    assert args.no_scene_detection is True
-    assert args.no_previews is True
+    assert args.no_scene_detection is False
+    assert args.no_previews is False
     assert args.keep_static_scenes is False
 
 

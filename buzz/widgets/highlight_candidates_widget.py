@@ -8,11 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
-from PyQt6.QtCore import QObject, QThread, QUrl, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QThread, QUrl, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QFileDialog,
-    QCheckBox,
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
@@ -20,7 +19,6 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QProgressBar,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -72,6 +70,7 @@ class HighlightCandidatesWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 28)
         layout.setSpacing(16)
+        layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
         eyebrow = QLabel(_("BUZZ / VIDEO WORKSPACE"))
         eyebrow.setObjectName("Eyebrow")
@@ -91,6 +90,9 @@ class HighlightCandidatesWidget(QWidget):
         form = QFormLayout()
         form.setHorizontalSpacing(14)
         form.setVerticalSpacing(12)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.FieldsStayAtSizeHint)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        form.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
         self.video_input = QLineEdit(self)
         self.video_input.setObjectName("HighlightVideoInput")
@@ -106,33 +108,24 @@ class HighlightCandidatesWidget(QWidget):
         srt_browse.clicked.connect(self._choose_srt)
         form.addRow(_("Transcript (SRT)"), self._with_button(self.srt_input, srt_browse))
 
-        self.output_input = QLineEdit(self)
-        self.output_input.setObjectName("HighlightOutputInput")
-        self.output_input.setPlaceholderText(_("Defaults to <video>_highlights"))
-        output_browse = QPushButton(_("Browse"), self)
-        output_browse.clicked.connect(self._choose_output)
-        self.output_container = self._with_button(self.output_input, output_browse)
-
-        # Keep legacy tuning fields available to callers, but keep the main
-        # workflow focused on source, optional subtitles, and reel duration.
-        self.window_seconds = self._double_spin(20.0, 1.0, 300.0)
-        self.stride_seconds = self._double_spin(10.0, 0.5, 300.0)
-        self.max_candidates = QSpinBox(self)
-        self.max_candidates.setRange(1, 2000)
-        self.max_candidates.setValue(2000)
+        # Output location and candidate tuning are intentionally internal in
+        # one-click mode; the default is <video>_highlights.
+        self._window_seconds = 20.0
+        self._stride_seconds = 10.0
+        self._max_candidates = 0
         self.target_duration = self._double_spin(0.0, 0.0, 24 * 3600.0)
         self.target_duration.setSpecialValueText(_("Automatic: one third of source video"))
         form.addRow(_("Highlight duration (seconds, 0 = automatic)"), self.target_duration)
-        layout.addLayout(form)
+        form_container = QWidget(self)
+        form_container.setObjectName("HighlightFormContainer")
+        form_container.setMaximumWidth(820)
+        form_container.setLayout(form)
+        layout.addWidget(form_container, 0, Qt.AlignmentFlag.AlignLeft)
 
-        self.no_scene_detection = QCheckBox(_("Use only basic video analysis"), self)
-        self.no_scene_detection.setVisible(False)
-        self.no_previews = QCheckBox(_("Do not generate previews"), self)
-        self.no_previews.setVisible(False)
+        self.no_scene_detection = False
+        self.no_previews = False
         self.ignore_static_scenes = True
         self.auto_edit = True
-        layout.addWidget(self.no_scene_detection)
-        layout.addWidget(self.no_previews)
 
         actions = QHBoxLayout()
         self.run_button = QPushButton(_("Generate highlight reel"), self)
@@ -197,26 +190,20 @@ class HighlightCandidatesWidget(QWidget):
         if path:
             self.srt_input.setText(path)
 
-    def _choose_output(self):
-        path = QFileDialog.getExistingDirectory(self, _("Choose output folder"))
-        if path:
-            self.output_input.setText(path)
-
     def _build_args(self) -> argparse.Namespace:
         video = Path(self.video_input.text().strip()).expanduser()
         srt_text = self.srt_input.text().strip()
-        output_text = self.output_input.text().strip()
         return SimpleNamespace(
             video=video,
-            output_dir=Path(output_text).expanduser() if output_text else None,
+            output_dir=None,
             srt=Path(srt_text).expanduser() if srt_text else None,
-            window_seconds=20.0,
-            stride_seconds=10.0,
+            window_seconds=self._window_seconds,
+            stride_seconds=self._stride_seconds,
             padding_seconds=1.5,
             scene_threshold=0.35,
-            max_candidates=self.max_candidates.value(),
-            no_scene_detection=self.no_scene_detection.isChecked(),
-            no_previews=self.no_previews.isChecked(),
+            max_candidates=self._max_candidates,
+            no_scene_detection=self.no_scene_detection,
+            no_previews=self.no_previews,
             static_motion_threshold=1.5,
             auto_edit=self.auto_edit,
             target_duration=self.target_duration.value(),
@@ -227,7 +214,7 @@ class HighlightCandidatesWidget(QWidget):
             keep_existing=True,
             open_html=False,
             serve_html=True,
-            keep_static_scenes=not self.ignore_static_scenes,
+            keep_static_scenes=False,
             verbose=False,
         )
 
