@@ -107,6 +107,27 @@ def test_auto_duration_uses_source_ratio():
     assert resolve_target_duration_seconds(3_600_000, configured_ratio=0.3, configured_seconds=300) == 300
 
 
+def test_auto_selection_handles_many_candidates_without_recursion():
+    candidates = [
+        Candidate(
+            str(index),
+            index * 5_000,
+            (index + 1) * 5_000,
+            index * 5_000,
+            (index + 1) * 5_000,
+            score=0.5,
+        )
+        for index in range(1_500)
+    ]
+    result = select_auto_candidates(
+        candidates,
+        HighlightConfig(target_duration_ratio=0.01),
+        source_duration_ms=1_500 * 5_000,
+    )
+    assert result.selected
+    assert result.total_duration_ms <= result.budget_ms
+
+
 def test_auto_selection_uses_full_source_duration_for_ratio():
     candidates = [Candidate("early", 0, 10_000, 0, 10_000, score=1.0)]
     result = select_auto_candidates(

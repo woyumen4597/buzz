@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import Iterable
 
 from .models import Candidate, HighlightConfig, interval_iou
 
 
-ALGORITHM_VERSION = "weighted-interval-budget-v3"
+ALGORITHM_VERSION = "weighted-interval-budget-v4"
 _BUDGET_QUANTUM_MS = 1000
 
 
@@ -130,47 +129,95 @@ def select_auto_candidates(
             previous[3] + (candidate_index,),
         )
 
+    # Evaluate the recurrence with an explicit stack rather than recursive
+    # lru_cache calls. Long videos can produce thousands of windows, and the
+    # recursive form can overflow a QThread's native stack on macOS.
+    State = tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]
     if config.max_auto_clips:
-        @lru_cache(maxsize=None)
-        def solve(
-            count: int, remaining_units: int, remaining_clips: int
-        ) -> tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]:
+        memo: dict[tuple[int, int, int], State] = {}
+        pending: list[tuple[int, int, int, bool]] = [
+            (len(ordered), budget_units, max_clips, False)
+        ]
+        while pending:
+            count, remaining_units, remaining_clips, expanded = pending.pop()
+            key = (count, remaining_units, remaining_clips)
+            if key in memo:
+                continue
             if count <= 0 or remaining_units <= 0 or remaining_clips <= 0:
-                return zero_state
+                memo[key] = zero_state
+                continue
+
             candidate_index = count - 1
             candidate = ordered[candidate_index]
-            best = solve(count - 1, remaining_units, remaining_clips)
-            duration_units = (candidate.duration_ms + _BUDGET_QUANTUM_MS - 1) // _BUDGET_QUANTUM_MS
+            duration_units = (
+                candidate.duration_ms + _BUDGET_QUANTUM_MS - 1
+            ) // _BUDGET_QUANTUM_MS
+            dependencies = [(count - 1, remaining_units, remaining_clips)]
             if duration_units <= remaining_units:
-                previous = solve(
-                    predecessors[candidate_index] + 1,
-                    remaining_units - duration_units,
-                    remaining_clips - 1,
+                dependencies.append(
+                    (
+                        predecessors[candidate_index] + 1,
+                        remaining_units - duration_units,
+                        remaining_clips - 1,
+                    )
                 )
-                best = _better(take_or_skip(candidate_index, previous), best)
-            return best
+            if not expanded:
+                pending.append((count, remaining_units, remaining_clips, True))
+                pending.extend(
+                    (*dependency, False)
+                    for dependency in dependencies
+                    if dependency not in memo
+                )
+                continue
 
-        best = solve(len(ordered), budget_units, max_clips)
+            best = memo[dependencies[0]]
+            if len(dependencies) == 2:
+                best = _better(
+                    take_or_skip(candidate_index, memo[dependencies[1]]), best
+                )
+            memo[key] = best
+        best = memo[(len(ordered), budget_units, max_clips)]
     else:
-        @lru_cache(maxsize=None)
-        def solve_unlimited(
-            count: int, remaining_units: int
-        ) -> tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]:
+        memo: dict[tuple[int, int], State] = {}
+        pending: list[tuple[int, int, bool]] = [(len(ordered), budget_units, False)]
+        while pending:
+            count, remaining_units, expanded = pending.pop()
+            key = (count, remaining_units)
+            if key in memo:
+                continue
             if count <= 0 or remaining_units <= 0:
-                return zero_state
+                memo[key] = zero_state
+                continue
+
             candidate_index = count - 1
             candidate = ordered[candidate_index]
-            best = solve_unlimited(count - 1, remaining_units)
-            duration_units = (candidate.duration_ms + _BUDGET_QUANTUM_MS - 1) // _BUDGET_QUANTUM_MS
+            duration_units = (
+                candidate.duration_ms + _BUDGET_QUANTUM_MS - 1
+            ) // _BUDGET_QUANTUM_MS
+            dependencies = [(count - 1, remaining_units)]
             if duration_units <= remaining_units:
-                previous = solve_unlimited(
-                    predecessors[candidate_index] + 1,
-                    remaining_units - duration_units,
+                dependencies.append(
+                    (
+                        predecessors[candidate_index] + 1,
+                        remaining_units - duration_units,
+                    )
                 )
-                best = _better(take_or_skip(candidate_index, previous), best)
-            return best
+            if not expanded:
+                pending.append((count, remaining_units, True))
+                pending.extend(
+                    (*dependency, False)
+                    for dependency in dependencies
+                    if dependency not in memo
+                )
+                continue
 
-        best = solve_unlimited(len(ordered), budget_units)
+            best = memo[dependencies[0]]
+            if len(dependencies) == 2:
+                best = _better(
+                    take_or_skip(candidate_index, memo[dependencies[1]]), best
+                )
+            memo[key] = best
+        best = memo[(len(ordered), budget_units)]
     chosen = [ordered[index] for index in best[3]]
     chosen.sort(key=_candidate_key)
     chosen_objects = {id(candidate) for candidate in chosen}
