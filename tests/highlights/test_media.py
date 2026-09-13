@@ -66,6 +66,7 @@ def test_concat_command_uses_concat_demuxer():
     command = concat_command("ffmpeg", "/tmp/concat list.txt", "/tmp/highlights.mp4")
     assert command == [
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "/tmp/concat list.txt",
+        "-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s?",
         "-c", "copy", "-movflags", "+faststart", "/tmp/highlights.mp4",
     ]
 

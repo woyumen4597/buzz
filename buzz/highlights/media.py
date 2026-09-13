@@ -176,6 +176,7 @@ def clip_command(
 def concat_command(ffmpeg: str, concat_file: str, output_path: str) -> list[str]:
     return [
         ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
+        "-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s?",
         "-c", "copy", "-movflags", "+faststart", output_path,
     ]
 
