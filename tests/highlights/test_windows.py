@@ -52,11 +52,26 @@ def test_motion_scores_are_optional_when_analysis_has_no_samples():
     assert all(candidate.status == "unprocessed" for candidate in candidates)
 
 
-def test_auto_duration_defaults_to_one_third_of_source():
-    assert resolve_target_duration_seconds(3_600_000, 0) == 1200
-    assert resolve_target_duration_seconds(7_200_000, 0) == 2400
-    assert resolve_target_duration_seconds(3_600_000, 300) == 300
-    assert resolve_target_duration_seconds(3_600_000, 7200) == 3600
+def test_auto_duration_uses_source_ratio():
+    assert resolve_target_duration_seconds(3_600_000) == 1080
+    assert resolve_target_duration_seconds(7_200_000) == 2160
+    assert resolve_target_duration_seconds(3_600_000, configured_ratio=0.5) == 1800
+    assert resolve_target_duration_seconds(3_600_000, 0.5) == 0.5
+    assert resolve_target_duration_seconds(3_600_000, 1.5) == 1.5
+    assert resolve_target_duration_seconds(3_600_000, configured_seconds=300) == 300
+    assert resolve_target_duration_seconds(3_600_000, configured_seconds=0) == 1080
+    assert resolve_target_duration_seconds(3_600_000, configured_ratio=0.3, configured_seconds=300) == 300
+
+
+def test_auto_selection_uses_full_source_duration_for_ratio():
+    candidates = [Candidate("early", 0, 10_000, 0, 10_000, score=1.0)]
+    result = select_auto_candidates(
+        candidates,
+        HighlightConfig(target_duration_ratio=0.5),
+        source_duration_ms=100_000,
+    )
+    assert result.total_duration_ms == 50_000
+    assert result.budget_ms == 10_000
 
 
 def test_auto_selection_respects_budget_and_avoids_overlap():
@@ -67,7 +82,7 @@ def test_auto_selection_respects_budget_and_avoids_overlap():
     ]
     result = select_auto_candidates(
         candidates,
-        HighlightConfig(target_duration_seconds=10, max_auto_clips=2),
+        HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=10, max_auto_clips=2),
     )
     assert [candidate.id for candidate in result.selected] == ["short-a", "short-b"]
     assert result.total_duration_ms == 10_000
@@ -78,7 +93,7 @@ def test_auto_selection_allows_adjacent_clips():
         Candidate("a", 0, 5_000, 0, 5_000, score=0.5),
         Candidate("b", 5_000, 10_000, 5_000, 10_000, score=0.5),
     ]
-    result = select_auto_candidates(candidates, HighlightConfig(target_duration_seconds=10))
+    result = select_auto_candidates(candidates, HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=10))
     assert [candidate.id for candidate in result.selected] == ["a", "b"]
 
 
@@ -87,14 +102,14 @@ def test_auto_selection_has_no_default_clip_count_limit():
         Candidate(str(index), index * 5_000, (index + 1) * 5_000, index * 5_000, (index + 1) * 5_000, score=0.5)
         for index in range(4)
     ]
-    result = select_auto_candidates(candidates, HighlightConfig(target_duration_seconds=20))
+    result = select_auto_candidates(candidates, HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=20))
     assert len(result.selected) == 4
     assert result.total_duration_ms == 20_000
 
 
 def test_auto_selection_skips_ignored_candidates():
     candidates = [Candidate("ignored", 0, 5_000, 0, 5_000, score=1.0, status="ignore")]
-    result = select_auto_candidates(candidates, HighlightConfig(target_duration_seconds=10))
+    result = select_auto_candidates(candidates, HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=10))
     assert result.selected == []
 
 

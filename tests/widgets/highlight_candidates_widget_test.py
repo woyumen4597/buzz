@@ -23,6 +23,9 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert widget.run_button.text() == "生成高光合集"
     assert widget.open_button.text() == "打开结果"
     assert widget.video_input.placeholderText() == "请选择视频文件"
+    assert widget.target_ratio.value() == 0.3
+    assert widget.target_ratio.minimum() == 0.0
+    assert widget.target_ratio.maximum() == 1.0
     assert widget.findChildren(QSpinBox) == []
     assert widget.findChildren(QCheckBox) == []
     form_container = widget.findChild(QWidget, "HighlightFormContainer")
@@ -32,7 +35,7 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     video.write_bytes(b"video")
     widget.video_input.setText(str(video))
     widget.srt_input.setText(str(tmp_path / "captions.srt"))
-    widget.target_duration.setValue(300)
+    widget.target_ratio.setValue(0.5)
 
     args = widget._build_args()
     assert args.video == Path(video)
@@ -41,7 +44,7 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert args.window_seconds == 20.0
     assert args.stride_seconds == 10.0
     assert args.max_candidates == 0
-    assert args.target_duration == 300
+    assert args.target_ratio == 0.5
     assert args.max_auto_clips == 0
     assert args.no_scene_detection is False
     assert args.no_previews is False

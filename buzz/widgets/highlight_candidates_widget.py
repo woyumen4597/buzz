@@ -81,7 +81,7 @@ class HighlightCandidatesWidget(QWidget):
         layout.addWidget(title)
 
         subtitle = QLabel(
-            _("Choose a video and generate a highlight reel automatically. The default reel length is one third of the source video.")
+            _("Choose a video and generate a highlight reel automatically. The default reel length is 0.3 of the source video.")
         )
         subtitle.setWordWrap(True)
         subtitle.setObjectName("PageSubtitle")
@@ -109,13 +109,14 @@ class HighlightCandidatesWidget(QWidget):
         form.addRow(_("Transcript (SRT)"), self._with_button(self.srt_input, srt_browse))
 
         # Output location and candidate tuning are intentionally internal in
-        # one-click mode; the default is <video>_highlights.
+        # one-click mode; the final reel is written beside the source video.
         self._window_seconds = 20.0
         self._stride_seconds = 10.0
         self._max_candidates = 0
-        self.target_duration = self._double_spin(0.0, 0.0, 24 * 3600.0)
-        self.target_duration.setSpecialValueText(_("Automatic: one third of source video"))
-        form.addRow(_("Highlight duration (seconds, 0 = automatic)"), self.target_duration)
+        self.target_ratio = self._double_spin(0.3, 0.0, 1.0)
+        self.target_ratio.setSingleStep(0.05)
+        self.target_ratio.setDecimals(2)
+        form.addRow(_("Highlight proportion of source (0-1)"), self.target_ratio)
         form_container = QWidget(self)
         form_container.setObjectName("HighlightFormContainer")
         form_container.setMaximumWidth(820)
@@ -206,7 +207,7 @@ class HighlightCandidatesWidget(QWidget):
             no_previews=self.no_previews,
             static_motion_threshold=1.5,
             auto_edit=self.auto_edit,
-            target_duration=self.target_duration.value(),
+            target_ratio=self.target_ratio.value(),
             max_auto_clips=0,
             score_threshold=0.0,
             gif=False,

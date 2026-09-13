@@ -75,9 +75,11 @@ class HighlightConfig:
     ignore_static_scenes: bool = True
     static_motion_threshold: float = 1.5
     auto_edit: bool = False
+    # Kept in its original position for positional-config compatibility.
     target_duration_seconds: float = 0.0
     max_auto_clips: int = 0
     score_threshold: float = 0.0
+    target_duration_ratio: float = 0.3
 
     def __post_init__(self) -> None:
         numeric = (
@@ -89,7 +91,8 @@ class HighlightConfig:
             self.scene_threshold,
             self.min_scene_duration_seconds,
             self.static_motion_threshold,
-            self.target_duration_seconds,
+            self.target_duration_ratio,
+            *( [self.target_duration_seconds] if self.target_duration_seconds is not None else [] ),
             self.score_threshold,
         )
         if any(not math.isfinite(value) or value < 0 for value in numeric):
@@ -106,6 +109,10 @@ class HighlightConfig:
             raise ValueError("static_motion_threshold must be <= 255")
         if not 0 <= self.score_threshold <= 1:
             raise ValueError("score_threshold must be between 0 and 1")
+        if not 0 <= self.target_duration_ratio <= 1:
+            raise ValueError("target_duration_ratio must be between 0 and 1")
+        if self.target_duration_seconds is not None and self.target_duration_seconds < 0:
+            raise ValueError("target_duration_seconds must be non-negative")
         if self.max_auto_clips < 0:
             raise ValueError("max_auto_clips must be non-negative")
 

@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 from buzz.highlights.exporter import load_checkpoint, write_checkpoint
 from buzz.highlights.models import Candidate, HighlightConfig, VideoInfo
 

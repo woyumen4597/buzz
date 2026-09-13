@@ -36,16 +36,29 @@ def _better(
     return left if left[2] < right[2] else right
 
 
-def resolve_target_duration_seconds(video_duration_ms: int, configured_seconds: float) -> float:
-    """Return the requested reel duration, defaulting to one third of source."""
-    if configured_seconds > 0:
-        return min(configured_seconds, max(0, video_duration_ms / 1000))
-    return max(0.0, video_duration_ms / 1000 / 3)
+def resolve_target_duration_seconds(
+    video_duration_ms: int,
+    configured_seconds: float | None = None,
+    *,
+    configured_ratio: float | None = None,
+) -> float:
+    """Resolve the target, preserving the old seconds API and adding ratios."""
+    source_seconds = max(0.0, video_duration_ms / 1000)
+    if configured_ratio is None:
+        # Legacy positional/keyword calls use seconds; zero means automatic.
+        if configured_seconds is not None and configured_seconds > 0:
+            return min(configured_seconds, source_seconds)
+        return source_seconds * 0.3
+    if configured_seconds is not None and configured_seconds > 0:
+        return min(configured_seconds, source_seconds)
+    ratio = max(0.0, min(1.0, configured_ratio))
+    return min(source_seconds, source_seconds * ratio)
 
 
 def select_auto_candidates(
     candidates: Iterable[Candidate],
     config: HighlightConfig,
+    source_duration_ms: int | None = None,
 ) -> AutoSelection:
     """Select a deterministic, non-overlapping reel within a time budget.
 
@@ -55,8 +68,12 @@ def select_auto_candidates(
     shorter, higher-value clips.
     """
     all_candidates = list(candidates)
-    source_duration_ms = max((candidate.end_ms for candidate in all_candidates), default=0)
-    target_seconds = resolve_target_duration_seconds(source_duration_ms, config.target_duration_seconds)
+    source_duration_ms = source_duration_ms or max((candidate.end_ms for candidate in all_candidates), default=0)
+    target_seconds = resolve_target_duration_seconds(
+        source_duration_ms,
+        config.target_duration_seconds,
+        configured_ratio=config.target_duration_ratio,
+    )
     budget_ms = round(target_seconds * 1000)
     for candidate in all_candidates:
         candidate.selected = False
@@ -164,13 +181,25 @@ def select_auto_candidates(
     return AutoSelection(chosen, best[1], budget_ms)
 
 
-def selection_summary(candidates: Iterable[Candidate], config: HighlightConfig) -> dict[str, object]:
+def selection_summary(
+    candidates: Iterable[Candidate],
+    config: HighlightConfig,
+    source_duration_ms: int | None = None,
+) -> dict[str, object]:
     """Return a serializable explanation of the automatic selection."""
     all_candidates = list(candidates)
     selected = sorted((candidate for candidate in all_candidates if candidate.selected), key=_candidate_key)
     return {
         "algorithm": ALGORITHM_VERSION,
-        "target_duration_ms": round(config.target_duration_seconds * 1000),
+        "target_duration_ratio": config.target_duration_ratio,
+        "target_duration_ms": round(
+            resolve_target_duration_seconds(
+                source_duration_ms or max((candidate.end_ms for candidate in all_candidates), default=0),
+                config.target_duration_seconds,
+                configured_ratio=config.target_duration_ratio,
+            )
+            * 1000
+        ),
         "selected_count": len(selected),
         "selected_duration_ms": sum(candidate.duration_ms for candidate in selected),
         "candidate_count": len(all_candidates),

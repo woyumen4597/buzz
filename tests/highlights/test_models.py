@@ -12,6 +12,10 @@ def test_timestamp_formatting():
 
 def test_config_validation():
     assert HighlightConfig().max_candidates == 200
+    assert HighlightConfig().target_duration_ratio == 0.3
+    with pytest.raises(ValueError):
+        HighlightConfig(target_duration_ratio=1.1)
+    assert HighlightConfig(target_duration_seconds=300).target_duration_seconds == 300
     with pytest.raises(ValueError):
         HighlightConfig(scene_threshold=1.1)
     with pytest.raises(ValueError):

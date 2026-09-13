@@ -30,6 +30,13 @@ from .windows import generate_candidates, scan_motion, scan_scene_changes
 LOG = logging.getLogger(__name__)
 
 
+def _ratio(value: str) -> float:
+    parsed = float(value)
+    if not 0 <= parsed <= 1:
+        raise argparse.ArgumentTypeError("target ratio must be between 0 and 1")
+    return parsed
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="buzz-highlights",
@@ -47,7 +54,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-previews", action="store_true")
     parser.add_argument("--keep-static-scenes", action="store_true", help="do not auto-ignore low-motion candidates")
     parser.add_argument("--auto-edit", action="store_true", help="automatically select and render a highlight reel")
-    parser.add_argument("--target-duration", type=float, default=0.0, help="target reel duration in seconds; 0 uses one third of the source")
+    parser.add_argument("--target-ratio", type=_ratio, default=0.3, help="target reel duration as a fraction of the source, from 0 to 1")
+    parser.add_argument("--target-duration", type=float, dest="target_duration", help=argparse.SUPPRESS)
     parser.add_argument("--max-auto-clips", type=int, default=0, help="maximum clips in an automatic reel; 0 means unlimited")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="minimum automatic selection score")
     parser.add_argument("--gif", action="store_true")
@@ -72,7 +80,8 @@ def _config(args: argparse.Namespace) -> HighlightConfig:
         keep_existing=args.keep_existing,
         ignore_static_scenes=not getattr(args, "keep_static_scenes", False),
         auto_edit=getattr(args, "auto_edit", False),
-        target_duration_seconds=getattr(args, "target_duration", 0.0),
+        target_duration_ratio=getattr(args, "target_ratio", 0.3),
+        target_duration_seconds=getattr(args, "target_duration", None),
         max_auto_clips=getattr(args, "max_auto_clips", 0),
         score_threshold=getattr(args, "score_threshold", 0.0),
     )
@@ -105,7 +114,9 @@ def run(
     config = _config(args)
     if config.auto_edit:
         config.target_duration_seconds = resolve_target_duration_seconds(
-            video.duration_ms, config.target_duration_seconds
+            video.duration_ms,
+            config.target_duration_seconds,
+            configured_ratio=config.target_duration_ratio,
         )
         config.max_candidates = 0
     warnings: list[str] = []
@@ -168,12 +179,12 @@ def run(
 
     auto_selection = None
     if config.auto_edit:
-        auto_selection = select_auto_candidates(candidates, config)
+        auto_selection = select_auto_candidates(candidates, config, source_duration_ms=video.duration_ms)
         if not auto_selection.selected:
             raise ValueError("no usable highlight candidates were found")
         (output_dir / "auto-selection.json").write_text(
             json.dumps({
-                **selection_summary(candidates, config),
+                **selection_summary(candidates, config, source_duration_ms=video.duration_ms),
                 "config": config.to_dict(),
             }, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",

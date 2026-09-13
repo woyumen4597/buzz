@@ -2014,8 +2014,8 @@ msgid "Automatic video highlights"
 msgstr "自动生成视频高光"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Choose a video and generate a highlight reel automatically. The default reel length is one third of the source video."
-msgstr "选择视频后一键生成高光合集，默认时长为原视频的三分之一。"
+msgid "Choose a video and generate a highlight reel automatically. The default reel length is 0.3 of the source video."
+msgstr "选择视频后一键生成高光合集，默认时长为原视频的 0.3。"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Choose a video file"
@@ -2066,8 +2066,8 @@ msgid "Auto-ignore mostly static scenes"
 msgstr "自动忽略画面基本静止的片段"
 
 #: buzz/widgets/highlight_candidates_widget.py
-msgid "Highlight duration (seconds, 0 = automatic)"
-msgstr "高光时长（秒，0 = 自动按原视频三分之一）"
+msgid "Highlight proportion of source (0-1)"
+msgstr "高光占原视频比例（0-1）"
 
 #: buzz/widgets/highlight_candidates_widget.py
 msgid "Automatic: one third of source video"
