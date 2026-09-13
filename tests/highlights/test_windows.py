@@ -24,6 +24,15 @@ def test_default_two_hour_candidate_count_is_bounded():
     assert candidates[0].id == "candidate-0001"
 
 
+def test_auto_candidates_include_short_scale_for_brief_moments():
+    candidates = generate_candidates(
+        VideoInfo(60_000),
+        HighlightConfig(auto_edit=True, no_scene_detection=True, max_candidates=0),
+    )
+    assert any("short_window" in candidate.reasons for candidate in candidates)
+    assert any(candidate.duration_ms <= 10_000 for candidate in candidates)
+
+
 def test_scene_parser_deduplicates():
     assert parse_scene_timestamps("pts_time:1.5 pts_time:1.5 pts_time:-1 scene_time=3") == [1500, 3000]
 
@@ -31,6 +40,15 @@ def test_scene_parser_deduplicates():
 def test_motion_parser_reads_metadata_samples():
     output = """frame:0 pts_time:1\n[Parsed_metadata] lavfi.signalstats.YAVG=0.5\nframe:1 pts_time:2\n[Parsed_metadata] lavfi.signalstats.YAVG=8.0\n"""
     assert parse_motion_samples(output) == [(1000, 0.5), (2000, 8.0)]
+
+
+def test_motion_scores_rescue_brief_high_peak():
+    config = HighlightConfig(ignore_static_scenes=True, static_motion_threshold=1.5)
+    candidate = Candidate("reaction", 0, 5_000, 0, 5_000)
+    samples = [(index * 500, 0.2) for index in range(10)] + [(4_500, 8.0)]
+    apply_motion_scores([candidate], samples, config)
+    assert candidate.status == "unprocessed"
+    assert "static_scene" not in candidate.reasons
 
 
 def test_motion_scores_flag_static_candidates():
@@ -72,6 +90,19 @@ def test_auto_selection_uses_full_source_duration_for_ratio():
     )
     assert result.total_duration_ms == 50_000
     assert result.budget_ms == 10_000
+
+
+def test_auto_selection_prefers_total_score_over_longer_low_score_clip():
+    candidates = [
+        Candidate("long", 0, 10_000, 0, 10_000, score=0.9),
+        Candidate("first", 0, 5_000, 0, 5_000, score=0.6),
+        Candidate("second", 5_000, 10_000, 5_000, 10_000, score=0.6),
+    ]
+    result = select_auto_candidates(
+        candidates,
+        HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=10),
+    )
+    assert [candidate.id for candidate in result.selected] == ["first", "second"]
 
 
 def test_auto_selection_respects_budget_and_avoids_overlap():

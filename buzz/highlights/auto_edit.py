@@ -9,7 +9,7 @@ from typing import Iterable
 from .models import Candidate, HighlightConfig, interval_iou
 
 
-ALGORITHM_VERSION = "weighted-interval-budget-v1"
+ALGORITHM_VERSION = "weighted-interval-budget-v2"
 _BUDGET_QUANTUM_MS = 1000
 
 
@@ -28,11 +28,11 @@ def _better(
     left: tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]],
     right: tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]],
 ) -> tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]:
-    """Compare states by budget utilization, score, then stable timeline order."""
-    if left[1] != right[1]:
-        return left if left[1] > right[1] else right
+    """Compare states by score, coverage, then stable timeline order."""
     if left[0] != right[0]:
         return left if left[0] > right[0] else right
+    if left[1] != right[1]:
+        return left if left[1] > right[1] else right
     return left if left[2] < right[2] else right
 
 

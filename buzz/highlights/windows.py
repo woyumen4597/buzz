@@ -288,13 +288,27 @@ def apply_motion_scores(
     for candidate in candidates:
         values = [value for timestamp, value in samples if candidate.start_ms <= timestamp < candidate.end_ms]
         average = sum(values) / len(values) if values else 0.0
-        motion_score = max(0.0, min(1.0, average / 32.0))
+        peak = max(values, default=0.0)
+        sorted_values = sorted(values)
+        upper_quartile = sorted_values[(len(sorted_values) - 1) * 3 // 4] if sorted_values else 0.0
+        # Average motion is stable but can dilute a short reaction. Blend in
+        # the upper quartile and peak so brief high-energy moments remain
+        # discoverable without letting a single value dominate completely.
+        average_signal = max(0.0, min(1.0, average / 32.0))
+        quartile_signal = max(0.0, min(1.0, upper_quartile / 32.0))
+        peak_signal = max(0.0, min(1.0, peak / 32.0))
+        motion_score = 0.50 * average_signal + 0.30 * quartile_signal + 0.20 * peak_signal
         candidate.score = score_candidate(
             scene_signal=1.0 if "scene_change" in candidate.reasons else 0.0,
             duration_quality_signal=duration_quality(candidate.duration_ms, config),
             motion_signal=motion_score,
         )
-        if config.ignore_static_scenes and average < config.static_motion_threshold:
+        if "short_window" in candidate.reasons:
+            candidate.score = min(1.0, candidate.score + 0.08)
+        # A genuinely strong peak is enough to keep a short reaction from
+        # being discarded as static, while empty analysis remains neutral.
+        peak_rescue = peak >= config.static_motion_threshold * 4
+        if values and config.ignore_static_scenes and average < config.static_motion_threshold and not peak_rescue:
             candidate.status = "ignore"
             candidate.reasons = merge_reasons([*candidate.reasons, "static_scene"])
         elif "static_scene" in candidate.reasons:
@@ -310,6 +324,23 @@ def generate_candidates(
 ) -> list[Candidate]:
     config = config or HighlightConfig()
     candidates = fixed_window_candidates(video, config)
+    if config.auto_edit and config.window_seconds > config.min_duration_seconds * 2:
+        # A second, shorter scale catches brief reactions, punchlines, and
+        # other high-value moments diluted by the default 20-second window.
+        short_config = replace(
+            config,
+            window_seconds=max(config.min_duration_seconds * 2, config.window_seconds / 2),
+            stride_seconds=max(config.min_duration_seconds, config.stride_seconds / 2),
+            max_candidates=0,
+        )
+        candidates.extend(
+            replace(
+                candidate,
+                score=min(1.0, candidate.score + 0.08),
+                reasons=merge_reasons([*candidate.reasons, "short_window"]),
+            )
+            for candidate in fixed_window_candidates(video, short_config)
+        )
     if not config.no_scene_detection and scene_changes_ms is not None:
         candidates.extend(scene_candidates(video, scene_changes_ms, config))
     if motion_samples:

@@ -89,4 +89,10 @@ def associate_subtitles(candidate: Candidate, subtitles: Iterable[Subtitle]) -> 
         density = len(candidate.transcript) / max(1, candidate.duration_ms)
         candidate.score = min(1.0, candidate.score + min(0.25, density * 1000 * 0.25))
         candidate.reasons = list(dict.fromkeys([*candidate.reasons, "transcript_density"]))
+        # Speech can be highly valuable even when the camera is static. Do
+        # not let the motion filter discard dialogue-rich candidates before
+        # automatic selection gets a chance to rank them.
+        if candidate.status == "ignore" and "static_scene" in candidate.reasons:
+            candidate.status = "unprocessed"
+            candidate.reasons = list(dict.fromkeys([*candidate.reasons, "dialogue_rescue"]))
     return candidate.transcript

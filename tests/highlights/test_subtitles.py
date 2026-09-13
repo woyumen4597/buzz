@@ -19,3 +19,11 @@ def test_associate_uses_overlap_only():
     cues, _ = parse_srt("1\n00:00:01,000 --> 00:00:02,000\nno\n\n2\n00:00:02,500 --> 00:00:04,000\nyes")
     assert associate_subtitles(candidate, cues) == "yes"
     assert "transcript_density" in candidate.reasons
+
+
+def test_associate_rescues_dialogue_from_static_scene_ignore():
+    candidate = Candidate("x", 2000, 5000, 0, 5000, status="ignore", reasons=["static_scene"])
+    cues, _ = parse_srt("1\n00:00:02,000 --> 00:00:04,000\n重要内容")
+    associate_subtitles(candidate, cues)
+    assert candidate.status == "unprocessed"
+    assert "dialogue_rescue" in candidate.reasons
