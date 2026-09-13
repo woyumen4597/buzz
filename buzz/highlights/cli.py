@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import threading
@@ -11,12 +12,14 @@ from pathlib import Path
 from typing import Callable
 
 from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
+from .auto_edit import selection_summary, select_auto_candidates
 from .media import (
     find_tools,
     generate_gif,
     generate_preview,
     generate_thumbnail,
     probe_media,
+    render_selected_video,
 )
 from .models import HighlightConfig
 from .subtitles import associate_subtitles, parse_srt_file
@@ -41,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-scene-detection", action="store_true")
     parser.add_argument("--no-previews", action="store_true")
     parser.add_argument("--keep-static-scenes", action="store_true", help="do not auto-ignore low-motion candidates")
+    parser.add_argument("--auto-edit", action="store_true", help="automatically select and render a highlight reel")
+    parser.add_argument("--target-duration", type=float, default=60.0, help="target reel duration in seconds")
+    parser.add_argument("--max-auto-clips", type=int, default=6, help="maximum clips in an automatic reel")
+    parser.add_argument("--score-threshold", type=float, default=0.0, help="minimum automatic selection score")
     parser.add_argument("--gif", action="store_true")
     parser.add_argument("--gif-limit", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
@@ -62,6 +69,10 @@ def _config(args: argparse.Namespace) -> HighlightConfig:
         gif_limit=args.gif_limit,
         keep_existing=args.keep_existing,
         ignore_static_scenes=not getattr(args, "keep_static_scenes", False),
+        auto_edit=getattr(args, "auto_edit", False),
+        target_duration_seconds=getattr(args, "target_duration", 60.0),
+        max_auto_clips=getattr(args, "max_auto_clips", 6),
+        score_threshold=getattr(args, "score_threshold", 0.0),
     )
 
 
@@ -141,11 +152,23 @@ def run(
         except OSError as exc:
             warnings.append(f"could not read SRT: {exc}")
 
+    auto_selection = None
+    if config.auto_edit:
+        auto_selection = select_auto_candidates(candidates, config)
+        (output_dir / "auto-selection.json").write_text(
+            json.dumps({
+                **selection_summary(candidates, config),
+                "config": config.to_dict(),
+            }, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    material_candidates = auto_selection.selected if auto_selection is not None else candidates
     thumbnail_dir = output_dir / "thumbnails"
     preview_dir = output_dir / "previews"
-    total_steps = max(1, len(candidates) * (1 if config.no_previews else 2))
+    total_steps = max(1, len(material_candidates) * (1 if config.no_previews else 2))
     completed_steps = 0
-    for candidate in candidates:
+    for candidate in material_candidates:
         thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
         if candidate.thumbnail and thumb_path.exists():
             completed_steps += 1
@@ -155,7 +178,7 @@ def run(
                 completed_steps += 1
     if progress_callback:
         progress_callback(completed_steps, total_steps, "继续生成" if completed_steps else "准备素材")
-    for candidate in candidates:
+    for candidate in material_candidates:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("highlight generation canceled")
         thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
@@ -184,11 +207,29 @@ def run(
             if progress_callback:
                 progress_callback(completed_steps, total_steps, f"预览 {candidate.id}")
             write_checkpoint(output_dir, str(video_path), video, config, candidates)
-        if config.gif and candidates.index(candidate) < config.gif_limit:
+        if config.gif and material_candidates.index(candidate) < config.gif_limit:
             gif_path = preview_dir / f"{candidate.id}.gif"
             generate_gif(candidate, str(video_path), gif_path, ffmpeg, config.keep_existing)
             if candidate.gif:
                 candidate.gif = gif_path.relative_to(output_dir).as_posix()
+
+    if auto_selection is not None and auto_selection.selected:
+        render_total = len(auto_selection.selected) + 1
+
+        def render_progress(completed: int, total: int, message: str) -> None:
+            if progress_callback:
+                progress_callback(total_steps + completed, total_steps + render_total, message)
+
+        if cancel_event is not None and cancel_event.is_set():
+            raise InterruptedError("highlight generation canceled")
+        render_selected_video(
+            ffmpeg,
+            str(video_path),
+            auto_selection.selected,
+            output_dir,
+            has_audio=bool(video.audio_codec),
+            progress_callback=render_progress,
+        )
 
     export_config = config
     if not scene_enabled:
@@ -220,7 +261,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, NotADirectoryError, InterruptedError) as exc:
         parser.error(str(exc))
         return 2
-    print(f"Generated {output_dir / 'index.html'} ({len(list(output_dir.glob('thumbnails/*.jpg')))} thumbnails)")
+    message = f"Generated {output_dir / 'index.html'} ({len(list(output_dir.glob('thumbnails/*.jpg')))} thumbnails)"
+    if getattr(args, "auto_edit", False):
+        message += f"; reel: {output_dir / 'highlights.mp4'}"
+    print(message)
     return 0
 
 

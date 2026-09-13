@@ -1,0 +1,150 @@
+"""Automatic highlight selection from scored candidates."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Iterable
+
+from .models import Candidate, HighlightConfig, interval_iou
+
+
+ALGORITHM_VERSION = "weighted-interval-budget-v1"
+_BUDGET_QUANTUM_MS = 100
+
+
+@dataclass(frozen=True)
+class AutoSelection:
+    selected: list[Candidate]
+    budget_ms: int
+    total_duration_ms: int
+
+
+def _candidate_key(candidate: Candidate) -> tuple[int, int, str]:
+    return candidate.start_ms, candidate.end_ms, candidate.id
+
+
+def _better(
+    left: tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]],
+    right: tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]],
+) -> tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]:
+    """Compare states by score, budget utilization, then stable timeline order."""
+    if left[0] != right[0]:
+        return left if left[0] > right[0] else right
+    if left[1] != right[1]:
+        return left if left[1] > right[1] else right
+    return left if left[2] < right[2] else right
+
+
+def select_auto_candidates(
+    candidates: Iterable[Candidate],
+    config: HighlightConfig,
+) -> AutoSelection:
+    """Select a deterministic, non-overlapping reel within a time budget.
+
+    Candidate durations are the primary intervals, never preview padding. A
+    weighted interval scheduling recurrence adds a duration budget and clip
+    count, avoiding the common failure where one long clip blocks several
+    shorter, higher-value clips.
+    """
+    all_candidates = list(candidates)
+    budget_ms = round(config.target_duration_seconds * 1000)
+    for candidate in all_candidates:
+        candidate.selected = False
+        if candidate.status == "keep":
+            candidate.status = "unprocessed"
+
+    valid = [
+        candidate
+        for candidate in all_candidates
+        if candidate.status != "ignore"
+        and candidate.score >= config.score_threshold
+        and candidate.duration_ms > 0
+    ]
+    deduped: list[Candidate] = []
+    for candidate in sorted(valid, key=lambda item: (-item.score, _candidate_key(item))):
+        if any(
+            interval_iou(
+                existing.start_ms,
+                existing.end_ms,
+                candidate.start_ms,
+                candidate.end_ms,
+            ) >= 0.6
+            for existing in deduped
+        ):
+            continue
+        deduped.append(candidate)
+
+    if budget_ms <= 0 or config.max_auto_clips <= 0 or not deduped:
+        return AutoSelection([], budget_ms, 0)
+
+    ordered = sorted(deduped, key=lambda item: (item.end_ms, item.start_ms, item.id))
+    budget_units = budget_ms // _BUDGET_QUANTUM_MS
+    predecessors: list[int] = []
+    for index, candidate in enumerate(ordered):
+        predecessor = -1
+        for earlier in range(index - 1, -1, -1):
+            if ordered[earlier].end_ms <= candidate.start_ms:
+                predecessor = earlier
+                break
+        predecessors.append(predecessor)
+
+    zero_state: tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]] = (0.0, 0, (), ())
+
+    @lru_cache(maxsize=None)
+    def solve(
+        count: int, remaining_units: int, remaining_clips: int
+    ) -> tuple[float, int, tuple[tuple[int, int, str], ...], tuple[int, ...]]:
+        if count <= 0 or remaining_units <= 0 or remaining_clips <= 0:
+            return zero_state
+        candidate_index = count - 1
+        candidate = ordered[candidate_index]
+        best = solve(count - 1, remaining_units, remaining_clips)
+        duration_units = (candidate.duration_ms + _BUDGET_QUANTUM_MS - 1) // _BUDGET_QUANTUM_MS
+        if duration_units <= remaining_units:
+            previous = solve(
+                predecessors[candidate_index] + 1,
+                remaining_units - duration_units,
+                remaining_clips - 1,
+            )
+            take = (
+                previous[0] + candidate.score,
+                previous[1] + candidate.duration_ms,
+                previous[2] + (_candidate_key(candidate),),
+                previous[3] + (candidate_index,),
+            )
+            best = _better(take, best)
+        return best
+
+    best = solve(len(ordered), budget_units, config.max_auto_clips)
+    chosen = [ordered[index] for index in best[3]]
+    chosen.sort(key=_candidate_key)
+    chosen_objects = {id(candidate) for candidate in chosen}
+    for candidate in all_candidates:
+        if id(candidate) in chosen_objects:
+            candidate.selected = True
+            candidate.status = "keep"
+    return AutoSelection(chosen, best[1], budget_ms)
+
+
+def selection_summary(candidates: Iterable[Candidate], config: HighlightConfig) -> dict[str, object]:
+    """Return a serializable explanation of the automatic selection."""
+    all_candidates = list(candidates)
+    selected = sorted((candidate for candidate in all_candidates if candidate.selected), key=_candidate_key)
+    return {
+        "algorithm": ALGORITHM_VERSION,
+        "target_duration_ms": round(config.target_duration_seconds * 1000),
+        "selected_count": len(selected),
+        "selected_duration_ms": sum(candidate.duration_ms for candidate in selected),
+        "candidate_count": len(all_candidates),
+        "ignored_count": sum(candidate.status == "ignore" for candidate in all_candidates),
+        "selected": [
+            {
+                "id": candidate.id,
+                "start_ms": candidate.start_ms,
+                "end_ms": candidate.end_ms,
+                "score": candidate.score,
+            }
+            for candidate in selected
+        ],
+    }

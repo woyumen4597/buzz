@@ -2066,6 +2066,18 @@ msgid "Auto-ignore mostly static scenes"
 msgstr "自动忽略画面基本静止的片段"
 
 #: buzz/widgets/highlight_candidates_widget.py
+msgid "Automatic reel duration (seconds)"
+msgstr "自动成片时长（秒）"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Maximum automatic clips"
+msgstr "自动成片最多片段数"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Automatically create a highlight reel"
+msgstr "自动生成高光合集"
+
+#: buzz/widgets/highlight_candidates_widget.py
 msgid "Generate candidates"
 msgstr "生成候选"
 

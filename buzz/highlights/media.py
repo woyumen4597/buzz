@@ -186,9 +186,17 @@ def render_selected_video(
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> Path:
     """Create individual selected clips and concatenate them in timeline order."""
-    selected = sorted((candidate for candidate in candidates if candidate.selected), key=lambda item: item.start_ms)
+    selected = sorted(
+        (candidate for candidate in candidates if candidate.selected),
+        key=lambda item: (item.start_ms, item.end_ms, item.id),
+    )
     if not selected:
         raise ValueError("select at least one candidate before rendering")
+    if any(
+        earlier.end_ms > later.start_ms
+        for earlier, later in zip(selected, selected[1:])
+    ):
+        raise ValueError("selected candidates must not overlap")
 
     clips_dir = output_dir / "clips"
     clips_dir.mkdir(parents=True, exist_ok=True)

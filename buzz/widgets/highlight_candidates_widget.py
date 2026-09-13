@@ -121,15 +121,24 @@ class HighlightCandidatesWidget(QWidget):
         self.max_candidates.setRange(1, 2000)
         self.max_candidates.setValue(200)
         form.addRow(_("Maximum candidates"), self.max_candidates)
+        self.target_duration = self._double_spin(60.0, 0.0, 3600.0)
+        form.addRow(_("Automatic reel duration (seconds)"), self.target_duration)
+        self.max_auto_clips = QSpinBox(self)
+        self.max_auto_clips.setRange(0, 100)
+        self.max_auto_clips.setValue(6)
+        form.addRow(_("Maximum automatic clips"), self.max_auto_clips)
         layout.addLayout(form)
 
         self.no_scene_detection = QCheckBox(_("Skip scene detection"), self)
         self.no_previews = QCheckBox(_("Skip MP4 previews for a faster first pass"), self)
         self.ignore_static_scenes = QCheckBox(_("Auto-ignore mostly static scenes"), self)
         self.ignore_static_scenes.setChecked(True)
+        self.auto_edit = QCheckBox(_("Automatically create a highlight reel"), self)
+        self.auto_edit.setChecked(True)
         layout.addWidget(self.no_scene_detection)
         layout.addWidget(self.no_previews)
         layout.addWidget(self.ignore_static_scenes)
+        layout.addWidget(self.auto_edit)
 
         actions = QHBoxLayout()
         self.run_button = QPushButton(_("Generate candidates"), self)
@@ -215,6 +224,10 @@ class HighlightCandidatesWidget(QWidget):
             no_scene_detection=self.no_scene_detection.isChecked(),
             no_previews=self.no_previews.isChecked(),
             static_motion_threshold=1.5,
+            auto_edit=self.auto_edit.isChecked(),
+            target_duration=self.target_duration.value(),
+            max_auto_clips=self.max_auto_clips.value(),
+            score_threshold=0.0,
             gif=False,
             gif_limit=0,
             keep_existing=True,

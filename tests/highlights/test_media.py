@@ -30,6 +30,19 @@ def test_concat_command_uses_concat_demuxer():
     ]
 
 
+def test_render_selected_video_rejects_overlapping_selection(tmp_path):
+    candidates = [
+        Candidate("a", 0, 2_000, 0, 2_000, selected=True, status="keep"),
+        Candidate("b", 1_000, 3_000, 1_000, 3_000, selected=True, status="keep"),
+    ]
+    try:
+        render_selected_video("ffmpeg", "input.mp4", candidates, tmp_path)
+    except ValueError as exc:
+        assert "overlap" in str(exc)
+    else:
+        raise AssertionError("overlapping candidates should be rejected")
+
+
 def test_render_selected_video_sorts_by_timeline(tmp_path, monkeypatch):
     candidates = [
         Candidate("late", 2_000, 3_000, 2_000, 3_000, selected=True, status="keep"),

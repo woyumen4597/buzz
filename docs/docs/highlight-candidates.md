@@ -1,6 +1,6 @@
 # 视频高光候选
 
-Buzz 主窗口现在包含“Video highlights”工作区 Tab。打开 Buzz 后，切换到该 Tab，选择视频文件，可选选择 SRT，调整窗口、步长和候选数量，然后点击“Generate candidates”。生成过程在后台执行，完成后点击“Open result”即可打开候选 HTML 页面。
+Buzz 主窗口现在包含“Video highlights”工作区 Tab。打开 Buzz 后，切换到该 Tab，选择视频文件，可选选择 SRT，调整窗口、步长和候选数量，然后点击“Generate candidates”。GUI 默认开启“自动生成高光合集”：它会在目标时长预算内选择高分、互不重叠且非静止的片段，并直接输出 `highlights.mp4`；关闭该选项后仍可只生成候选 HTML 页面。生成过程在后台执行，完成后点击“Open result”即可打开候选页面。
 
 该页面是轻量入口，候选卡片、缩略图和预览仍在生成的静态 HTML 中查看，不会改变现有转写工作区。候选分数是用于排序的启发式分数：结合场景变化、字幕密度、画面运动和窗口时长，不是模型对“高光”的确定性判断；没有字幕或运动信号时，同类候选出现相同分数是正常的。
 
@@ -12,7 +12,15 @@ uv run python -m buzz.highlights.cli video.mp4 \
   --output-dir video_highlights
 ```
 
-也可以在安装后使用 `buzz-highlights` 命令。默认会检查 FFmpeg、生成固定时间窗口，并尝试进行画面场景变化扫描。场景扫描失败时会记录 warning 并自动退回固定窗口；使用 `--no-scene-detection` 可以主动关闭场景扫描。
+也可以在安装后使用 `buzz-highlights` 命令。默认会检查 FFmpeg、生成固定时间窗口，并尝试进行画面场景变化扫描。场景扫描失败时会记录 warning 并自动退回固定窗口；使用 `--no-scene-detection` 可以主动关闭场景扫描。要直接自动选片并输出合集，使用 `--auto-edit`。
+
+```bash
+uv run buzz-highlights video.mp4 --srt video.srt \
+  --auto-edit --target-duration 60 --max-auto-clips 6 \
+  --output-dir video_highlights
+```
+
+自动模式会排除标记为忽略的候选，按评分和时间区间做非重叠选择，主体片段总时长不会超过目标时长；输出目录会生成 `highlights.mp4` 和 `auto-selection.json`。这是可解释的自动初剪，不是对内容高光的确定性判断。
 
 常用选项：
 
