@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from .media import render_selected_video
-from .models import Candidate, HighlightConfig, VideoInfo, format_timestamp
+from .models import Candidate, HighlightConfig, VideoInfo
 
 
 def _atomic_text(path: Path, content: str) -> None:
@@ -124,11 +124,16 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, x => ({{'&':'&amp;','<':'&l
 const fmt = ms => {{ let s=Math.max(0,Math.round(ms))/1000; let h=Math.floor(s/3600);s%=3600;let m=Math.floor(s/60);s=(s%60).toFixed(3);return `${{String(h).padStart(2,'0')}}:${{String(m).padStart(2,'0')}}:${{String(s).padStart(6,'0')}}`; }};
 function persist() {{ localStorage.setItem(key, JSON.stringify(Object.fromEntries(state.map(c => [c.id,c.status])))); }}
 function download(name, content, type='application/json') {{ const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{{type}}));a.download=name;a.click();URL.revokeObjectURL(a.href); }}
+function previewNotice(c) {{
+  const error = (c.errors||[]).find(item => String(item).startsWith('preview:'));
+  if (error) return `预览生成失败：${{esc(error)}}`;
+  return c.status === 'keep' ? '预览未生成' : '未入选自动成片，未生成预览';
+}}
 function render() {{ const sort=document.querySelector('#sort').value, filter=document.querySelector('#filter').value, query=document.querySelector('#search').value.toLowerCase();
  let rows=state.filter(c => (filter==='all'||c.status===filter) && (!query||String(c.transcript).toLowerCase().includes(query)));
  rows.sort((a,b)=>sort==='time'?a.start_ms-b.start_ms:sort==='status'?a.status.localeCompare(b.status):b.score-a.score);
  document.querySelector('#summary').textContent=`显示 ${{rows.length}} / ${{state.length}}，保留 ${{state.filter(c=>c.status==='keep').length}} 个`;
- document.querySelector('#cards').innerHTML=rows.map(c=>`<article class="card ${{c.status==='keep'?'keep':c.status==='ignore'?'ignore':''}}"><img src="${{esc(c.thumbnail||'')}}" loading="lazy" alt="${{esc(c.id)}}"><div class="meta"><b>${{esc(c.id)}}</b><span>分数 ${{Number(c.score).toFixed(3)}}</span><b>主体</b><button class="timestamp" data-start="${{c.start_ms}}" data-end="${{c.end_ms}}">${{fmt(c.start_ms)}} → ${{fmt(c.end_ms)}}</button><b>预览</b><span>${{fmt(c.preview_start_ms)}} → ${{fmt(c.preview_end_ms)}}</span><b>原因</b><span>${{esc((c.reasons||[]).join(', '))}}</span></div>${{c.transcript?`<div class="transcript">${{esc(c.transcript)}}</div>`:''}}${{c.preview?`<video controls preload="metadata" src="${{esc(c.preview)}}"></video>`:'<small>预览生成失败或未生成</small>'}}<div class="actions"><button data-action="keep" data-id="${{c.id}}">保留</button><button data-action="ignore" data-id="${{c.id}}">忽略</button><button data-action="unprocessed" data-id="${{c.id}}">未处理</button></div></article>`).join('');
+ document.querySelector('#cards').innerHTML=rows.map(c=>`<article class="card ${{c.status==='keep'?'keep':c.status==='ignore'?'ignore':''}}"><img src="${{esc(c.thumbnail||'')}}" loading="lazy" alt="${{esc(c.id)}}"><div class="meta"><b>${{esc(c.id)}}</b><span>分数 ${{Number(c.score).toFixed(3)}}</span><b>主体</b><button class="timestamp" data-start="${{c.start_ms}}" data-end="${{c.end_ms}}">${{fmt(c.start_ms)}} → ${{fmt(c.end_ms)}}</button><b>预览</b><span>${{fmt(c.preview_start_ms)}} → ${{fmt(c.preview_end_ms)}}</span><b>原因</b><span>${{esc((c.reasons||[]).join(', '))}}</span></div>${{c.transcript?`<div class="transcript">${{esc(c.transcript)}}</div>`:''}}${{c.preview?`<video controls preload="metadata" src="${{esc(c.preview)}}"></video>`:`<small>${{previewNotice(c)}}</small>`}}<div class="actions"><button data-action="keep" data-id="${{c.id}}">保留</button><button data-action="ignore" data-id="${{c.id}}">忽略</button><button data-action="unprocessed" data-id="${{c.id}}">未处理</button></div></article>`).join('');
  document.querySelectorAll('[data-action]').forEach(b=>b.onclick=()=>{{state.find(c=>c.id===b.dataset.id).status=b.dataset.action;state.find(c=>c.id===b.dataset.id).selected=b.dataset.action==='keep';persist();render();}});
  document.querySelectorAll('.timestamp').forEach(b=>b.onclick=()=>navigator.clipboard?.writeText(`${{fmt(+b.dataset.start)}} --> ${{fmt(+b.dataset.end)}}`)); }}
 ['sort','filter','search'].forEach(id=>document.querySelector('#'+id).oninput=render);

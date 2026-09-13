@@ -163,22 +163,25 @@ def run(
             encoding="utf-8",
         )
 
-    material_candidates = auto_selection.selected if auto_selection is not None else candidates
+    thumbnail_candidates = candidates
+    preview_candidates = auto_selection.selected if auto_selection is not None else candidates
+    preview_ids = {candidate.id for candidate in preview_candidates}
     thumbnail_dir = output_dir / "thumbnails"
     preview_dir = output_dir / "previews"
-    total_steps = max(1, len(material_candidates) * (1 if config.no_previews else 2))
+    total_steps = max(1, len(thumbnail_candidates) + (0 if config.no_previews else len(preview_candidates)))
     completed_steps = 0
-    for candidate in material_candidates:
+    for candidate in thumbnail_candidates:
         thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
         if candidate.thumbnail and thumb_path.exists():
             completed_steps += 1
-        if not config.no_previews:
+    if not config.no_previews:
+        for candidate in preview_candidates:
             preview_path = preview_dir / f"{candidate.id}.mp4"
             if candidate.preview and preview_path.exists():
                 completed_steps += 1
     if progress_callback:
         progress_callback(completed_steps, total_steps, "继续生成" if completed_steps else "准备素材")
-    for candidate in material_candidates:
+    for candidate in thumbnail_candidates:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("highlight generation canceled")
         thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
@@ -189,7 +192,7 @@ def run(
         if progress_callback:
             progress_callback(completed_steps, total_steps, f"缩略图 {candidate.id}")
         write_checkpoint(output_dir, str(video_path), video, config, candidates)
-        if not config.no_previews:
+        if not config.no_previews and candidate.id in preview_ids:
             if cancel_event is not None and cancel_event.is_set():
                 raise InterruptedError("highlight generation canceled")
             preview_path = preview_dir / f"{candidate.id}.mp4"
@@ -207,7 +210,7 @@ def run(
             if progress_callback:
                 progress_callback(completed_steps, total_steps, f"预览 {candidate.id}")
             write_checkpoint(output_dir, str(video_path), video, config, candidates)
-        if config.gif and material_candidates.index(candidate) < config.gif_limit:
+        if config.gif and thumbnail_candidates.index(candidate) < config.gif_limit:
             gif_path = preview_dir / f"{candidate.id}.gif"
             generate_gif(candidate, str(video_path), gif_path, ffmpeg, config.keep_existing)
             if candidate.gif:
