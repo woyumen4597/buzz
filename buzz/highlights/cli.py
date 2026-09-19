@@ -21,16 +21,23 @@ from .auto_edit import (
 )
 from .output import automatic_output_path
 from .media import (
+    extract_subtitles_command,
     find_tools,
     generate_gif,
     generate_preview,
     generate_thumbnail,
     probe_media,
     render_selected_video,
+    source_has_text_subtitles,
 )
 from .models import HighlightConfig
 from .progress import phase
-from .subtitles import associate_subtitles, parse_srt_file
+from .subtitles import (
+    Subtitle,
+    associate_subtitles,
+    extract_source_subtitles,
+    parse_srt_file,
+)
 from .verify import summarise, verify_reel
 from .windows import (
     generate_candidates,
@@ -193,6 +200,38 @@ def run(
             warnings.append(warning)
             LOG.warning(warning)
 
+    # Subtitles feed the ranking score, so they must be resolved before
+    # candidates are generated. An explicit --srt always wins; otherwise the
+    # source's own embedded text track is used when it has one. Extracting once
+    # here lets the render stage reuse the same cues.
+    source_subtitles: list[Subtitle] | None = None
+    if args.srt:
+        try:
+            source_subtitles, subtitle_warnings = parse_srt_file(args.srt)
+            warnings.extend(subtitle_warnings)
+            LOG.info("ranking with %d cues from %s", len(source_subtitles), args.srt)
+        except OSError as exc:
+            warnings.append(f"could not read SRT: {exc}")
+            LOG.warning("could not read SRT %s: %s", args.srt, exc)
+    else:
+        try:
+            with phase("extracting embedded subtitles", LOG):
+                source_subtitles = extract_source_subtitles(
+                    ffmpeg,
+                    str(video_path),
+                    has_text_subtitles=source_has_text_subtitles,
+                    build_command=extract_subtitles_command,
+                    work_dir=output_dir,
+                )
+        except Exception as exc:  # ranking without subtitles is still valid
+            warning = f"embedded subtitle extraction failed; ranking without transcripts: {exc}"
+            warnings.append(warning)
+            LOG.warning(warning)
+        if source_subtitles is None:
+            LOG.info("no embedded text subtitle track; ranking on audio and video only")
+        else:
+            LOG.info("ranking with %d cues from the embedded subtitle track", len(source_subtitles))
+
     with phase("generating candidates", LOG):
         candidates = generate_candidates(video, config, scene_points, motion_samples, audio_samples)
     LOG.info("generated %d candidates", len(candidates))
@@ -222,16 +261,22 @@ def run(
         else:
             warnings.append("existing checkpoint does not match the current input or settings; starting fresh")
 
-    if args.srt:
-        try:
-            subtitles, subtitle_warnings = parse_srt_file(args.srt)
-            warnings.extend(subtitle_warnings)
+    if source_subtitles:
+        with phase("scoring transcripts", LOG):
             for candidate in candidates:
-                associate_subtitles(candidate, subtitles)
-            # Text density changes ranking, so keep stable IDs but order by score for assets.
-            candidates.sort(key=lambda item: (-item.score, item.start_ms))
-        except OSError as exc:
-            warnings.append(f"could not read SRT: {exc}")
+                associate_subtitles(candidate, source_subtitles)
+        boosted = sum("transcript_density" in candidate.reasons for candidate in candidates)
+        rescued = sum("dialogue_rescue" in candidate.reasons for candidate in candidates)
+        LOG.info(
+            "transcript signal: %d/%d candidates scored, %d rescued from static filtering",
+            boosted,
+            len(candidates),
+            rescued,
+        )
+        if not boosted:
+            warnings.append("subtitles were found but no candidate overlaps them; check their timing")
+        # Text density changes ranking, so keep stable IDs but order by score for assets.
+        candidates.sort(key=lambda item: (-item.score, item.start_ms))
 
     auto_selection = None
     if config.auto_edit:
@@ -334,6 +379,7 @@ def run(
                 has_audio=bool(video.audio_codec),
                 progress_callback=render_progress,
                 output_path=final_output_path,
+                source_subtitles=source_subtitles,
             )
         LOG.info("wrote %s", final_output_path)
         if getattr(args, "verify", "fast") != "off":

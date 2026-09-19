@@ -10,7 +10,7 @@ from typing import Iterable
 from .models import Candidate, HighlightConfig, interval_iou
 
 
-ALGORITHM_VERSION = "weighted-interval-budget-v5"
+ALGORITHM_VERSION = "weighted-interval-budget-v6"
 _BUDGET_QUANTUM_MS = 1000
 # Upper bound on DP table cells. Long sources are handled by coarsening the
 # budget quantum instead of growing the table, which keeps memory flat.
@@ -295,6 +295,15 @@ def selection_summary(
         "selected_duration_ms": sum(candidate.duration_ms for candidate in selected),
         "candidate_count": len(all_candidates),
         "ignored_count": sum(candidate.status == "ignore" for candidate in all_candidates),
+        # Ranking blends an embedded-subtitle signal, so record how much of the
+        # candidate set it actually reached. A zero here means the source had no
+        # usable cues and the reel was ranked on audio and video alone.
+        "transcript_candidate_count": sum(
+            "transcript_density" in candidate.reasons for candidate in all_candidates
+        ),
+        "transcript_rescued_count": sum(
+            "dialogue_rescue" in candidate.reasons for candidate in all_candidates
+        ),
         "selected": [
             {
                 "id": candidate.id,
