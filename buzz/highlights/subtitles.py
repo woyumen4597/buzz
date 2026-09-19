@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from .models import Candidate, interval_overlap
+from .models import Candidate, format_timestamp, interval_overlap
 
 LOG = logging.getLogger(__name__)
 _TIME_RE = re.compile(
@@ -76,6 +76,45 @@ def parse_srt(content: str) -> tuple[list[Subtitle], list[str]]:
 
 def parse_srt_file(path: str | Path) -> tuple[list[Subtitle], list[str]]:
     return parse_srt(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def format_srt(subtitles: Iterable[Subtitle]) -> str:
+    """Serialize subtitles as an SRT document with sequential cue numbers."""
+    blocks: list[str] = []
+    for index, subtitle in enumerate(
+        sorted(subtitles, key=lambda item: (item.start_ms, item.end_ms, item.text)), 1
+    ):
+        start = format_timestamp(subtitle.start_ms, ",")
+        end = format_timestamp(subtitle.end_ms, ",")
+        blocks.append(f"{index}\n{start} --> {end}\n{subtitle.text}\n")
+    return "\n".join(blocks)
+
+
+def write_srt_file(path: str | Path, subtitles: Iterable[Subtitle]) -> None:
+    Path(path).write_text(format_srt(subtitles), encoding="utf-8")
+
+
+def clip_subtitles(
+    subtitles: Iterable[Subtitle], start_ms: int, end_ms: int
+) -> list[Subtitle]:
+    """Clip cues to ``[start_ms, end_ms]`` and rebase them to a zero origin.
+
+    Input seeking in FFmpeg does not reliably rebase a text subtitle track, so
+    rendering uses this instead: the full track is extracted once, then each
+    clip receives its own SRT whose cues are trimmed and shifted. Cues that do
+    not overlap the window are dropped rather than carried over.
+    """
+    clipped: list[Subtitle] = []
+    for subtitle in subtitles:
+        cue_start = max(subtitle.start_ms, start_ms)
+        cue_end = min(subtitle.end_ms, end_ms)
+        if cue_end <= cue_start:
+            continue
+        clipped.append(
+            Subtitle(cue_start - start_ms, cue_end - start_ms, subtitle.text)
+        )
+    clipped.sort(key=lambda item: (item.start_ms, item.end_ms, item.text))
+    return clipped
 
 
 def associate_subtitles(candidate: Candidate, subtitles: Iterable[Subtitle]) -> str:

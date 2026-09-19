@@ -13,6 +13,7 @@ from typing import Callable, Sequence
 from buzz.ffmpeg_video_player import _find_ffmpeg, _find_ffprobe, probe_video
 
 from .models import Candidate, VideoInfo, format_timestamp
+from .subtitles import Subtitle, clip_subtitles, parse_srt_file, write_srt_file
 
 LOG = logging.getLogger(__name__)
 
@@ -162,7 +163,29 @@ def clip_command(
     candidate: Candidate,
     output_path: str,
     has_audio: bool = True,
+    subtitle_path: str | None = None,
 ) -> list[str]:
+    """Build a clip command.
+
+    When ``subtitle_path`` is given the clip is muxed from that pre-retimed SRT
+    instead of copying the source track. Input seeking does not rebase text
+    subtitles, so copying the source track makes every clip's cues drift by its
+    start offset. An empty SRT still yields a ``mov_text`` stream, which keeps
+    the concatenation stream layout identical across clips.
+    """
+    if subtitle_path is not None:
+        return [
+            ffmpeg, "-y", "-ss", _seconds(candidate.start_ms), "-i", video_path,
+            "-f", "srt", "-i", subtitle_path,
+            "-map", "0:v:0", *( ["-map", "0:a:0?"] if has_audio else [] ),
+            "-map", "1:0",
+            "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+            *( ["-c:a", "aac", "-b:a", "192k"] if has_audio else [] ),
+            "-c:s", "mov_text",
+            # ``-t`` must be an output option: before the subtitle input it
+            # would instead cap that input and produce an over-long clip.
+            "-t", _seconds(candidate.duration_ms), output_path,
+        ]
     return [
         ffmpeg, "-y", "-ss", _seconds(candidate.start_ms), "-i", video_path,
         "-t", _seconds(candidate.duration_ms),
@@ -173,12 +196,41 @@ def clip_command(
     ]
 
 
+def extract_subtitles_command(ffmpeg: str, video_path: str, output_path: str) -> list[str]:
+    """Extract the first text subtitle track of a source as SRT."""
+    return [
+        ffmpeg, "-y", "-i", video_path, "-map", "0:s:0", "-f", "srt", output_path,
+    ]
+
+
 def concat_command(ffmpeg: str, concat_file: str, output_path: str) -> list[str]:
     return [
         ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
         "-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s?",
         "-c", "copy", "-movflags", "+faststart", output_path,
     ]
+
+
+def source_has_text_subtitles(video_path: str) -> bool:
+    """Return whether the source carries a text subtitle track we can retime."""
+    try:
+        ffprobe = _find_ffprobe()
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "s",
+                "-show_entries", "stream=codec_name", "-of", "csv=p=0", video_path,
+            ],
+            capture_output=True, check=True, text=True,
+        )
+    except Exception as exc:  # probing is best-effort; no subtitles means no retiming
+        LOG.debug("subtitle probe failed for %s: %s", video_path, exc)
+        return False
+    text_codecs = {"subrip", "srt", "ass", "ssa", "mov_text", "text", "webvtt", "ttml"}
+    return any(
+        line.strip().lower() in text_codecs
+        for line in result.stdout.splitlines()
+        if line.strip()
+    )
 
 
 def render_selected_video(
@@ -208,13 +260,40 @@ def render_selected_video(
     total = len(selected) + 1
     concat_file = output_dir / ".highlight-concat.txt"
     clip_paths: list[Path] = []
+    source_subtitles = _load_source_subtitles(ffmpeg, video_path, output_dir)
+    if source_subtitles is None:
+        LOG.info("no retimable subtitle track; rendering %d clips without subtitles", len(selected))
+    else:
+        LOG.info(
+            "retiming %d subtitle cues across %d clips", len(source_subtitles), len(selected)
+        )
     try:
         for index, candidate in enumerate(selected, 1):
             clip_path = clips_dir / f"clip_{index:04d}.mp4"
-            _run_atomic(
-                clip_command(ffmpeg, video_path, candidate, str(clip_path), has_audio=has_audio),
-                clip_path,
-            )
+            subtitle_path: Path | None = None
+            if source_subtitles is not None:
+                # Rebase the cue timeline onto this clip so the concatenated
+                # reel keeps every subtitle aligned with its own video segment.
+                subtitle_path = clips_dir / f"clip_{index:04d}.srt"
+                write_srt_file(
+                    subtitle_path,
+                    clip_subtitles(source_subtitles, candidate.start_ms, candidate.end_ms),
+                )
+            try:
+                _run_atomic(
+                    clip_command(
+                        ffmpeg,
+                        video_path,
+                        candidate,
+                        str(clip_path),
+                        has_audio=has_audio,
+                        subtitle_path=str(subtitle_path) if subtitle_path else None,
+                    ),
+                    clip_path,
+                )
+            finally:
+                if subtitle_path is not None:
+                    subtitle_path.unlink(missing_ok=True)
             clip_paths.append(clip_path)
             if progress_callback:
                 progress_callback(index, total, f"剪辑 {candidate.id}")
@@ -231,6 +310,38 @@ def render_selected_video(
         return final_path
     finally:
         concat_file.unlink(missing_ok=True)
+
+
+def _load_source_subtitles(
+    ffmpeg: str, video_path: str, output_dir: Path
+) -> list[Subtitle] | None:
+    """Extract the source subtitle track once, or ``None`` if it has none.
+
+    Extracting a single full track and slicing it per clip is what keeps the
+    reel's subtitles aligned; copying the source track per clip drifts.
+    """
+    if not source_has_text_subtitles(video_path):
+        return None
+    srt_path = output_dir / ".highlight-source.srt"
+    try:
+        subprocess.run(
+            extract_subtitles_command(ffmpeg, video_path, str(srt_path)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subtitles, warnings = parse_srt_file(srt_path)
+        for warning in warnings:
+            LOG.debug("source subtitle: %s", warning)
+        if not subtitles:
+            LOG.warning("source subtitles could not be parsed; rendering without subtitles")
+            return None
+        return subtitles
+    except subprocess.CalledProcessError as exc:
+        LOG.warning("subtitle extraction failed; rendering without subtitles: %s", _error_summary(exc))
+        return None
+    finally:
+        srt_path.unlink(missing_ok=True)
 
 
 def candidate_timestamp_label(candidate: Candidate) -> str:

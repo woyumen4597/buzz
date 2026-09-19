@@ -3,6 +3,7 @@ from pathlib import Path
 from buzz.highlights.media import (
     clip_command,
     concat_command,
+    extract_subtitles_command,
     gif_command,
     preview_command,
     render_selected_video,
@@ -55,6 +56,35 @@ def test_clip_command_without_audio_does_not_map_audio():
     assert "0:a:0?" not in command
     assert "-an" not in command
     assert "-map" in command and "0:s?" in command
+
+
+def test_clip_command_with_retimed_srt_muxes_the_srt_input():
+    candidate = Candidate("only", 1_000, 3_000, 1_000, 3_000)
+    command = clip_command(
+        "ffmpeg", "in.mp4", candidate, "out.mp4", subtitle_path="clip.srt"
+    )
+    # The retimed SRT is a second input, so its stream is mapped as 1:0.
+    assert "clip.srt" in command
+    assert command[command.index("clip.srt") - 3:command.index("clip.srt")] == ["-f", "srt", "-i"]
+    assert "1:0" in command
+    assert "0:s?" not in command
+    # -t must be an output option, i.e. after the subtitle input.
+    assert command.index("-t") > command.index("clip.srt")
+    assert command[-1] == "out.mp4"
+
+
+def test_clip_command_without_retimed_srt_still_maps_source_subtitles():
+    candidate = Candidate("only", 0, 1_000, 0, 1_000)
+    command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4")
+    assert "0:s?" in command
+    assert "1:0" not in command
+
+
+def test_extract_subtitles_command_maps_first_subtitle_track():
+    command = extract_subtitles_command("ffmpeg", "in.mp4", "out.srt")
+    assert command == [
+        "ffmpeg", "-y", "-i", "in.mp4", "-map", "0:s:0", "-f", "srt", "out.srt",
+    ]
 
 
 def test_gif_command_limits_duration():
