@@ -5,10 +5,7 @@ from buzz.highlights.media import (
     clip_command,
     concat_command,
     extract_subtitles_command,
-    gif_command,
-    preview_command,
     render_selected_video,
-    thumbnail_command,
     video_encoder_args,
 )
 from buzz.highlights.models import Candidate
@@ -23,17 +20,9 @@ def test_automatic_output_path_uses_source_directory_and_suffix():
 
 def test_commands_keep_paths_as_single_args():
     path = "/tmp/a video 中文.mp4"
-    assert path in thumbnail_command("ffmpeg", path, 1500, "/tmp/out x.jpg")
-    command = preview_command("ffmpeg", path, 1000, 5000, "/tmp/out.mp4", has_audio=False)
-    assert "-an" in command
+    candidate = Candidate("only", 1_000, 3_000, 1_000, 3_000)
+    command = clip_command("ffmpeg", path, candidate, "/tmp/out x.mp4")
     assert path in command
-    assert "-t" in command and "4.000" in command
-
-
-def test_preview_command_without_audio_uses_an():
-    command = preview_command("ffmpeg", "in.mp4", 0, 1000, "out.mp4", has_audio=False)
-    assert "-an" in command
-    assert "-c:a" not in command
 
 
 def test_clip_command_uses_high_quality_encoding_and_preserves_subtitles(monkeypatch):
@@ -147,11 +136,6 @@ def test_extract_subtitles_command_maps_first_subtitle_track():
     assert command == [
         "ffmpeg", "-y", "-i", "in.mp4", "-map", "0:s:0", "-f", "srt", "out.srt",
     ]
-
-
-def test_gif_command_limits_duration():
-    command = gif_command("ffmpeg", "in.mp4", 0, 20_000, "out.gif")
-    assert "12.000" in command
 
 
 def test_concat_command_uses_concat_demuxer():

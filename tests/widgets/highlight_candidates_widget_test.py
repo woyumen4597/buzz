@@ -47,7 +47,6 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert args.target_ratio == 0.5
     assert args.max_auto_clips == 0
     assert args.no_scene_detection is False
-    assert args.no_previews is False
     assert args.keep_static_scenes is False
     # The GUI has no CLI flags, so verification must be requested explicitly
     # rather than relying on the CLI default.

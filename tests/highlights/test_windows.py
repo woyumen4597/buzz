@@ -34,7 +34,7 @@ def test_default_two_hour_candidate_count_is_bounded():
 def test_auto_candidates_include_short_scale_for_brief_moments():
     candidates = generate_candidates(
         VideoInfo(60_000),
-        HighlightConfig(auto_edit=True, no_scene_detection=True, max_candidates=0),
+        HighlightConfig(no_scene_detection=True, max_candidates=0),
     )
     assert any("short_window" in candidate.reasons for candidate in candidates)
     assert any(candidate.duration_ms <= 10_000 for candidate in candidates)

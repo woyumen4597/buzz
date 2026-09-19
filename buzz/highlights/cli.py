@@ -8,12 +8,10 @@ import logging
 import shutil
 import sys
 import threading
-import webbrowser
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
-from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
+from .exporter import load_checkpoint
 from .auto_edit import (
     ALGORITHM_VERSION,
     resolve_target_duration_seconds,
@@ -24,14 +22,11 @@ from .output import automatic_output_path
 from .media import (
     extract_subtitles_command,
     find_tools,
-    generate_gif,
-    generate_preview,
-    generate_thumbnail,
     probe_media,
     render_selected_video,
     source_has_text_subtitles,
 )
-from .models import Candidate, HighlightConfig
+from .models import HighlightConfig
 from .progress import phase
 from .subtitles import (
     Subtitle,
@@ -66,7 +61,7 @@ def _ratio(value: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="buzz-highlights",
-        description="Generate human-reviewable video highlight candidates.",
+        description="Generate a highlight reel that skips the source's dull stretches.",
     )
     parser.add_argument("video", type=Path, help="input video file")
     parser.add_argument("--output-dir", type=Path)
@@ -77,17 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene-threshold", type=float, default=0.35)
     parser.add_argument("--max-candidates", type=int, default=200)
     parser.add_argument("--no-scene-detection", action="store_true")
-    parser.add_argument("--no-previews", action="store_true")
     parser.add_argument("--keep-static-scenes", action="store_true", help="do not auto-ignore low-motion candidates")
-    parser.add_argument("--auto-edit", action="store_true", help="automatically select and render a highlight reel")
     parser.add_argument("--target-ratio", type=_ratio, default=0.3, help="target reel duration as a fraction of the source, from 0 to 1")
     parser.add_argument("--target-duration", type=float, dest="target_duration", help=argparse.SUPPRESS)
     parser.add_argument("--max-auto-clips", type=int, default=0, help="maximum clips in an automatic reel; 0 means unlimited")
     parser.add_argument("--score-threshold", type=float, default=0.0, help="minimum automatic selection score")
-    parser.add_argument("--gif", action="store_true")
-    parser.add_argument("--gif-limit", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
-    parser.add_argument("--open", action="store_true", dest="open_html")
     parser.add_argument(
         "--verify",
         choices=("off", "fast", "full"),
@@ -106,12 +96,8 @@ def _config(args: argparse.Namespace) -> HighlightConfig:
         scene_threshold=args.scene_threshold,
         max_candidates=args.max_candidates,
         no_scene_detection=args.no_scene_detection,
-        no_previews=args.no_previews,
-        gif=args.gif,
-        gif_limit=args.gif_limit,
         keep_existing=args.keep_existing,
         ignore_static_scenes=not getattr(args, "keep_static_scenes", False),
-        auto_edit=getattr(args, "auto_edit", False),
         target_duration_ratio=getattr(args, "target_ratio", 0.3),
         target_duration_seconds=getattr(args, "target_duration", None),
         max_auto_clips=getattr(args, "max_auto_clips", 0),
@@ -129,9 +115,8 @@ def run(
         raise FileNotFoundError(f"input video does not exist: {video_path}")
     if not video_path.stat().st_size:
         raise ValueError(f"input video is empty: {video_path}")
-    automatic_output = bool(getattr(args, "auto_edit", False))
-    cleanup_work_dir = automatic_output and args.output_dir is None
-    final_output_path = automatic_output_path(video_path) if automatic_output else None
+    cleanup_work_dir = args.output_dir is None
+    final_output_path = automatic_output_path(video_path)
     output_dir = (
         Path(args.output_dir).expanduser().absolute()
         if args.output_dir
@@ -154,19 +139,17 @@ def run(
         video.audio_codec or "none",
     )
     config = _config(args)
-    if config.auto_edit:
-        config.target_duration_seconds = resolve_target_duration_seconds(
-            video.duration_ms,
-            config.target_duration_seconds,
-            configured_ratio=config.target_duration_ratio,
-        )
-        config.max_candidates = 0
-    warnings: list[str] = []
-    errors: list[str] = []
+    config.target_duration_seconds = resolve_target_duration_seconds(
+        video.duration_ms,
+        config.target_duration_seconds,
+        configured_ratio=config.target_duration_ratio,
+    )
+    config.max_candidates = 0
+    # Failures here are reported through the log and degrade the reel to
+    # whatever signals remain; they never abort the run.
     scene_points: list[int] | None = None
     motion_samples: list[tuple[int, float]] = []
     audio_samples: list[tuple[int, float]] = []
-    scene_enabled = not config.no_scene_detection
     motion_scanned = False
     if not config.no_scene_detection:
         # Motion and scene analysis share one decode pass; on a multi-hour
@@ -185,9 +168,7 @@ def run(
             )
         except Exception as exc:  # scene detection is explicitly best-effort
             warning = f"scene detection failed; using fixed windows: {exc}"
-            warnings.append(warning)
             LOG.warning(warning)
-            scene_enabled = False
     if not motion_scanned:
         try:
             with phase("scanning motion", LOG):
@@ -195,7 +176,6 @@ def run(
             LOG.info("motion scan: %d samples", len(motion_samples))
         except Exception as exc:
             warning = f"motion analysis failed; using base scores: {exc}"
-            warnings.append(warning)
             LOG.warning(warning)
     if video.audio_codec:
         try:
@@ -204,7 +184,6 @@ def run(
             LOG.info("audio scan: %d samples", len(audio_samples))
         except Exception as exc:
             warning = f"audio activity analysis failed; using visual scores: {exc}"
-            warnings.append(warning)
             LOG.warning(warning)
 
     # Subtitles feed the ranking score, so they must be resolved before
@@ -214,11 +193,11 @@ def run(
     source_subtitles: list[Subtitle] | None = None
     if args.srt:
         try:
-            source_subtitles, subtitle_warnings = parse_srt_file(args.srt)
-            warnings.extend(subtitle_warnings)
+            source_subtitles, warnings = parse_srt_file(args.srt)
+            for warning in warnings:
+                LOG.warning("SRT: %s", warning)
             LOG.info("ranking with %d cues from %s", len(source_subtitles), args.srt)
         except OSError as exc:
-            warnings.append(f"could not read SRT: {exc}")
             LOG.warning("could not read SRT %s: %s", args.srt, exc)
     else:
         try:
@@ -232,7 +211,6 @@ def run(
                 )
         except Exception as exc:  # ranking without subtitles is still valid
             warning = f"embedded subtitle extraction failed; ranking without transcripts: {exc}"
-            warnings.append(warning)
             LOG.warning(warning)
         if source_subtitles is None:
             LOG.info("no embedded text subtitle track; ranking on audio and video only")
@@ -266,7 +244,9 @@ def run(
                         if field in saved:
                             setattr(candidate, field, saved[field])
         else:
-            warnings.append("existing checkpoint does not match the current input or settings; starting fresh")
+            LOG.warning(
+                "existing checkpoint does not match the current input or settings; starting fresh"
+            )
 
     if source_subtitles:
         with phase("scoring transcripts", LOG):
@@ -281,160 +261,62 @@ def run(
             rescued,
         )
         if not boosted:
-            warnings.append("subtitles were found but no candidate overlaps them; check their timing")
+            LOG.warning("subtitles were found but no candidate overlaps them; check their timing")
         # Text density changes ranking, so keep stable IDs but order by score for assets.
         candidates.sort(key=lambda item: (-item.score, item.start_ms))
 
-    auto_selection = None
-    if config.auto_edit:
-        with phase("selecting highlights", LOG):
-            auto_selection = select_auto_candidates(candidates, config, source_duration_ms=video.duration_ms)
-        if not auto_selection.selected:
-            raise ValueError("no usable highlight candidates were found")
-        LOG.info(
-            "auto selection: %d clips, %.0fs of %.0fs budget (%s)",
-            len(auto_selection.selected),
-            auto_selection.total_duration_ms / 1000,
-            auto_selection.budget_ms / 1000,
-            ALGORITHM_VERSION,
-        )
-        (output_dir / "auto-selection.json").write_text(
-            json.dumps({
-                **selection_summary(candidates, config, source_duration_ms=video.duration_ms),
-                "config": config.to_dict(),
-            }, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-
-    # Automatic mode is a one-click workflow: only the selected reel needs
-    # review assets. Manual mode keeps the full candidate browser behavior.
-    thumbnail_candidates = auto_selection.selected if auto_selection is not None else candidates
-    preview_candidates = auto_selection.selected if auto_selection is not None else candidates
-    preview_ids = {candidate.id for candidate in preview_candidates}
-    thumbnail_dir = output_dir / "thumbnails"
-    preview_dir = output_dir / "previews"
-    total_steps = max(1, len(thumbnail_candidates) + (0 if config.no_previews else len(preview_candidates)))
-    completed_steps = 0
-    for candidate in thumbnail_candidates:
-        thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
-        if candidate.thumbnail and thumb_path.exists():
-            completed_steps += 1
-    if not config.no_previews:
-        for candidate in preview_candidates:
-            preview_path = preview_dir / f"{candidate.id}.mp4"
-            if candidate.preview and preview_path.exists():
-                completed_steps += 1
-    if progress_callback:
-        progress_callback(completed_steps, total_steps, "继续生成" if completed_steps else "准备素材")
+    with phase("selecting highlights", LOG):
+        auto_selection = select_auto_candidates(candidates, config, source_duration_ms=video.duration_ms)
+    if not auto_selection.selected:
+        raise ValueError("no usable highlight candidates were found")
     LOG.info(
-        "review assets: %d thumbnails%s, %d already present",
-        len(thumbnail_candidates),
-        "" if config.no_previews else f" and {len(preview_candidates)} previews",
-        completed_steps,
+        "auto selection: %d clips, %.0fs of %.0fs budget (%s)",
+        len(auto_selection.selected),
+        auto_selection.total_duration_ms / 1000,
+        auto_selection.budget_ms / 1000,
+        ALGORITHM_VERSION,
     )
-    # Each candidate's review assets are independent ffmpeg processes writing
-    # their own files, so they run concurrently. The per-candidate work stays
-    # whole (one worker owns both its thumbnail and preview) because the
-    # checkpoint write reflects a candidate's state as a unit.
-    gif_ids = {
-        candidate.id
-        for candidate in thumbnail_candidates[: config.gif_limit]
-    } if config.gif else set()
+    (output_dir / "auto-selection.json").write_text(
+        json.dumps({
+            **selection_summary(candidates, config, source_duration_ms=video.duration_ms),
+            "config": config.to_dict(),
+        }, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
-    def build_assets(candidate: Candidate) -> int:
-        if cancel_event is not None and cancel_event.is_set():
-            raise InterruptedError("highlight generation canceled")
-        steps = 0
-        thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
-        generate_thumbnail(candidate, str(video_path), thumb_path, ffmpeg, config.keep_existing)
-        if candidate.thumbnail:
-            candidate.thumbnail = thumb_path.relative_to(output_dir).as_posix()
-        steps += 1
-        if not config.no_previews and candidate.id in preview_ids:
-            preview_path = preview_dir / f"{candidate.id}.mp4"
-            generate_preview(
-                candidate,
-                str(video_path),
-                preview_path,
-                ffmpeg,
-                config.keep_existing,
-                has_audio=bool(video.audio_codec),
-            )
-            if candidate.preview:
-                candidate.preview = preview_path.relative_to(output_dir).as_posix()
-            steps += 1
-        if candidate.id in gif_ids:
-            gif_path = preview_dir / f"{candidate.id}.gif"
-            generate_gif(candidate, str(video_path), gif_path, ffmpeg, config.keep_existing)
-            if candidate.gif:
-                candidate.gif = gif_path.relative_to(output_dir).as_posix()
-        return steps
+    # Selection is automatic and the work directory is removed on success, so
+    # there is no manual review step to serve assets to.
+    total_steps = 1
+    if progress_callback:
+        progress_callback(0, total_steps, "准备素材")
 
-    workers = min(_REVIEW_ASSET_WORKERS, len(thumbnail_candidates))
-    if workers > 1:
-        LOG.info("building review assets with %d parallel workers", workers)
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        futures = {
-            pool.submit(build_assets, candidate): candidate
-            for candidate in thumbnail_candidates
-        }
-        for future in as_completed(futures):
-            candidate = futures[future]
-            completed_steps += future.result()
-            if progress_callback:
-                progress_callback(completed_steps, total_steps, f"素材 {candidate.id}")
-            # Checkpoints are written from this thread only: a concurrent
-            # writer could interleave with a reader mid-file.
-            write_checkpoint(output_dir, str(video_path), video, config, candidates)
+    render_total = len(auto_selection.selected) + 1
 
-    if auto_selection is not None and auto_selection.selected:
-        render_total = len(auto_selection.selected) + 1
+    def render_progress(completed: int, total: int, message: str) -> None:
+        if progress_callback:
+            progress_callback(total_steps + completed, total_steps + render_total, message)
 
-        def render_progress(completed: int, total: int, message: str) -> None:
-            if progress_callback:
-                progress_callback(total_steps + completed, total_steps + render_total, message)
-
-        if cancel_event is not None and cancel_event.is_set():
-            raise InterruptedError("highlight generation canceled")
-        LOG.info("rendering reel: %d clips", len(auto_selection.selected))
-        with phase("rendering highlight reel", LOG):
-            render_selected_video(
-                ffmpeg,
-                str(video_path),
-                auto_selection.selected,
-                output_dir,
-                has_audio=bool(video.audio_codec),
-                progress_callback=render_progress,
-                output_path=final_output_path,
-                source_subtitles=source_subtitles,
-            )
-        LOG.info("wrote %s", final_output_path)
-        if getattr(args, "verify", "fast") != "off":
-            _verify_output(args, final_output_path)
-        # A successful one-click run leaves only the final MP4 beside the source.
-        if cleanup_work_dir:
-            shutil.rmtree(output_dir, ignore_errors=True)
-        return final_output_path
-
-    export_config = config
-    if not scene_enabled:
-        export_config = HighlightConfig(**{**config.to_dict(), "no_scene_detection": True})
-    render_server = None
-    if args.open_html or getattr(args, "serve_html", False):
-        render_server, _thread = serve_result_page(
-            output_dir, candidates, str(video_path), ffmpeg, has_audio=bool(video.audio_codec)
+    if cancel_event is not None and cancel_event.is_set():
+        raise InterruptedError("highlight generation canceled")
+    LOG.info("rendering reel: %d clips", len(auto_selection.selected))
+    with phase("rendering highlight reel", LOG):
+        render_selected_video(
+            ffmpeg,
+            str(video_path),
+            auto_selection.selected,
+            output_dir,
+            has_audio=bool(video.audio_codec),
+            progress_callback=render_progress,
+            output_path=final_output_path,
+            source_subtitles=source_subtitles,
         )
-    render_endpoint = f"http://127.0.0.1:{render_server.server_port}/render" if render_server else None
-    export_outputs(
-        output_dir, candidates, video, export_config, str(video_path), errors, warnings,
-        render_endpoint=render_endpoint,
-    )
-    if render_server:
-        result_url = f"http://127.0.0.1:{render_server.server_port}"
-        (output_dir / ".highlight-server-url").write_text(result_url + "\n", encoding="utf-8")
-        if args.open_html:
-            webbrowser.open(result_url + "/index.html")
-    return output_dir
+    LOG.info("wrote %s", final_output_path)
+    if getattr(args, "verify", "fast") != "off":
+        _verify_output(args, final_output_path)
+    # A successful one-click run leaves only the final MP4 beside the source.
+    if cleanup_work_dir:
+        shutil.rmtree(output_dir, ignore_errors=True)
+    return final_output_path
 
 
 def _verify_output(args: argparse.Namespace, output_path: Path) -> None:
@@ -485,11 +367,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, NotADirectoryError, InterruptedError) as exc:
         parser.error(str(exc))
         return 2
-    if getattr(args, "auto_edit", False):
-        message = f"Generated reel: {output_dir}"
-    else:
-        message = f"Generated {output_dir / 'index.html'} ({len(list(output_dir.glob('thumbnails/*.jpg')))} thumbnails)"
-    print(message)
+    print(f"Generated reel: {output_dir}")
     return 0
 
 

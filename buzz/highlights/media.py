@@ -108,51 +108,6 @@ def video_encoder_args(ffmpeg: str) -> list[str]:
     return list(args)
 
 
-def _preview_encoder_args(ffmpeg: str) -> list[str]:
-    """Encoding options for the small scrub previews.
-
-    Previews are 640px wide review assets, so they keep their own cheap settings
-    instead of the delivery-quality clip encoder.
-    """
-    if sys.platform == "darwin" and _encoder_available(ffmpeg, _HARDWARE_ENCODER):
-        return ["-c:v", _HARDWARE_ENCODER, "-b:v", "1200k"]
-    return ["-c:v", _SOFTWARE_ENCODER, "-preset", "veryfast", "-crf", "30"]
-
-
-def thumbnail_command(ffmpeg: str, video_path: str, timestamp_ms: int, output_path: str) -> list[str]:
-    return [
-        ffmpeg, "-y", "-ss", _seconds(timestamp_ms), "-i", video_path,
-        "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "3", output_path,
-    ]
-
-
-def preview_command(
-    ffmpeg: str,
-    video_path: str,
-    start_ms: int,
-    end_ms: int,
-    output_path: str,
-    has_audio: bool = True,
-) -> list[str]:
-    return [
-        ffmpeg, "-y", "-ss", _seconds(start_ms), "-i", video_path,
-        "-t", _seconds(max(0, end_ms - start_ms)),
-        "-vf", "scale=640:-2", *_preview_encoder_args(ffmpeg),
-        *( ["-c:a", "aac", "-b:a", "96k"] if has_audio else ["-an"] ),
-        "-movflags", "+faststart", output_path,
-    ]
-
-
-def gif_command(
-    ffmpeg: str, video_path: str, start_ms: int, end_ms: int, output_path: str
-) -> list[str]:
-    duration = min(12_000, max(0, end_ms - start_ms))
-    return [
-        ffmpeg, "-y", "-ss", _seconds(start_ms), "-i", video_path, "-t", _seconds(duration),
-        "-vf", "fps=8,scale=480:-2:flags=lanczos", output_path,
-    ]
-
-
 def _run_atomic(command: Sequence[str], output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(
@@ -173,67 +128,6 @@ def _run_atomic(command: Sequence[str], output_path: Path) -> None:
 def _error_summary(exc: subprocess.CalledProcessError) -> str:
     output = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()
     return output[-1][-500:] if output else str(exc)
-
-
-def generate_thumbnail(
-    candidate: Candidate, video_path: str, output_path: Path, ffmpeg: str, keep_existing: bool = False
-) -> None:
-    if keep_existing and output_path.exists():
-        candidate.thumbnail = output_path.as_posix()
-        return
-    timestamp = candidate.start_ms + round(candidate.duration_ms * 0.5)
-    try:
-        _run_atomic(thumbnail_command(ffmpeg, video_path, timestamp, str(output_path)), output_path)
-        candidate.thumbnail = output_path.as_posix()
-    except subprocess.CalledProcessError as exc:
-        candidate.errors.append(f"thumbnail: {_error_summary(exc)}")
-        LOG.warning("Thumbnail failed for %s: %s", candidate.id, candidate.errors[-1])
-
-
-def generate_preview(
-    candidate: Candidate,
-    video_path: str,
-    output_path: Path,
-    ffmpeg: str,
-    keep_existing: bool = False,
-    has_audio: bool = True,
-) -> None:
-    if keep_existing and output_path.exists():
-        candidate.preview = output_path.as_posix()
-        return
-    try:
-        _run_atomic(
-            preview_command(
-                ffmpeg,
-                video_path,
-                candidate.preview_start_ms,
-                candidate.preview_end_ms,
-                str(output_path),
-                has_audio=has_audio,
-            ),
-            output_path,
-        )
-        candidate.preview = output_path.as_posix()
-    except subprocess.CalledProcessError as exc:
-        candidate.errors.append(f"preview: {_error_summary(exc)}")
-        LOG.warning("Preview failed for %s: %s", candidate.id, candidate.errors[-1])
-
-
-def generate_gif(
-    candidate: Candidate, video_path: str, output_path: Path, ffmpeg: str, keep_existing: bool = False
-) -> None:
-    if keep_existing and output_path.exists():
-        candidate.gif = output_path.as_posix()
-        return
-    try:
-        _run_atomic(
-            gif_command(ffmpeg, video_path, candidate.preview_start_ms, candidate.preview_end_ms, str(output_path)),
-            output_path,
-        )
-        candidate.gif = output_path.as_posix()
-    except subprocess.CalledProcessError as exc:
-        candidate.errors.append(f"gif: {_error_summary(exc)}")
-        LOG.warning("GIF failed for %s: %s", candidate.id, candidate.errors[-1])
 
 
 def clip_command(

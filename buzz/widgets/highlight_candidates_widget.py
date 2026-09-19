@@ -171,9 +171,7 @@ class HighlightCandidatesWidget(QWidget):
         layout.addWidget(form_container, 0, Qt.AlignmentFlag.AlignLeft)
 
         self.no_scene_detection = False
-        self.no_previews = False
         self.ignore_static_scenes = True
-        self.auto_edit = True
 
         actions = QHBoxLayout()
         self.run_button = QPushButton(_("Generate highlight reel"), self)
@@ -258,17 +256,11 @@ class HighlightCandidatesWidget(QWidget):
             scene_threshold=0.35,
             max_candidates=self._max_candidates,
             no_scene_detection=self.no_scene_detection,
-            no_previews=self.no_previews,
             static_motion_threshold=1.5,
-            auto_edit=self.auto_edit,
             target_ratio=self.target_ratio.value(),
             max_auto_clips=0,
             score_threshold=0.0,
-            gif=False,
-            gif_limit=0,
             keep_existing=True,
-            open_html=False,
-            serve_html=True,
             keep_static_scenes=False,
             # Validate the reel automatically: the GUI has no CLI flags, and a
             # misaligned-subtitle reel is not something a user would notice by

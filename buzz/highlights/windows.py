@@ -452,7 +452,7 @@ def generate_candidates(
 ) -> list[Candidate]:
     config = config or HighlightConfig()
     candidates = fixed_window_candidates(video, config)
-    if config.auto_edit and config.window_seconds > config.min_duration_seconds * 2:
+    if config.window_seconds > config.min_duration_seconds * 2:
         # A second, shorter scale catches brief reactions, punchlines, and
         # other high-value moments diluted by the default 20-second window.
         short_config = replace(

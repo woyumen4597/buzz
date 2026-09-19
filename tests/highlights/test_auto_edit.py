@@ -104,7 +104,7 @@ def test_short_sources_produce_a_reel_at_the_default_ratio():
             duration_ms=seconds * 1000, width=320, height=240, fps=30,
             video_codec="h264", audio_codec="aac",
         )
-        config = HighlightConfig(auto_edit=True, target_duration_ratio=0.3)
+        config = HighlightConfig(target_duration_ratio=0.3)
         candidates = generate_candidates(video, config, None, [], [])
         if not candidates:
             continue

@@ -68,13 +68,9 @@ class HighlightConfig:
     min_scene_duration_seconds: float = 2.0
     max_candidates: int = 200
     no_scene_detection: bool = False
-    no_previews: bool = False
-    gif: bool = False
-    gif_limit: int = 20
     keep_existing: bool = False
     ignore_static_scenes: bool = True
     static_motion_threshold: float = 1.5
-    auto_edit: bool = False
     # Kept in its original position for positional-config compatibility.
     target_duration_seconds: float = 0.0
     max_auto_clips: int = 0
@@ -103,7 +99,7 @@ class HighlightConfig:
             raise ValueError("max_duration_seconds must be >= min_duration_seconds")
         if not 0 <= self.scene_threshold <= 1:
             raise ValueError("scene_threshold must be between 0 and 1")
-        if self.max_candidates < 0 or self.gif_limit < 0:
+        if self.max_candidates < 0:
             raise ValueError("candidate limits must be non-negative")
         if self.static_motion_threshold > 255:
             raise ValueError("static_motion_threshold must be <= 255")
