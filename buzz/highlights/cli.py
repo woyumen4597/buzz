@@ -9,6 +9,7 @@ import shutil
 import sys
 import threading
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -30,7 +31,7 @@ from .media import (
     render_selected_video,
     source_has_text_subtitles,
 )
-from .models import HighlightConfig
+from .models import Candidate, HighlightConfig
 from .progress import phase
 from .subtitles import (
     Subtitle,
@@ -47,6 +48,12 @@ from .windows import (
 )
 
 LOG = logging.getLogger(__name__)
+
+#: Review assets (thumbnails, previews, GIFs) are small ffmpeg jobs whose cost
+#: is dominated by process startup and source seek, so the wall clock is almost
+#: entirely the serial spawn chain. Four at a time matches the performance-core
+#: count without starving the encode pool that runs later.
+_REVIEW_ASSET_WORKERS = 4
 
 
 def _ratio(value: str) -> float:
@@ -325,20 +332,25 @@ def run(
         "" if config.no_previews else f" and {len(preview_candidates)} previews",
         completed_steps,
     )
-    for candidate in thumbnail_candidates:
+    # Each candidate's review assets are independent ffmpeg processes writing
+    # their own files, so they run concurrently. The per-candidate work stays
+    # whole (one worker owns both its thumbnail and preview) because the
+    # checkpoint write reflects a candidate's state as a unit.
+    gif_ids = {
+        candidate.id
+        for candidate in thumbnail_candidates[: config.gif_limit]
+    } if config.gif else set()
+
+    def build_assets(candidate: Candidate) -> int:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("highlight generation canceled")
+        steps = 0
         thumb_path = thumbnail_dir / f"{candidate.id}.jpg"
         generate_thumbnail(candidate, str(video_path), thumb_path, ffmpeg, config.keep_existing)
         if candidate.thumbnail:
             candidate.thumbnail = thumb_path.relative_to(output_dir).as_posix()
-        completed_steps += 1
-        if progress_callback:
-            progress_callback(completed_steps, total_steps, f"缩略图 {candidate.id}")
-        write_checkpoint(output_dir, str(video_path), video, config, candidates)
+        steps += 1
         if not config.no_previews and candidate.id in preview_ids:
-            if cancel_event is not None and cancel_event.is_set():
-                raise InterruptedError("highlight generation canceled")
             preview_path = preview_dir / f"{candidate.id}.mp4"
             generate_preview(
                 candidate,
@@ -350,15 +362,30 @@ def run(
             )
             if candidate.preview:
                 candidate.preview = preview_path.relative_to(output_dir).as_posix()
-            completed_steps += 1
-            if progress_callback:
-                progress_callback(completed_steps, total_steps, f"预览 {candidate.id}")
-            write_checkpoint(output_dir, str(video_path), video, config, candidates)
-        if config.gif and thumbnail_candidates.index(candidate) < config.gif_limit:
+            steps += 1
+        if candidate.id in gif_ids:
             gif_path = preview_dir / f"{candidate.id}.gif"
             generate_gif(candidate, str(video_path), gif_path, ffmpeg, config.keep_existing)
             if candidate.gif:
                 candidate.gif = gif_path.relative_to(output_dir).as_posix()
+        return steps
+
+    workers = min(_REVIEW_ASSET_WORKERS, len(thumbnail_candidates))
+    if workers > 1:
+        LOG.info("building review assets with %d parallel workers", workers)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {
+            pool.submit(build_assets, candidate): candidate
+            for candidate in thumbnail_candidates
+        }
+        for future in as_completed(futures):
+            candidate = futures[future]
+            completed_steps += future.result()
+            if progress_callback:
+                progress_callback(completed_steps, total_steps, f"素材 {candidate.id}")
+            # Checkpoints are written from this thread only: a concurrent
+            # writer could interleave with a reader mid-file.
+            write_checkpoint(output_dir, str(video_path), video, config, candidates)
 
     if auto_selection is not None and auto_selection.selected:
         render_total = len(auto_selection.selected) + 1

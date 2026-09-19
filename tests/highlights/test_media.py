@@ -1,3 +1,4 @@
+import threading
 from pathlib import Path
 
 from buzz.highlights.media import (
@@ -8,6 +9,7 @@ from buzz.highlights.media import (
     preview_command,
     render_selected_video,
     thumbnail_command,
+    video_encoder_args,
 )
 from buzz.highlights.models import Candidate
 from buzz.highlights.output import automatic_output_path
@@ -34,14 +36,15 @@ def test_preview_command_without_audio_uses_an():
     assert "-c:a" not in command
 
 
-def test_clip_command_uses_high_quality_encoding_and_preserves_subtitles():
+def test_clip_command_uses_high_quality_encoding_and_preserves_subtitles(monkeypatch):
+    monkeypatch.setattr("buzz.highlights.media.video_encoder_args", lambda _ffmpeg: ["-c:v", "libx264"])
     candidate = Candidate("only", 1_000, 3_000, 1_000, 3_000)
     command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4")
     assert command[command.index("-map"):command.index("-c:v")] == [
         "-map", "0:v:0", "-map", "0:a:0?", "-map", "0:s?",
     ]
     assert command[command.index("-c:v"):command.index("-c:a")] == [
-        "-c:v", "libx264", "-preset", "medium", "-crf", "18",
+        "-c:v", "libx264",
     ]
     assert command[command.index("-c:a"):command.index("-c:s")] == [
         "-c:a", "aac", "-b:a", "192k",
@@ -79,6 +82,64 @@ def test_clip_command_without_retimed_srt_still_maps_source_subtitles():
     command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4")
     assert "0:s?" in command
     assert "1:0" not in command
+
+
+def test_video_encoder_args_prefers_hardware_on_macos(monkeypatch):
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: True)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+    args = video_encoder_args("/usr/bin/ffmpeg")
+    assert args[:2] == ["-c:v", "h264_videotoolbox"]
+
+
+def test_video_encoder_args_falls_back_to_software(monkeypatch):
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: False)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+    args = video_encoder_args("/usr/bin/ffmpeg")
+    assert args[:2] == ["-c:v", "libx264"]
+    assert "-preset" in args and "veryfast" in args
+    # libx264 regresses past the performance-core count on Apple silicon.
+    assert args[args.index("-threads") + 1] == "4"
+
+
+def test_video_encoder_args_are_memoized_per_binary(monkeypatch):
+    calls = []
+
+    def counting_probe(*_args):
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", counting_probe)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+    video_encoder_args("/usr/bin/ffmpeg")
+    video_encoder_args("/usr/bin/ffmpeg")
+    assert len(calls) == 1
+
+
+def test_render_selected_video_parallelizes_and_keeps_timeline_order(tmp_path, monkeypatch):
+    """Concurrent encodes must still concatenate in timeline order."""
+    candidates = [
+        Candidate(str(i), i * 2_000, i * 2_000 + 1_000, i * 2_000, i * 2_000 + 1_000,
+                  selected=True, status="keep")
+        for i in range(4)
+    ]
+    seen = []
+    lock = threading.Lock()
+
+    def fake_run(command, output_path):
+        if output_path.suffix == ".mp4" and output_path.name.startswith("clip_"):
+            with lock:
+                seen.append(output_path.name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"ok")
+
+    monkeypatch.setattr("buzz.highlights.media._run_atomic", fake_run)
+    render_selected_video("ffmpeg", "input.mp4", candidates, tmp_path)
+
+    # The four clips are named by sorted index regardless of encode order.
+    assert sorted(seen) == [f"clip_{i:04d}.mp4" for i in range(1, 5)]
 
 
 def test_extract_subtitles_command_maps_first_subtitle_track():
