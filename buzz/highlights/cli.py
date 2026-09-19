@@ -31,6 +31,7 @@ from .media import (
 from .models import HighlightConfig
 from .progress import phase
 from .subtitles import associate_subtitles, parse_srt_file
+from .verify import summarise, verify_reel
 from .windows import (
     generate_candidates,
     scan_audio_activity,
@@ -73,6 +74,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--gif-limit", type=int, default=20)
     parser.add_argument("--keep-existing", action="store_true")
     parser.add_argument("--open", action="store_true", dest="open_html")
+    parser.add_argument(
+        "--verify",
+        choices=("off", "fast", "full"),
+        default="fast",
+        help="validate the rendered reel: fast samples audio/video, full decodes more",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -329,6 +336,8 @@ def run(
                 output_path=final_output_path,
             )
         LOG.info("wrote %s", final_output_path)
+        if getattr(args, "verify", "fast") != "off":
+            _verify_output(args, final_output_path)
         # A successful one-click run leaves only the final MP4 beside the source.
         if cleanup_work_dir:
             shutil.rmtree(output_dir, ignore_errors=True)
@@ -353,6 +362,45 @@ def run(
         if args.open_html:
             webbrowser.open(result_url + "/index.html")
     return output_dir
+
+
+def _verify_output(args: argparse.Namespace, output_path: Path) -> None:
+    """Validate a freshly rendered reel and report through the log.
+
+    Verification is best-effort: a defect in the reel is worth reporting, but
+    it must never turn a successful render into a failed run.
+    """
+    mode = getattr(args, "verify", "fast")
+    sample_count, window_s = (6, 5.0) if mode == "fast" else (24, 8.0)
+    try:
+        with phase("verifying highlight reel", LOG):
+            report = verify_reel(
+                output_path, sample_count=sample_count, sample_window_s=window_s
+            )
+    except Exception as exc:  # verification must never break a good render
+        LOG.warning("reel verification could not run: %s", exc)
+        return
+    for check in report.checks:
+        level = {"error": logging.ERROR, "warning": logging.WARNING}.get(
+            check.severity, logging.INFO
+        )
+        LOG.log(level, "verify %s: %s", check.name, check.detail)
+    if report.ok:
+        LOG.info(
+            "reel verified (%d warning(s) to review)",
+            len(report.warnings),
+        )
+    else:
+        LOG.error(
+            "reel verification found %d problem(s); the output may be unusable",
+            len(report.errors),
+        )
+    try:
+        (output_path.parent / "verification.txt").write_text(
+            summarise(report) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        LOG.debug("could not write verification report: %s", exc)
 
 
 def main(argv: list[str] | None = None) -> int:
