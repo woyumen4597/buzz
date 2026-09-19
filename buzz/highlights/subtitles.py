@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import logging
 import re
+import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .models import Candidate, format_timestamp, interval_overlap
 
@@ -76,6 +78,58 @@ def parse_srt(content: str) -> tuple[list[Subtitle], list[str]]:
 
 def parse_srt_file(path: str | Path) -> tuple[list[Subtitle], list[str]]:
     return parse_srt(Path(path).read_text(encoding="utf-8-sig"))
+
+
+def extract_source_subtitles(
+    ffmpeg: str,
+    video_path: str | Path,
+    *,
+    has_text_subtitles: Callable[[str], bool],
+    build_command: Callable[[str, str, str], list[str]],
+    work_dir: Path | None = None,
+) -> list[Subtitle] | None:
+    """Extract a source's embedded text subtitle track as cues.
+
+    Both the ranking stage and the render stage need the same track: ranking
+    uses cue density as a score signal, rendering re-times the cues per clip.
+    Extracting once and sharing the result keeps the two consistent and avoids
+    a second full-track decode.
+
+    Returns ``None`` when the source carries no retimable text track or when
+    extraction fails; both are non-fatal and callers proceed without
+    subtitles. ``has_text_subtitles``/``build_command`` are injected so this
+    module stays free of ffmpeg discovery.
+    """
+    if not has_text_subtitles(str(video_path)):
+        return None
+    temp_dir = Path(work_dir) if work_dir is not None else Path(tempfile.mkdtemp())
+    owned = work_dir is None
+    srt_path = temp_dir / ".highlight-source.srt"
+    try:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            build_command(ffmpeg, str(video_path), str(srt_path)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subtitles, warnings = parse_srt_file(srt_path)
+        for warning in warnings:
+            LOG.debug("source subtitle: %s", warning)
+        if not subtitles:
+            LOG.warning("source subtitles could not be parsed")
+            return None
+        return subtitles
+    except (subprocess.CalledProcessError, OSError) as exc:
+        LOG.warning("subtitle extraction failed: %s", exc)
+        return None
+    finally:
+        srt_path.unlink(missing_ok=True)
+        if owned:
+            try:
+                temp_dir.rmdir()
+            except OSError:
+                pass
 
 
 def format_srt(subtitles: Iterable[Subtitle]) -> str:

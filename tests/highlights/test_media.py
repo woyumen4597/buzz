@@ -11,6 +11,7 @@ from buzz.highlights.media import (
 )
 from buzz.highlights.models import Candidate
 from buzz.highlights.output import automatic_output_path
+from buzz.highlights.subtitles import Subtitle
 
 
 def test_automatic_output_path_uses_source_directory_and_suffix():
@@ -150,3 +151,49 @@ def test_render_selected_video_supports_final_output_path(tmp_path, monkeypatch)
     )
     assert output == final_path
     assert commands[-1][-1] == str(final_path)
+
+
+def test_render_selected_video_reuses_caller_supplied_subtitles(tmp_path, monkeypatch):
+    """Ranking already extracted the track, so rendering must not extract again."""
+    candidate = Candidate("only", 0, 5_000, 0, 5_000, selected=True, status="keep")
+    commands = []
+
+    def fake_run(command, output_path):
+        commands.append(command)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"ok")
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("render must not re-extract subtitles")
+
+    monkeypatch.setattr("buzz.highlights.media._run_atomic", fake_run)
+    monkeypatch.setattr("buzz.highlights.media._load_source_subtitles", explode)
+    render_selected_video(
+        "ffmpeg",
+        "input.mp4",
+        [candidate],
+        tmp_path,
+        source_subtitles=[Subtitle(1_000, 2_000, "cue")],
+    )
+    clip_command = commands[0]
+    assert "-f" in clip_command and "srt" in clip_command
+
+
+def test_render_selected_video_extracts_subtitles_when_not_supplied(tmp_path, monkeypatch):
+    candidate = Candidate("only", 0, 5_000, 0, 5_000, selected=True, status="keep")
+    commands = []
+    calls = []
+
+    def fake_run(command, output_path):
+        commands.append(command)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"ok")
+
+    def fake_load(_ffmpeg, _video, _output_dir):
+        calls.append(True)
+        return [Subtitle(1_000, 2_000, "cue")]
+
+    monkeypatch.setattr("buzz.highlights.media._run_atomic", fake_run)
+    monkeypatch.setattr("buzz.highlights.media._load_source_subtitles", fake_load)
+    render_selected_video("ffmpeg", "input.mp4", [candidate], tmp_path)
+    assert calls == [True]

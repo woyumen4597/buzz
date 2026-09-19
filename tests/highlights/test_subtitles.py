@@ -1,8 +1,11 @@
+from pathlib import Path
+
 from buzz.highlights.models import Candidate
 from buzz.highlights.subtitles import (
     Subtitle,
     associate_subtitles,
     clip_subtitles,
+    extract_source_subtitles,
     format_srt,
     parse_srt,
 )
@@ -67,3 +70,82 @@ def test_clipped_srt_round_trips_through_the_parser():
     assert [(cue.start_ms, cue.end_ms, cue.text) for cue in reparsed] == [
         (2_000, 6_000, "b"),
     ]
+
+
+def _writer(srt_text: str):
+    """Build a fake extraction command that writes ``srt_text`` and succeeds."""
+
+    def build_command(_ffmpeg: str, _video: str, output_path: str) -> list[str]:
+        Path(output_path).write_text(srt_text, encoding="utf-8")
+        return ["true", output_path]
+
+    return build_command
+
+
+def test_extract_source_subtitles_returns_cues_for_a_text_track(tmp_path):
+    cues = extract_source_subtitles(
+        "ffmpeg",
+        "video.mp4",
+        has_text_subtitles=lambda _path: True,
+        build_command=_writer("1\n00:00:01,000 --> 00:00:02,000\nhello\n"),
+        work_dir=tmp_path,
+    )
+    assert [(cue.start_ms, cue.end_ms, cue.text) for cue in cues] == [
+        (1_000, 2_000, "hello"),
+    ]
+
+
+def test_extract_source_subtitles_skips_sources_without_a_text_track(tmp_path):
+    def explode(*_args, **_kwargs):
+        raise AssertionError("extraction must not run without a text track")
+
+    assert (
+        extract_source_subtitles(
+            "ffmpeg",
+            "video.mp4",
+            has_text_subtitles=lambda _path: False,
+            build_command=explode,
+            work_dir=tmp_path,
+        )
+        is None
+    )
+
+
+def test_extract_source_subtitles_returns_none_when_the_command_fails(tmp_path):
+    def failing_command(_ffmpeg: str, _video: str, _output: str) -> list[str]:
+        return ["false"]
+
+    assert (
+        extract_source_subtitles(
+            "ffmpeg",
+            "video.mp4",
+            has_text_subtitles=lambda _path: True,
+            build_command=failing_command,
+            work_dir=tmp_path,
+        )
+        is None
+    )
+
+
+def test_extract_source_subtitles_returns_none_when_the_track_has_no_cues(tmp_path):
+    assert (
+        extract_source_subtitles(
+            "ffmpeg",
+            "video.mp4",
+            has_text_subtitles=lambda _path: True,
+            build_command=_writer(""),
+            work_dir=tmp_path,
+        )
+        is None
+    )
+
+
+def test_extract_source_subtitles_removes_its_temporary_srt(tmp_path):
+    extract_source_subtitles(
+        "ffmpeg",
+        "video.mp4",
+        has_text_subtitles=lambda _path: True,
+        build_command=_writer("1\n00:00:01,000 --> 00:00:02,000\nhello\n"),
+        work_dir=tmp_path,
+    )
+    assert not (tmp_path / ".highlight-source.srt").exists()

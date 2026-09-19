@@ -13,7 +13,12 @@ from typing import Callable, Sequence
 from buzz.ffmpeg_video_player import _find_ffmpeg, _find_ffprobe, probe_video
 
 from .models import Candidate, VideoInfo, format_timestamp
-from .subtitles import Subtitle, clip_subtitles, parse_srt_file, write_srt_file
+from .subtitles import (
+    Subtitle,
+    clip_subtitles,
+    extract_source_subtitles,
+    write_srt_file,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -241,8 +246,14 @@ def render_selected_video(
     has_audio: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
     output_path: Path | None = None,
+    source_subtitles: Sequence[Subtitle] | None = None,
 ) -> Path:
-    """Create individual selected clips and concatenate them in timeline order."""
+    """Create individual selected clips and concatenate them in timeline order.
+
+    When ``source_subtitles`` is given the caller has already extracted them
+    (the ranking stage does this so cues can influence scores); otherwise the
+    track is extracted here.
+    """
     selected = sorted(
         (candidate for candidate in candidates if candidate.selected),
         key=lambda item: (item.start_ms, item.end_ms, item.id),
@@ -260,7 +271,8 @@ def render_selected_video(
     total = len(selected) + 1
     concat_file = output_dir / ".highlight-concat.txt"
     clip_paths: list[Path] = []
-    source_subtitles = _load_source_subtitles(ffmpeg, video_path, output_dir)
+    if source_subtitles is None:
+        source_subtitles = _load_source_subtitles(ffmpeg, video_path, output_dir)
     if source_subtitles is None:
         LOG.info("no retimable subtitle track; rendering %d clips without subtitles", len(selected))
     else:
@@ -328,28 +340,13 @@ def _load_source_subtitles(
     Extracting a single full track and slicing it per clip is what keeps the
     reel's subtitles aligned; copying the source track per clip drifts.
     """
-    if not source_has_text_subtitles(video_path):
-        return None
-    srt_path = output_dir / ".highlight-source.srt"
-    try:
-        subprocess.run(
-            extract_subtitles_command(ffmpeg, video_path, str(srt_path)),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        subtitles, warnings = parse_srt_file(srt_path)
-        for warning in warnings:
-            LOG.debug("source subtitle: %s", warning)
-        if not subtitles:
-            LOG.warning("source subtitles could not be parsed; rendering without subtitles")
-            return None
-        return subtitles
-    except subprocess.CalledProcessError as exc:
-        LOG.warning("subtitle extraction failed; rendering without subtitles: %s", _error_summary(exc))
-        return None
-    finally:
-        srt_path.unlink(missing_ok=True)
+    return extract_source_subtitles(
+        ffmpeg,
+        video_path,
+        has_text_subtitles=source_has_text_subtitles,
+        build_command=extract_subtitles_command,
+        work_dir=output_dir,
+    )
 
 
 def candidate_timestamp_label(candidate: Candidate) -> str:
