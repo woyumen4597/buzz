@@ -13,7 +13,12 @@ from pathlib import Path
 from typing import Callable
 
 from .exporter import export_outputs, load_checkpoint, serve_result_page, write_checkpoint
-from .auto_edit import resolve_target_duration_seconds, selection_summary, select_auto_candidates
+from .auto_edit import (
+    ALGORITHM_VERSION,
+    resolve_target_duration_seconds,
+    selection_summary,
+    select_auto_candidates,
+)
 from .output import automatic_output_path
 from .media import (
     find_tools,
@@ -24,6 +29,7 @@ from .media import (
     render_selected_video,
 )
 from .models import HighlightConfig
+from .progress import phase
 from .subtitles import associate_subtitles, parse_srt_file
 from .windows import (
     generate_candidates,
@@ -115,7 +121,17 @@ def run(
         raise NotADirectoryError(str(output_dir))
 
     ffmpeg, _ = find_tools()
-    video = probe_media(str(video_path))
+    with phase("probing source media", LOG):
+        video = probe_media(str(video_path))
+    LOG.info(
+        "source: %s (%dx%d, %.0fs, video=%s, audio=%s)",
+        video_path.name,
+        video.width,
+        video.height,
+        video.duration_ms / 1000,
+        video.video_codec or "none",
+        video.audio_codec or "none",
+    )
     config = _config(args)
     if config.auto_edit:
         config.target_duration_seconds = resolve_target_duration_seconds(
@@ -136,10 +152,16 @@ def run(
         # source that is the difference between minutes of fan noise and one
         # continuous scan.
         try:
-            motion_samples, scene_points = scan_motion_and_scenes(
-                ffmpeg, str(video_path), config.scene_threshold
-            )
+            with phase("scanning motion and scenes", LOG):
+                motion_samples, scene_points = scan_motion_and_scenes(
+                    ffmpeg, str(video_path), config.scene_threshold
+                )
             motion_scanned = True
+            LOG.info(
+                "combined scan: %d motion samples, %d scene changes",
+                len(motion_samples),
+                len(scene_points),
+            )
         except Exception as exc:  # scene detection is explicitly best-effort
             warning = f"scene detection failed; using fixed windows: {exc}"
             warnings.append(warning)
@@ -147,20 +169,26 @@ def run(
             scene_enabled = False
     if not motion_scanned:
         try:
-            motion_samples = scan_motion(ffmpeg, str(video_path))
+            with phase("scanning motion", LOG):
+                motion_samples = scan_motion(ffmpeg, str(video_path))
+            LOG.info("motion scan: %d samples", len(motion_samples))
         except Exception as exc:
             warning = f"motion analysis failed; using base scores: {exc}"
             warnings.append(warning)
             LOG.warning(warning)
     if video.audio_codec:
         try:
-            audio_samples = scan_audio_activity(ffmpeg, str(video_path))
+            with phase("scanning audio activity", LOG):
+                audio_samples = scan_audio_activity(ffmpeg, str(video_path))
+            LOG.info("audio scan: %d samples", len(audio_samples))
         except Exception as exc:
             warning = f"audio activity analysis failed; using visual scores: {exc}"
             warnings.append(warning)
             LOG.warning(warning)
 
-    candidates = generate_candidates(video, config, scene_points, motion_samples, audio_samples)
+    with phase("generating candidates", LOG):
+        candidates = generate_candidates(video, config, scene_points, motion_samples, audio_samples)
+    LOG.info("generated %d candidates", len(candidates))
     checkpoint = load_checkpoint(output_dir) if config.keep_existing else None
     if checkpoint:
         checkpoint_input = checkpoint.get("input", {})
@@ -200,9 +228,17 @@ def run(
 
     auto_selection = None
     if config.auto_edit:
-        auto_selection = select_auto_candidates(candidates, config, source_duration_ms=video.duration_ms)
+        with phase("selecting highlights", LOG):
+            auto_selection = select_auto_candidates(candidates, config, source_duration_ms=video.duration_ms)
         if not auto_selection.selected:
             raise ValueError("no usable highlight candidates were found")
+        LOG.info(
+            "auto selection: %d clips, %.0fs of %.0fs budget (%s)",
+            len(auto_selection.selected),
+            auto_selection.total_duration_ms / 1000,
+            auto_selection.budget_ms / 1000,
+            ALGORITHM_VERSION,
+        )
         (output_dir / "auto-selection.json").write_text(
             json.dumps({
                 **selection_summary(candidates, config, source_duration_ms=video.duration_ms),
@@ -231,6 +267,12 @@ def run(
                 completed_steps += 1
     if progress_callback:
         progress_callback(completed_steps, total_steps, "继续生成" if completed_steps else "准备素材")
+    LOG.info(
+        "review assets: %d thumbnails%s, %d already present",
+        len(thumbnail_candidates),
+        "" if config.no_previews else f" and {len(preview_candidates)} previews",
+        completed_steps,
+    )
     for candidate in thumbnail_candidates:
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("highlight generation canceled")
@@ -275,15 +317,18 @@ def run(
 
         if cancel_event is not None and cancel_event.is_set():
             raise InterruptedError("highlight generation canceled")
-        render_selected_video(
-            ffmpeg,
-            str(video_path),
-            auto_selection.selected,
-            output_dir,
-            has_audio=bool(video.audio_codec),
-            progress_callback=render_progress,
-            output_path=final_output_path,
-        )
+        LOG.info("rendering reel: %d clips", len(auto_selection.selected))
+        with phase("rendering highlight reel", LOG):
+            render_selected_video(
+                ffmpeg,
+                str(video_path),
+                auto_selection.selected,
+                output_dir,
+                has_audio=bool(video.audio_codec),
+                progress_callback=render_progress,
+                output_path=final_output_path,
+            )
+        LOG.info("wrote %s", final_output_path)
         # A successful one-click run leaves only the final MP4 beside the source.
         if cleanup_work_dir:
             shutil.rmtree(output_dir, ignore_errors=True)

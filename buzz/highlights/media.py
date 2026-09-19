@@ -295,6 +295,13 @@ def render_selected_video(
                 if subtitle_path is not None:
                     subtitle_path.unlink(missing_ok=True)
             clip_paths.append(clip_path)
+            LOG.info(
+                "clip %d/%d rendered (%.1fs from %s)",
+                index,
+                len(selected),
+                candidate.duration_ms / 1000,
+                format_timestamp(candidate.start_ms),
+            )
             if progress_callback:
                 progress_callback(index, total, f"剪辑 {candidate.id}")
 
@@ -304,6 +311,7 @@ def render_selected_video(
             concat_lines.append(f"file '{escaped}'")
         concat_file.write_text("\n".join(concat_lines) + "\n", encoding="utf-8")
         final_path = output_path or output_dir / "highlights.mp4"
+        LOG.info("concatenating %d clips", len(clip_paths))
         _run_atomic(concat_command(ffmpeg, str(concat_file), str(final_path)), final_path)
         if progress_callback:
             progress_callback(total, total, "拼接完成")
