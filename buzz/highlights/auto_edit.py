@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+import logging
 import math
 from typing import Iterable
 
 from .models import Candidate, HighlightConfig, interval_iou
 
+LOG = logging.getLogger(__name__)
 
 ALGORITHM_VERSION = "weighted-interval-budget-v6"
 _BUDGET_QUANTUM_MS = 1000
@@ -242,6 +244,21 @@ def select_auto_candidates(
     # Binary search beats the previous backward scan: it is O(n log n) overall
     # instead of O(n^2) on sources that produce thousands of candidates.
     predecessors = [bisect_right(ends, candidate.start_ms) - 1 for candidate in ordered]
+
+    # A strict knapsack returns nothing when the budget is smaller than every
+    # candidate, which is arithmetically right but useless: short sources at the
+    # default ratio (anything under ~35s) would fail outright, as would a very
+    # small ratio on a long one. Widen the budget to the shortest candidate so a
+    # reel always exists, and report the widened budget so the caller can see
+    # the selection ran over the configured target.
+    shortest_ms = min(candidate.duration_ms for candidate in ordered)
+    if budget_ms < shortest_ms:
+        LOG.info(
+            "target budget %dms is below the shortest candidate (%dms); widening it",
+            budget_ms,
+            shortest_ms,
+        )
+        budget_ms = shortest_ms
 
     max_clips = min(config.max_auto_clips, len(ordered)) if config.max_auto_clips else 0
     layers = max_clips if max_clips else 1
