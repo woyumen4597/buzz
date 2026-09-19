@@ -25,7 +25,12 @@ from .media import (
 )
 from .models import HighlightConfig
 from .subtitles import associate_subtitles, parse_srt_file
-from .windows import generate_candidates, scan_audio_activity, scan_motion, scan_scene_changes
+from .windows import (
+    generate_candidates,
+    scan_audio_activity,
+    scan_motion,
+    scan_motion_and_scenes,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -125,20 +130,28 @@ def run(
     motion_samples: list[tuple[int, float]] = []
     audio_samples: list[tuple[int, float]] = []
     scene_enabled = not config.no_scene_detection
+    motion_scanned = False
     if not config.no_scene_detection:
+        # Motion and scene analysis share one decode pass; on a multi-hour
+        # source that is the difference between minutes of fan noise and one
+        # continuous scan.
         try:
-            scene_points = scan_scene_changes(ffmpeg, str(video_path), config.scene_threshold)
+            motion_samples, scene_points = scan_motion_and_scenes(
+                ffmpeg, str(video_path), config.scene_threshold
+            )
+            motion_scanned = True
         except Exception as exc:  # scene detection is explicitly best-effort
             warning = f"scene detection failed; using fixed windows: {exc}"
             warnings.append(warning)
             LOG.warning(warning)
             scene_enabled = False
-    try:
-        motion_samples = scan_motion(ffmpeg, str(video_path))
-    except Exception as exc:
-        warning = f"motion analysis failed; using base scores: {exc}"
-        warnings.append(warning)
-        LOG.warning(warning)
+    if not motion_scanned:
+        try:
+            motion_samples = scan_motion(ffmpeg, str(video_path))
+        except Exception as exc:
+            warning = f"motion analysis failed; using base scores: {exc}"
+            warnings.append(warning)
+            LOG.warning(warning)
     if video.audio_codec:
         try:
             audio_samples = scan_audio_activity(ffmpeg, str(video_path))

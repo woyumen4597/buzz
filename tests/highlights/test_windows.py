@@ -1,14 +1,19 @@
+import subprocess
+
 from buzz.highlights.auto_edit import resolve_target_duration_seconds, select_auto_candidates
 from buzz.highlights.models import Candidate, HighlightConfig, VideoInfo
 from buzz.highlights.windows import (
     apply_motion_scores,
     audio_activity_command,
+    combined_analysis_command,
     parse_audio_samples,
     combine_candidates,
     fixed_window_candidates,
     generate_candidates,
     parse_motion_samples,
+    parse_scene_scores,
     parse_scene_timestamps,
+    scan_motion_and_scenes,
     score_candidate,
 )
 
@@ -48,6 +53,55 @@ def test_audio_activity_command_analyzes_audio_only():
     command = audio_activity_command("ffmpeg", "input.mp4")
     assert "-vn" in command
     assert "astats=metadata=1:reset=1" in command[command.index("-af") + 1]
+
+
+def test_combined_analysis_command_decodes_video_once():
+    command = combined_analysis_command("ffmpeg", "input.mp4", 0.4)
+    # One input, two branches, so the source is decoded a single time.
+    assert command.count("-i") == 1
+    graph = command[command.index("-filter_complex") + 1]
+    assert "[motion]" in graph and "[scene]" in graph
+    assert command.count("-map") == 2
+    assert "-an" in command
+
+
+def test_combined_analysis_command_keeps_all_scene_frames():
+    # ``select=gt(scene,...)`` would emit zero frames on a cut-free source,
+    # which FFmpeg treats as fatal; every frame must be kept instead.
+    command = combined_analysis_command("ffmpeg", "input.mp4")
+    graph = command[command.index("-filter_complex") + 1]
+    assert "gte(scene" in graph
+    assert "gt(scene" not in graph
+    assert "lavfi.scene_score" in graph
+
+
+def test_parse_scene_scores_filters_by_threshold_and_drops_frame_zero():
+    output = (
+        "pts_time:0\n[Parsed_metadata] lavfi.scene_score=0.900000\n"
+        "pts_time:1\n[Parsed_metadata] lavfi.scene_score=0.100000\n"
+        "pts_time:2\n[Parsed_metadata] lavfi.scene_score=0.500000\n"
+    )
+    assert parse_scene_scores(output, 0.4) == [2000]
+
+
+def test_parse_scene_scores_deduplicates_repeated_timestamps():
+    output = (
+        "pts_time:3\n[Parsed_metadata] lavfi.scene_score=0.9\n"
+        "pts_time:3\n[Parsed_metadata] lavfi.scene_score=0.8\n"
+    )
+    assert parse_scene_scores(output, 0.4) == [3000]
+
+
+def test_scan_motion_and_scenes_falls_back_when_combined_pass_fails(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(1, "ffmpeg")
+
+    monkeypatch.setattr("buzz.highlights.windows.subprocess.run", fail)
+    monkeypatch.setattr("buzz.highlights.windows.scan_motion", lambda *a, **k: [(1000, 1.0)])
+    monkeypatch.setattr("buzz.highlights.windows.scan_scene_changes", lambda *a, **k: [2000])
+    motion, scenes = scan_motion_and_scenes("ffmpeg", "input.mp4")
+    assert motion == [(1000, 1.0)]
+    assert scenes == [2000]
 
 
 def test_audio_parser_reads_rms_samples():
@@ -107,6 +161,50 @@ def test_auto_duration_uses_source_ratio():
     assert resolve_target_duration_seconds(3_600_000, configured_ratio=0.3, configured_seconds=300) == 300
 
 
+def test_auto_selection_scales_to_a_multi_hour_source():
+    """A 3h19m source must not blow up the DP table.
+
+    This mirrors the real failure: a ~3600s budget with thousands of
+    candidates used to build an exponential number of DP states and exhaust
+    memory. The quantum is coarsened instead, so the table stays bounded.
+    """
+    duration_ms = 11_977_813
+    candidates = [
+        Candidate(
+            f"c{index}",
+            start,
+            start + 20_000,
+            start,
+            start + 20_000,
+            score=0.5,
+        )
+        for index, start in enumerate(range(0, duration_ms - 20_000, 5_000))
+    ]
+    result = select_auto_candidates(
+        candidates, HighlightConfig(), source_duration_ms=duration_ms
+    )
+    assert result.selected
+    assert result.total_duration_ms <= result.budget_ms
+    assert result.budget_ms == round(duration_ms / 1000 * 0.3 * 1000)
+    ordered = sorted(result.selected, key=lambda item: item.start_ms)
+    assert all(
+        earlier.end_ms <= later.start_ms for earlier, later in zip(ordered, ordered[1:])
+    )
+
+
+def test_auto_selection_is_deterministic_for_equal_scores():
+    candidates = [
+        Candidate(f"c{index}", index * 5_000, (index + 1) * 5_000, index * 5_000, (index + 1) * 5_000, score=0.5)
+        for index in range(6)
+    ]
+    config = HighlightConfig(target_duration_ratio=1.0, target_duration_seconds=10)
+    first = select_auto_candidates(candidates, config)
+    second = select_auto_candidates(candidates, config)
+    assert [candidate.id for candidate in first.selected] == [
+        candidate.id for candidate in second.selected
+    ]
+
+
 def test_auto_selection_handles_many_candidates_without_recursion():
     candidates = [
         Candidate(
@@ -135,8 +233,8 @@ def test_auto_selection_uses_full_source_duration_for_ratio():
         HighlightConfig(target_duration_ratio=0.5),
         source_duration_ms=100_000,
     )
-    assert result.total_duration_ms == 50_000
-    assert result.budget_ms == 10_000
+    assert result.total_duration_ms == 10_000
+    assert result.budget_ms == 50_000
 
 
 def test_auto_selection_prefers_total_score_over_longer_low_score_clip():

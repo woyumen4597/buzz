@@ -239,6 +239,74 @@ def scene_detection_command(
     ]
 
 
+def combined_analysis_command(
+    ffmpeg: str, video_path: str, threshold: float = 0.35
+) -> list[str]:
+    """Scan motion and scene scores in a single decode pass.
+
+    Motion, scene and audio analysis each decode the whole source. Folding the
+    two video scans into one pass roughly halves the wall-clock time and the
+    CPU load on long videos, which is what made the machine feel busy.
+
+    Scene scores are emitted for every sampled frame rather than filtered by
+    ``select``. A source with no scene change would otherwise produce a stream
+    with zero frames, which FFmpeg treats as a fatal error.
+    """
+    motion = "fps=1,scale=160:-2,tblend=all_mode=difference,signalstats,metadata=print:key=lavfi.signalstats.YAVG[motion]"
+    scene = "fps=2,scale=320:-2,select='gte(scene\\,0)',metadata=print:key=lavfi.scene_score[scene]"
+    return [
+        ffmpeg, "-hide_banner", "-nostats", "-i", video_path,
+        "-filter_complex", f"[0:v]{motion};[0:v]{scene}",
+        "-map", "[motion]", "-map", "[scene]",
+        "-an", "-f", "null", "-",
+    ]
+
+
+def parse_scene_scores(output: str, threshold: float) -> list[int]:
+    """Return timestamps whose scene score meets ``threshold``."""
+    points: list[int] = []
+    timestamp: int | None = None
+    for line in output.splitlines():
+        pts_match = re.search(r"pts_time[:=]\s*(-?\d+(?:\.\d+)?)", line)
+        if pts_match:
+            try:
+                timestamp = round(float(pts_match.group(1)) * 1000)
+            except ValueError:
+                timestamp = None
+        score_match = re.search(r"lavfi\.scene_score=([0-9]+(?:\.[0-9]+)?)", line)
+        if score_match and timestamp is not None:
+            try:
+                if float(score_match.group(1)) >= threshold and timestamp > 0:
+                    points.append(timestamp)
+            except ValueError:
+                pass
+            timestamp = None
+    return sorted(set(points))
+
+
+def scan_motion_and_scenes(
+    ffmpeg: str, video_path: str, threshold: float = 0.35, timeout: float | None = None
+) -> tuple[list[tuple[int, float]], list[int]]:
+    """Run the combined scan, returning motion samples and scene timestamps.
+
+    Falls back to the separate scans when the combined pass fails, so a source
+    whose filter graph cannot be built still yields analysis results.
+    """
+    try:
+        process = subprocess.run(
+            combined_analysis_command(ffmpeg, video_path, threshold),
+            capture_output=True, text=True, check=True, timeout=timeout,
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        LOG.warning("combined analysis failed; falling back to separate scans: %s", exc)
+        return (
+            scan_motion(ffmpeg, video_path, timeout),
+            scan_scene_changes(ffmpeg, video_path, threshold, timeout),
+        )
+    output = process.stderr + "\n" + process.stdout
+    return parse_motion_samples(output), parse_scene_scores(output, threshold)
+
+
 def scan_scene_changes(
     ffmpeg: str, video_path: str, threshold: float = 0.35, timeout: float | None = None
 ) -> list[int]:
