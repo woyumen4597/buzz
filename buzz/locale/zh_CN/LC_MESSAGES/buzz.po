@@ -2090,6 +2090,34 @@ msgid "Open result"
 msgstr "打开结果"
 
 #: buzz/widgets/highlight_candidates_widget.py
+msgid "Check video"
+msgstr "检查视频"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Re-check the generated reel for broken audio, video or subtitles"
+msgstr "重新检查生成视频的声音、画面和字幕是否正常"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Checking the generated video..."
+msgstr "正在检查生成的视频……"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Check failed: {}"
+msgstr "检查未通过：{}"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Checked, {} warning(s) to review"
+msgstr "已检查，{} 项待查看"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Checked, no problems found"
+msgstr "已检查，未发现问题"
+
+#: buzz/widgets/highlight_candidates_widget.py
+msgid "Check could not run: {}"
+msgstr "无法执行检查：{}"
+
+#: buzz/widgets/highlight_candidates_widget.py
 msgid "Cancel"
 msgstr "取消"
 

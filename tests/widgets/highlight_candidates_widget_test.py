@@ -49,6 +49,71 @@ def test_highlight_widget_builds_cli_arguments(qtbot, tmp_path):
     assert args.no_scene_detection is False
     assert args.no_previews is False
     assert args.keep_static_scenes is False
+    # The GUI has no CLI flags, so verification must be requested explicitly
+    # rather than relying on the CLI default.
+    assert args.verify == "fast"
+
+
+def test_highlight_widget_surfaces_verification_warnings(qtbot, tmp_path):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    output = tmp_path / "video_highlight.mp4"
+    output.write_bytes(b"video")
+    (tmp_path / "verification.txt").write_text(
+        "[ok  ] video_stream: video: h264 320x240\n"
+        "[WARN] audio_silence: 2 silent stretch(es)\n",
+        encoding="utf-8",
+    )
+    widget._output_dir = output
+    assert "1" in widget._verification_note()
+
+
+def test_highlight_widget_surfaces_verification_failures(qtbot, tmp_path):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    output = tmp_path / "video_highlight.mp4"
+    output.write_bytes(b"video")
+    (tmp_path / "verification.txt").write_text(
+        "[FAIL] subtitle_bounds: cues end past the reel duration\n",
+        encoding="utf-8",
+    )
+    widget._output_dir = output
+    note = widget._verification_note()
+    assert "cues end past the reel duration" in note
+
+
+def test_highlight_widget_verification_note_is_empty_without_a_report(qtbot, tmp_path):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    output = tmp_path / "video_highlight.mp4"
+    output.write_bytes(b"video")
+    widget._output_dir = output
+    assert widget._verification_note() == ""
+
+
+def test_highlight_widget_has_a_manual_check_button(qtbot):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    # Disabled until a reel exists, since there is nothing to check yet.
+    assert widget.verify_button.isEnabled() is False
+    assert widget.verify_button.text() == "检查视频"
+
+
+def test_highlight_widget_enables_check_button_after_generation(qtbot, tmp_path):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    reel = tmp_path / "video_highlight.mp4"
+    reel.write_bytes(b"video")
+    widget._generation_finished(str(reel))
+    assert widget.verify_button.isEnabled() is True
+
+
+def test_highlight_widget_check_button_ignores_a_missing_reel(qtbot):
+    widget = HighlightCandidatesWidget()
+    qtbot.add_widget(widget)
+    # No reel at all: clicking must be a no-op rather than an error.
+    widget.verify_result()
+    assert widget._verify_thread is None
 
 
 def test_highlight_widget_rejects_missing_video(qtbot):

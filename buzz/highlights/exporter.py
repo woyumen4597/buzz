@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shlex
 import tempfile
@@ -15,6 +16,8 @@ from typing import Any, Iterable
 
 from .media import render_selected_video
 from .models import Candidate, HighlightConfig, VideoInfo
+
+LOG = logging.getLogger(__name__)
 
 
 def _atomic_text(path: Path, content: str) -> None:
@@ -138,7 +141,7 @@ function render() {{ const sort=document.querySelector('#sort').value, filter=do
  document.querySelectorAll('.timestamp').forEach(b=>b.onclick=()=>navigator.clipboard?.writeText(`${{fmt(+b.dataset.start)}} --> ${{fmt(+b.dataset.end)}}`)); }}
 ['sort','filter','search'].forEach(id=>document.querySelector('#'+id).oninput=render);
 document.querySelector('#ignoreAll').onclick=()=>{{state.filter(c=>c.status==='unprocessed').forEach(c=>c.status='ignore');persist();render();}};
-if (renderEndpoint) document.querySelector('#render').onclick=async()=>{{const selected=state.filter(c=>c.status==='keep');if(!selected.length){{alert('请先保留至少一个片段');return;}}const button=document.querySelector('#render');button.disabled=true;button.textContent='正在生成...';try{{const response=await fetch(renderEndpoint,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ids:selected.map(c=>c.id),statuses:Object.fromEntries(state.map(c=>[c.id,c.status]))}})}});const result=await response.json();if(!response.ok) throw new Error(result.error||'生成失败');window.location.href=result.url;}}catch(error){{alert(error.message);button.disabled=false;button.textContent='生成最终视频';}}}};
+if (renderEndpoint) document.querySelector('#render').onclick=async()=>{{const selected=state.filter(c=>c.status==='keep');if(!selected.length){{alert('请先保留至少一个片段');return;}}const button=document.querySelector('#render');button.disabled=true;button.textContent='正在生成...';try{{const response=await fetch(renderEndpoint,{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{ids:selected.map(c=>c.id),statuses:Object.fromEntries(state.map(c=>[c.id,c.status]))}})}});const result=await response.json();if(!response.ok) throw new Error(result.error||'生成失败');const note=result.verification&&result.verification.summary?result.verification.summary:'';document.querySelector('#summary').textContent=note?note+'　正在打开视频...':'正在打开视频...';window.location.href=result.url;}}catch(error){{alert(error.message);button.disabled=false;button.textContent='生成最终视频';}}}};
  document.querySelector('#export').onclick=()=>{{const selected=state.filter(c=>c.status==='keep');download('selected.json',JSON.stringify(selected,null,2));download('clips.txt',selected.map((c,i)=>`ffmpeg -y -ss ${{(c.start_ms/1000).toFixed(3)}} -i "${{esc(videoName)}}" -t ${{((c.end_ms-c.start_ms)/1000).toFixed(3)}} -c:v libx264 -c:a aac "clip_${{String(i+1).padStart(4,'0')}}.mp4"`).join('\\n')+'\\n','text/plain');}};
 render();
 </script></body></html>'''
@@ -171,7 +174,7 @@ class _ResultRequestHandler(SimpleHTTPRequestHandler):
                 has_audio=self.server.has_audio,  # type: ignore[attr-defined]
             )
             _json(self.server.output_dir / "selected.json", [candidate.to_dict() for candidate in candidates if candidate.selected])  # type: ignore[attr-defined]
-            self._send_json({"url": output_path.name})
+            self._send_json({"url": output_path.name, "verification": _verify_reel_summary(output_path)})
         except Exception as exc:
             self._send_json({"error": str(exc)}, status=400)
 
@@ -185,6 +188,46 @@ class _ResultRequestHandler(SimpleHTTPRequestHandler):
 
     def log_message(self, *_args):
         return
+
+
+def _verify_reel_summary(output_path: Path) -> dict[str, Any]:
+    """Validate a freshly rendered reel and return a JSON-friendly summary.
+
+    The manual selection page renders through this module rather than the CLI,
+    so it needs its own verification hook. Verification is best-effort: a
+    failed check is reported to the page, never raised.
+    """
+    try:
+        from .verify import verify_reel
+
+        report = verify_reel(output_path, sample_count=6, sample_window_s=5.0)
+    except Exception as exc:  # never turn a good render into an error
+        LOG.warning("reel verification could not run: %s", exc)
+        return {"ok": True, "summary": "", "details": []}
+
+    details = [
+        {"name": check.name, "severity": check.severity, "detail": check.detail}
+        for check in report.checks
+    ]
+    if report.errors:
+        summary = f"检查未通过：{report.errors[0].detail}"
+    elif report.warnings:
+        summary = f"已检查，{len(report.warnings)} 项待查看"
+    else:
+        summary = "已检查，未发现问题"
+    report_path = output_path.parent / "verification.txt"
+    try:
+        report_path.write_text(
+            "\n".join(
+                f"[{'FAIL' if c['severity'] == 'error' else 'WARN' if c['severity'] == 'warning' else 'ok'}] "
+                f"{c['name']}: {c['detail']}"
+                for c in details
+            ) + "\n",
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        LOG.debug("could not write verification report: %s", exc)
+    return {"ok": report.ok, "summary": summary, "details": details}
 
 
 def serve_result_page(

@@ -54,6 +54,51 @@ class HighlightGenerationWorker(QObject):
             self.failed.emit(str(exc))
 
 
+class HighlightVerificationWorker(QObject):
+    """Run reel validation off the GUI thread.
+
+    Verification decodes sampled video, so it must not block the event loop.
+    """
+
+    finished = pyqtSignal(str, str)  # (summary text, verification report path)
+
+    def __init__(self, reel_path: Path):
+        super().__init__()
+        self.reel_path = reel_path
+
+    @pyqtSlot()
+    def run(self):
+        try:
+            from buzz.highlights.verify import verify_reel
+
+            report = verify_reel(self.reel_path, sample_count=6, sample_window_s=5.0)
+            lines = [
+                {
+                    "error": f"[FAIL] {check.name}: {check.detail}",
+                    "warning": f"[WARN] {check.name}: {check.detail}",
+                }.get(check.severity, f"[ok] {check.name}: {check.detail}")
+                for check in report.checks
+            ]
+            target = self.reel_path.parent / "verification.txt"
+            try:
+                target.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            except OSError:
+                pass
+            if report.errors:
+                summary = _("Check failed: {}").format(
+                    "; ".join(check.detail for check in report.errors[:2])
+                )
+            elif report.warnings:
+                summary = _("Checked, {} warning(s) to review").format(
+                    len(report.warnings)
+                )
+            else:
+                summary = _("Checked, no problems found")
+            self.finished.emit(summary, str(target))
+        except Exception as exc:
+            self.finished.emit(_("Check could not run: {}").format(exc), "")
+
+
 class HighlightCandidatesWidget(QWidget):
     """Select inputs and launch the existing static highlight browser."""
 
@@ -64,6 +109,8 @@ class HighlightCandidatesWidget(QWidget):
         self._worker: Optional[HighlightGenerationWorker] = None
         self._cancel_event: Optional[threading.Event] = None
         self._output_dir: Optional[Path] = None
+        self._verify_thread: Optional[QThread] = None
+        self._verify_worker: Optional[HighlightVerificationWorker] = None
         self._build_ui()
 
     def _build_ui(self):
@@ -137,6 +184,13 @@ class HighlightCandidatesWidget(QWidget):
         self.open_button.setEnabled(False)
         self.open_button.clicked.connect(self.open_result)
         actions.addWidget(self.open_button)
+        self.verify_button = QPushButton(_("Check video"), self)
+        self.verify_button.setEnabled(False)
+        self.verify_button.setToolTip(
+            _("Re-check the generated reel for broken audio, video or subtitles")
+        )
+        self.verify_button.clicked.connect(self.verify_result)
+        actions.addWidget(self.verify_button)
         self.cancel_button = QPushButton(_("Cancel"), self)
         self.cancel_button.setEnabled(False)
         self.cancel_button.clicked.connect(self.cancel_generation)
@@ -216,6 +270,10 @@ class HighlightCandidatesWidget(QWidget):
             open_html=False,
             serve_html=True,
             keep_static_scenes=False,
+            # Validate the reel automatically: the GUI has no CLI flags, and a
+            # misaligned-subtitle reel is not something a user would notice by
+            # watching it.
+            verify="fast",
             verbose=False,
         )
 
@@ -260,8 +318,70 @@ class HighlightCandidatesWidget(QWidget):
         self.run_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
         self.open_button.setEnabled(True)
+        self.verify_button.setEnabled(self._output_dir.is_file())
         self.progress_bar.setValue(self.progress_bar.maximum())
-        self.status_label.setText(_("Highlight reel is ready: {}" ).format(output_dir))
+        message = _("Highlight reel is ready: {}").format(output_dir)
+        note = self._verification_note()
+        if note:
+            message = f"{message}\n{note}"
+        self.status_label.setText(message)
+
+    def verify_result(self):
+        """Re-run validation on the current reel, off the GUI thread."""
+        if self._output_dir is None or not self._output_dir.is_file():
+            return
+        if self._verify_thread is not None and self._verify_thread.isRunning():
+            return
+        self.verify_button.setEnabled(False)
+        self.status_label.setText(_("Checking the generated video..."))
+        self._verify_thread = QThread()
+        self._verify_worker = HighlightVerificationWorker(self._output_dir)
+        self._verify_worker.moveToThread(self._verify_thread)
+        self._verify_thread.started.connect(self._verify_worker.run)
+        self._verify_worker.finished.connect(self._verification_done)
+        self._verify_worker.finished.connect(self._verify_thread.quit)
+        self._verify_thread.finished.connect(self._verify_worker.deleteLater)
+        self._verify_thread.finished.connect(self._verify_thread_finished)
+        self._verify_thread.start()
+
+    @pyqtSlot(str, str)
+    def _verification_done(self, summary: str, _report_path: str):
+        self.status_label.setText(summary)
+
+    def _verify_thread_finished(self):
+        if self._verify_thread is not None:
+            self._verify_thread.deleteLater()
+        self._verify_thread = None
+        self._verify_worker = None
+        self.verify_button.setEnabled(
+            self._output_dir is not None and self._output_dir.is_file()
+        )
+
+    def _verification_note(self) -> str:
+        """Summarise the saved verification report for the status label.
+
+        The reel is checked automatically after rendering; surfacing the result
+        here means a subtitle or audio problem is visible without opening the
+        log file.
+        """
+        if self._output_dir is None:
+            return ""
+        report = self._output_dir.parent / "verification.txt"
+        try:
+            lines = report.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return ""
+        failures = [line for line in lines if line.startswith("[FAIL]")]
+        warnings = [line for line in lines if line.startswith("[WARN]")]
+        if failures:
+            return _("Check failed: {}").format("; ".join(
+                line.split(": ", 1)[-1] for line in failures[:2]
+            ))
+        if warnings:
+            return _("Checked, {} warning(s) to review").format(len(warnings))
+        if lines:
+            return _("Checked, no problems found")
+        return ""
 
     @pyqtSlot(str)
     def _generation_failed(self, message: str):
