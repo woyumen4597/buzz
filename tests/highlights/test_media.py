@@ -6,6 +6,8 @@ from buzz.highlights.media import (
     concat_command,
     extract_subtitles_command,
     render_selected_video,
+    source_video_bitrate,
+    target_video_bitrate,
     video_encoder_args,
 )
 from buzz.highlights.models import Candidate
@@ -26,7 +28,10 @@ def test_commands_keep_paths_as_single_args():
 
 
 def test_clip_command_uses_high_quality_encoding_and_preserves_subtitles(monkeypatch):
-    monkeypatch.setattr("buzz.highlights.media.video_encoder_args", lambda _ffmpeg: ["-c:v", "libx264"])
+    monkeypatch.setattr(
+        "buzz.highlights.media.video_encoder_args",
+        lambda _ffmpeg, _source_bitrate=None: ["-c:v", "libx264"],
+    )
     candidate = Candidate("only", 1_000, 3_000, 1_000, 3_000)
     command = clip_command("ffmpeg", "in.mp4", candidate, "out.mp4")
     assert command[command.index("-map"):command.index("-c:v")] == [
@@ -81,6 +86,51 @@ def test_video_encoder_args_prefers_hardware_on_macos(monkeypatch):
     assert args[:2] == ["-c:v", "h264_videotoolbox"]
 
 
+def test_video_encoder_args_track_a_low_bitrate_source(monkeypatch):
+    """A heavily compressed source must not be re-encoded at a fixed 6 Mbit/s.
+
+    Re-encoding a 720p source averaging 1.4 Mbit/s at 6 Mbit/s produced a reel
+    that was 3.4x shorter yet only 6% smaller than the original.
+    """
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: True)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+    args = video_encoder_args("/usr/bin/ffmpeg", source_bitrate=1_650_000)
+    bitrate = int(args[args.index("-b:v") + 1])
+    assert bitrate < 2_500_000, f"bitrate {bitrate} should follow the source"
+    assert bitrate > 0
+
+
+def test_video_encoder_args_clamp_extreme_source_bitrates(monkeypatch):
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: True)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+
+    low = video_encoder_args("/usr/bin/ffmpeg", source_bitrate=100_000)
+    assert int(low[low.index("-b:v") + 1]) == 1_500_000
+
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+    high = video_encoder_args("/usr/bin/ffmpeg", source_bitrate=90_000_000)
+    assert int(high[high.index("-b:v") + 1]) == 8_000_000
+
+
+def test_target_video_bitrate_returns_none_when_the_source_is_unknown():
+    # The caller then keeps the 1080p-oriented default rather than guessing.
+    assert target_video_bitrate(None) is None
+    assert target_video_bitrate(0) is None
+
+
+def test_source_video_bitrate_uses_size_over_duration(tmp_path):
+    path = tmp_path / "src.mp4"
+    path.write_bytes(b"0" * 1_000_000)
+    # 1 MB over 8 seconds is 1 Mbit/s.
+    assert source_video_bitrate(str(path), 8_000) == 1_000_000
+
+
+def test_source_video_bitrate_is_none_for_a_missing_file(tmp_path):
+    assert source_video_bitrate(str(tmp_path / "nope.mp4"), 1_000) is None
+
+
 def test_video_encoder_args_falls_back_to_software(monkeypatch):
     monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
     monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: False)
@@ -90,6 +140,8 @@ def test_video_encoder_args_falls_back_to_software(monkeypatch):
     assert "-preset" in args and "veryfast" in args
     # libx264 regresses past the performance-core count on Apple silicon.
     assert args[args.index("-threads") + 1] == "4"
+    # CRF adapts on its own, so a source bitrate must not add a -b:v.
+    assert "-b:v" not in args
 
 
 def test_video_encoder_args_are_memoized_per_binary(monkeypatch):
@@ -105,6 +157,18 @@ def test_video_encoder_args_are_memoized_per_binary(monkeypatch):
     video_encoder_args("/usr/bin/ffmpeg")
     video_encoder_args("/usr/bin/ffmpeg")
     assert len(calls) == 1
+
+
+def test_video_encoder_args_are_memoized_per_source_bitrate(monkeypatch):
+    """Two sources at different bitrates must not share one cached command."""
+    monkeypatch.setattr("buzz.highlights.media.sys.platform", "darwin")
+    monkeypatch.setattr("buzz.highlights.media._encoder_available", lambda *_: True)
+    monkeypatch.setattr("buzz.highlights.media._ENCODER_CACHE", {})
+
+    low = video_encoder_args("/usr/bin/ffmpeg", source_bitrate=2_000_000)
+    high = video_encoder_args("/usr/bin/ffmpeg", source_bitrate=9_000_000)
+    assert low != high
+    assert int(low[low.index("-b:v") + 1]) < int(high[high.index("-b:v") + 1])
 
 
 def test_render_selected_video_parallelizes_and_keeps_timeline_order(tmp_path, monkeypatch):

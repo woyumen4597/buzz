@@ -63,10 +63,33 @@ _PARALLEL_ENCODES = 4
 #: libx264 beyond the performance-core count regresses (measured 8 > 4 on M1).
 _SOFTWARE_THREADS = "4"
 
-_ENCODER_CACHE: dict[str, list[str]] = {}
+# VideoToolbox is bitrate-driven and cannot take a CRF, so the bitrate has to be
+# chosen up front. A fixed value is wrong for sources that are already heavily
+# compressed: re-encoding a 720p source that averages 1.4 Mbit/s at a flat
+# 6 Mbit/s produced a reel only 6% smaller than a 4-hour original despite being
+# 3.4x shorter. Follow the source instead, with a floor so a very low-bitrate
+# source is not re-encoded into visible artifacts, and a ceiling so an
+# unusually high-bitrate source cannot balloon the output.
+_MIN_VIDEO_BITRATE = 1_500_000
+_MAX_VIDEO_BITRATE = 8_000_000
+
+#: Re-encoding is not free: the output needs headroom over the source or the
+#: extra generation loss shows. 1.15 keeps the reel visually equivalent while
+#: still tracking a low-bitrate source downwards.
+_SOURCE_BITRATE_FACTOR = 1.15
+
+_ENCODER_CACHE: dict[tuple[str, int | None], list[str]] = {}
+
+#: Hardware-encoder availability per ffmpeg binary. Probing spawns a process, so
+#: the answer is cached separately from the per-bitrate command cache: the
+#: bitrate varies by source but availability does not.
+_ENCODER_PROBE_CACHE: dict[str, bool] = {}
 
 
 def _encoder_available(ffmpeg: str, encoder: str) -> bool:
+    cached = _ENCODER_PROBE_CACHE.get(ffmpeg)
+    if cached is not None:
+        return cached
     try:
         result = subprocess.run(
             [ffmpeg, "-hide_banner", "-loglevel", "error", "-h", f"encoder={encoder}"],
@@ -77,34 +100,81 @@ def _encoder_available(ffmpeg: str, encoder: str) -> bool:
     except Exception as exc:  # probing is best-effort; fall back to software
         LOG.debug("encoder probe for %s failed: %s", encoder, exc)
         return False
-    return result.returncode == 0 and "not recognized" not in result.stdout.lower()
+    available = result.returncode == 0 and "not recognized" not in result.stdout.lower()
+    _ENCODER_PROBE_CACHE[ffmpeg] = available
+    return available
 
 
-def video_encoder_args(ffmpeg: str) -> list[str]:
+def source_video_bitrate(video_path: str, duration_ms: int) -> int | None:
+    """Approximate the source's overall bitrate in bits per second.
+
+    The container's own ``bit_rate`` is absent for some files, so this falls
+    back to size over duration. The total (audio included) is the right basis
+    because the clip encoder re-encodes audio too.
+    """
+    try:
+        size = os.path.getsize(video_path)
+    except OSError as exc:
+        LOG.debug("could not stat %s for a bitrate estimate: %s", video_path, exc)
+        return None
+    if size <= 0 or duration_ms <= 0:
+        return None
+    return int(size * 8 / (duration_ms / 1000))
+
+
+def target_video_bitrate(source_bitrate: int | None) -> int | None:
+    """Pick the clip bitrate, tracking the source where it is known.
+
+    Returns ``None`` when the source bitrate is unknown, which makes the caller
+    fall back to a fixed rate rather than guessing from a bad measurement.
+    """
+    if not source_bitrate or source_bitrate <= 0:
+        return None
+    scaled = int(source_bitrate * _SOURCE_BITRATE_FACTOR)
+    return max(_MIN_VIDEO_BITRATE, min(_MAX_VIDEO_BITRATE, scaled))
+
+
+def video_encoder_args(
+    ffmpeg: str, source_bitrate: int | None = None
+) -> list[str]:
     """Video-encoding options for clip renders, preferring hardware when usable.
 
-    Results are memoized per ffmpeg binary because probing spawns a process and
-    every clip would otherwise pay for it.
+    Results are memoized per ``(ffmpeg, bitrate)`` because the bitrate depends on
+    the source; probing spawns a process and every clip would otherwise pay for
+    it. The software path is CRF-based and therefore bitrate-independent, so it
+    memoizes under a single key.
     """
-    cached = _ENCODER_CACHE.get(ffmpeg)
-    if cached is not None:
-        return list(cached)
+    bitrate = target_video_bitrate(source_bitrate)
+    # Check both possible cache keys before probing so a repeated call with a
+    # known bitrate never spawns ffmpeg again.
+    for key in ((ffmpeg, bitrate), (ffmpeg, None)):
+        cached = _ENCODER_CACHE.get(key)
+        if cached is not None:
+            return list(cached)
 
-    if sys.platform == "darwin" and _encoder_available(ffmpeg, _HARDWARE_ENCODER):
-        # VideoToolbox is bitrate-driven; ~6 Mbit/s is visually transparent for
-        # the 1080p highlight output this pipeline produces.
-        args = ["-c:v", _HARDWARE_ENCODER, "-b:v", "6M"]
-        LOG.info("clip encoding: %s (hardware)", _HARDWARE_ENCODER)
+    hardware = sys.platform == "darwin" and _encoder_available(ffmpeg, _HARDWARE_ENCODER)
+    key = (ffmpeg, bitrate) if hardware else (ffmpeg, None)
+
+    if hardware:
+        if bitrate is None:
+            # No usable measurement; keep the previous 1080p-oriented default.
+            args = ["-c:v", _HARDWARE_ENCODER, "-b:v", "6M"]
+            detail = "6.0 Mbit/s (source bitrate unknown)"
+        else:
+            args = ["-c:v", _HARDWARE_ENCODER, "-b:v", str(bitrate)]
+            detail = f"{bitrate / 1e6:.1f} Mbit/s"
+        LOG.info("clip encoding: %s (hardware, %s)", _HARDWARE_ENCODER, detail)
     else:
         # ``veryfast``/``crf 20`` is ~1.8x faster than ``medium``/``crf 18`` at a
-        # difference that is invisible in a highlight preview.
+        # difference that is invisible in a highlight preview. CRF adapts to
+        # picture complexity on its own, so no source bitrate is needed.
         args = [
             "-c:v", _SOFTWARE_ENCODER,
             "-preset", "veryfast", "-crf", "20",
             "-threads", _SOFTWARE_THREADS,
         ]
         LOG.info("clip encoding: %s (software)", _SOFTWARE_ENCODER)
-    _ENCODER_CACHE[ffmpeg] = args
+    _ENCODER_CACHE[key] = args
     return list(args)
 
 
@@ -137,6 +207,7 @@ def clip_command(
     output_path: str,
     has_audio: bool = True,
     subtitle_path: str | None = None,
+    source_bitrate: int | None = None,
 ) -> list[str]:
     """Build a clip command.
 
@@ -152,7 +223,7 @@ def clip_command(
             "-f", "srt", "-i", subtitle_path,
             "-map", "0:v:0", *( ["-map", "0:a:0?"] if has_audio else [] ),
             "-map", "1:0",
-            *video_encoder_args(ffmpeg),
+            *video_encoder_args(ffmpeg, source_bitrate),
             *( ["-c:a", "aac", "-b:a", "192k"] if has_audio else [] ),
             "-c:s", "mov_text",
             # ``-t`` must be an output option: before the subtitle input it
@@ -163,7 +234,7 @@ def clip_command(
         ffmpeg, "-y", "-ss", _seconds(candidate.start_ms), "-i", video_path,
         "-t", _seconds(candidate.duration_ms),
         "-map", "0:v:0", *( ["-map", "0:a:0?"] if has_audio else [] ),
-        "-map", "0:s?", *video_encoder_args(ffmpeg),
+        "-map", "0:s?", *video_encoder_args(ffmpeg, source_bitrate),
         *( ["-c:a", "aac", "-b:a", "192k"] if has_audio else [] ),
         "-c:s", "mov_text", output_path,
     ]
@@ -215,12 +286,17 @@ def render_selected_video(
     progress_callback: Callable[[int, int, str], None] | None = None,
     output_path: Path | None = None,
     source_subtitles: Sequence[Subtitle] | None = None,
+    source_duration_ms: int = 0,
 ) -> Path:
     """Create individual selected clips and concatenate them in timeline order.
 
     When ``source_subtitles`` is given the caller has already extracted them
     (the ranking stage does this so cues can influence scores); otherwise the
     track is extracted here.
+
+    ``source_duration_ms`` lets the clip bitrate track the source's own; without
+    it a heavily compressed source is re-encoded at a fixed rate and the reel
+    can end up nearly as large as the original despite being far shorter.
     """
     selected = sorted(
         (candidate for candidate in candidates if candidate.selected),
@@ -239,6 +315,16 @@ def render_selected_video(
     total = len(selected) + 1
     concat_file = output_dir / ".highlight-concat.txt"
     clip_paths: list[Path] = []
+    source_bitrate = None
+    if source_duration_ms:
+        source_bitrate = source_video_bitrate(video_path, source_duration_ms)
+    if source_bitrate:
+        target = target_video_bitrate(source_bitrate)
+        LOG.info(
+            "source bitrate ~%.1f Mbit/s; clip target %s",
+            source_bitrate / 1e6,
+            f"{target / 1e6:.1f} Mbit/s" if target else "default",
+        )
     if source_subtitles is None:
         source_subtitles = _load_source_subtitles(ffmpeg, video_path, output_dir)
     if source_subtitles is None:
@@ -268,6 +354,7 @@ def render_selected_video(
                         str(clip_path),
                         has_audio=has_audio,
                         subtitle_path=str(subtitle_path) if subtitle_path else None,
+                        source_bitrate=source_bitrate,
                     ),
                     clip_path,
                 )

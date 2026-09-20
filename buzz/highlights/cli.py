@@ -309,6 +309,7 @@ def run(
             progress_callback=render_progress,
             output_path=final_output_path,
             source_subtitles=source_subtitles,
+            source_duration_ms=video.duration_ms,
         )
     LOG.info("wrote %s", final_output_path)
     verification_note = ""
