@@ -132,6 +132,34 @@ def extract_source_subtitles(
                 pass
 
 
+#: Longest single line written into a cue. FFmpeg's subrip decoder fails on
+#: extremely long lines: one cue in a real source held a ~20000-character
+#: sound-effect run and every clip containing it died with "Invalid UTF-8"
+#: (exit 69) even though the SRT was valid UTF-8, aborting the whole render.
+#: Wrapping into short lines decodes cleanly. Ordinary cues are far shorter
+#: than this, so the cap only ever affects pathological input.
+_MAX_SRT_LINE_CHARS = 400
+
+
+def wrap_cue_text(text: str, width: int = _MAX_SRT_LINE_CHARS) -> str:
+    """Split over-long lines so FFmpeg's subrip decoder can read the cue.
+
+    Existing line breaks are preserved; only lines above ``width`` are split,
+    and the split is by character so a multi-byte character is never cut in
+    half. The rendered subtitle is unchanged for normal-length cues.
+    """
+    if width <= 0:
+        raise ValueError("width must be positive")
+    lines = text.splitlines() or [""]
+    wrapped: list[str] = []
+    for line in lines:
+        if len(line) <= width:
+            wrapped.append(line)
+            continue
+        wrapped.extend(line[index : index + width] for index in range(0, len(line), width))
+    return "\n".join(wrapped)
+
+
 def format_srt(subtitles: Iterable[Subtitle]) -> str:
     """Serialize subtitles as an SRT document with sequential cue numbers."""
     blocks: list[str] = []
@@ -140,7 +168,7 @@ def format_srt(subtitles: Iterable[Subtitle]) -> str:
     ):
         start = format_timestamp(subtitle.start_ms, ",")
         end = format_timestamp(subtitle.end_ms, ",")
-        blocks.append(f"{index}\n{start} --> {end}\n{subtitle.text}\n")
+        blocks.append(f"{index}\n{start} --> {end}\n{wrap_cue_text(subtitle.text)}\n")
     return "\n".join(blocks)
 
 

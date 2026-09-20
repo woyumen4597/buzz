@@ -190,14 +190,60 @@ def _run_atomic(command: Sequence[str], output_path: Path) -> None:
         temp_path.unlink()
         subprocess.run(command[:-1] + [str(temp_path)], check=True, capture_output=True, text=True)
         os.replace(temp_path, output_path)
+    except subprocess.CalledProcessError as exc:
+        temp_path.unlink(missing_ok=True)
+        # ``capture_output`` hides FFmpeg's own message, which is the only place
+        # the reason for a failure appears (e.g. the subrip decoder rejecting a
+        # cue). Surface it on the exception or the CLI/GUI shows just a command.
+        raise RuntimeError(
+            f"{exc.cmd[0]} failed with exit code {exc.returncode}: {_error_summary(exc)}"
+        ) from exc
     except Exception:
         temp_path.unlink(missing_ok=True)
         raise
 
 
+#: Substrings that mark the informative line in FFmpeg's stderr. The final line
+#: is usually a generic "Conversion failed!", so picking only the last line
+#: hides the actual cause.
+_ERROR_HINTS = (
+    "invalid",
+    "error",
+    "unable",
+    "failed",
+    "no such",
+    "not found",
+    "unknown",
+    "cannot",
+    "denied",
+)
+
+
 def _error_summary(exc: subprocess.CalledProcessError) -> str:
-    output = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()
-    return output[-1][-500:] if output else str(exc)
+    """Return the most useful line(s) from a failed FFmpeg invocation."""
+    raw = (exc.stderr or exc.stdout or "").strip()
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not lines:
+        return str(exc)
+
+    def readable(line: str) -> str:
+        # Drop the "[component @ 0x...]" prefix FFmpeg puts in front of messages.
+        if line.startswith("[") and "] " in line:
+            line = line.split("] ", 1)[1]
+        return line.strip()
+
+    useful: list[str] = []
+    for line in lines:
+        lowered = line.lower()
+        if any(hint in lowered for hint in _ERROR_HINTS):
+            text = readable(line)
+            if text and text not in useful:
+                useful.append(text)
+        if len(useful) == 3:
+            break
+    if not useful:
+        useful = [readable(lines[-1])]
+    return "; ".join(useful)[-500:]
 
 
 def clip_command(

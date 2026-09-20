@@ -306,3 +306,31 @@ def test_render_selected_video_extracts_subtitles_when_not_supplied(tmp_path, mo
     monkeypatch.setattr("buzz.highlights.media._load_source_subtitles", fake_load)
     render_selected_video("ffmpeg", "input.mp4", [candidate], tmp_path)
     assert calls == [True]
+
+
+def test_run_atomic_surfaces_ffmpeg_stderr_on_failure(tmp_path, monkeypatch):
+    """FFmpeg's own message is the only clue when a clip fails.
+
+    ``capture_output`` otherwise discards it, leaving the CLI and GUI to report
+    a bare command line, which is what made a real failure hard to diagnose.
+    """
+    import subprocess
+
+    from buzz.highlights.media import _run_atomic
+
+    def boom(*_args, **_kwargs):
+        raise subprocess.CalledProcessError(
+            69, ["ffmpeg", "-i", "in.mp4"], stderr="Invalid UTF-8 in subtitles\nConversion failed!"
+        )
+
+    monkeypatch.setattr("buzz.highlights.media.subprocess.run", boom)
+    try:
+        _run_atomic(["ffmpeg", "-i", "in.mp4", str(tmp_path / "out.mp4")], tmp_path / "out.mp4")
+    except RuntimeError as exc:
+        message = str(exc)
+        assert "69" in message
+        assert "Invalid UTF-8 in subtitles" in message
+    else:
+        raise AssertionError("expected a RuntimeError")
+    # The half-written temp file must not be left behind.
+    assert list(tmp_path.glob(".*")) == []

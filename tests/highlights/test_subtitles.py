@@ -8,6 +8,7 @@ from buzz.highlights.subtitles import (
     extract_source_subtitles,
     format_srt,
     parse_srt,
+    wrap_cue_text,
 )
 
 
@@ -149,3 +150,50 @@ def test_extract_source_subtitles_removes_its_temporary_srt(tmp_path):
         work_dir=tmp_path,
     )
     assert not (tmp_path / ".highlight-source.srt").exists()
+
+
+def test_wrap_cue_text_leaves_normal_lines_untouched():
+    assert wrap_cue_text("hello") == "hello"
+    assert wrap_cue_text("") == ""
+
+
+def test_wrap_cue_text_splits_a_pathologically_long_line():
+    """A ~20000-character cue used to make FFmpeg's subrip decoder bail out.
+
+    Every clip containing such a cue failed with exit 69 and "Invalid UTF-8",
+    which aborted the whole render. Wrapping keeps each line short.
+    """
+    text = "呜——" * 6667  # ~20014 characters, as found in a real source
+    wrapped = wrap_cue_text(text, width=400)
+    lines = wrapped.split("\n")
+    assert max(len(line) for line in lines) <= 400
+    # Wrapping only inserts line breaks; the visible text is unchanged.
+    assert wrapped.replace("\n", "") == text
+
+
+def test_wrap_cue_text_preserves_existing_line_breaks():
+    wrapped = wrap_cue_text("a" * 300 + "\n" + "b" * 300, width=400)
+    assert wrapped == "a" * 300 + "\n" + "b" * 300
+
+
+def test_wrap_cue_text_splits_each_over_long_line_separately():
+    wrapped = wrap_cue_text("a" * 500 + "\n" + "b" * 500, width=400)
+    assert [len(line) for line in wrapped.split("\n")] == [400, 100, 400, 100]
+
+
+def test_wrap_cue_text_never_splits_a_multi_byte_character():
+    text = "あ" * 1000  # 3 bytes each; splitting must stay on character boundaries
+    wrapped = wrap_cue_text(text, width=333)
+    assert all(len(line.encode("utf-8")) <= 999 for line in wrapped.split("\n"))
+    assert "\ufffd" not in wrapped
+    assert wrapped.replace("\n", "") == text
+
+
+def test_format_srt_wraps_a_long_cue_but_keeps_its_text():
+    text = "あ" * 5000
+    rendered = format_srt([Subtitle(0, 1_000, text)])
+    assert all(len(line) <= 400 for line in rendered.split("\n"))
+    reparsed, warnings = parse_srt(rendered)
+    assert not warnings
+    # ``parse_srt`` joins wrapped lines with a space, so compare without spaces.
+    assert reparsed[0].text.replace("\n", "").replace(" ", "") == text
