@@ -24,11 +24,12 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.locale import _
+from buzz.highlights.output import verification_report_path
 
 
 class HighlightGenerationWorker(QObject):
     progress = pyqtSignal(int, int, str)
-    finished = pyqtSignal(str)
+    finished = pyqtSignal(str, str)  # (reel path, verification summary)
     failed = pyqtSignal(str)
 
     def __init__(self, args: argparse.Namespace, cancel_event: threading.Event):
@@ -42,14 +43,14 @@ class HighlightGenerationWorker(QObject):
             # Keep the media-heavy implementation off the GUI thread.
             from buzz.highlights.cli import run
 
-            output_dir = run(
+            output_path, verification_note = run(
                 self.args,
                 progress_callback=lambda completed, total, message: self.progress.emit(
                     completed, total, message
                 ),
                 cancel_event=self.cancel_event,
             )
-            self.finished.emit(str(output_dir))
+            self.finished.emit(str(output_path), verification_note)
         except Exception as exc:  # surfaced in the page instead of crashing Qt
             self.failed.emit(str(exc))
 
@@ -79,7 +80,7 @@ class HighlightVerificationWorker(QObject):
                 }.get(check.severity, f"[ok] {check.name}: {check.detail}")
                 for check in report.checks
             ]
-            target = self.reel_path.parent / "verification.txt"
+            target = verification_report_path(self.reel_path)
             try:
                 target.write_text("\n".join(lines) + "\n", encoding="utf-8")
             except OSError:
@@ -304,8 +305,8 @@ class HighlightCandidatesWidget(QWidget):
         self.progress_bar.setValue(min(completed, total))
         self.status_label.setText(f"{message} ({self.progress_bar.value() * 100 // max(1, total)}%)")
 
-    @pyqtSlot(str)
-    def _generation_finished(self, output_dir: str):
+    @pyqtSlot(str, str)
+    def _generation_finished(self, output_dir: str, verification_note: str = ""):
         self._output_dir = Path(output_dir)
         self.run_button.setEnabled(True)
         self.cancel_button.setEnabled(False)
@@ -313,7 +314,9 @@ class HighlightCandidatesWidget(QWidget):
         self.verify_button.setEnabled(self._output_dir.is_file())
         self.progress_bar.setValue(self.progress_bar.maximum())
         message = _("Highlight reel is ready: {}").format(output_dir)
-        note = self._verification_note()
+        # Prefer the summary returned by the run: a one-click run removes its
+        # work directory, taking the report file with it.
+        note = verification_note or self._verification_note()
         if note:
             message = f"{message}\n{note}"
         self.status_label.setText(message)
@@ -358,7 +361,7 @@ class HighlightCandidatesWidget(QWidget):
         """
         if self._output_dir is None:
             return ""
-        report = self._output_dir.parent / "verification.txt"
+        report = verification_report_path(self._output_dir)
         try:
             lines = report.read_text(encoding="utf-8").splitlines()
         except OSError:

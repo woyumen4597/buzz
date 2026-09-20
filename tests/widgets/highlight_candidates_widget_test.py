@@ -58,7 +58,9 @@ def test_highlight_widget_surfaces_verification_warnings(qtbot, tmp_path):
     qtbot.add_widget(widget)
     output = tmp_path / "video_highlight.mp4"
     output.write_bytes(b"video")
-    (tmp_path / "verification.txt").write_text(
+    report = tmp_path / "video_highlights" / "verification.txt"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
         "[ok  ] video_stream: video: h264 320x240\n"
         "[WARN] audio_silence: 2 silent stretch(es)\n",
         encoding="utf-8",
@@ -72,7 +74,9 @@ def test_highlight_widget_surfaces_verification_failures(qtbot, tmp_path):
     qtbot.add_widget(widget)
     output = tmp_path / "video_highlight.mp4"
     output.write_bytes(b"video")
-    (tmp_path / "verification.txt").write_text(
+    report = tmp_path / "video_highlights" / "verification.txt"
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(
         "[FAIL] subtitle_bounds: cues end past the reel duration\n",
         encoding="utf-8",
     )

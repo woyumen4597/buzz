@@ -32,3 +32,34 @@ def test_cli_rejects_an_unknown_verify_mode():
 
     with pytest.raises(SystemExit):
         build_parser().parse_args(["video.mp4", "--verify", "sometimes"])
+
+
+def test_verification_report_is_written_inside_the_work_directory(tmp_path):
+    """The report must not land beside the reel in the user's source folder.
+
+    A one-click run removes its work directory but the reel itself sits next to
+    the source video, so writing the report to the reel's parent left a stray
+    file in the library that no cleanup step owned.
+    """
+    from buzz.highlights.output import (
+        automatic_output_path,
+        verification_report_path,
+        work_dir_for,
+    )
+
+    source = tmp_path / "movie.mp4"
+    reel = automatic_output_path(source)
+    report = verification_report_path(reel)
+
+    assert report == work_dir_for(source) / "verification.txt"
+    assert report.parent != reel.parent
+
+
+def test_verification_report_path_handles_a_renamed_reel(tmp_path):
+    from buzz.highlights.output import verification_report_path
+
+    # A reel that does not follow the automatic naming keeps its own stem.
+    assert (
+        verification_report_path(tmp_path / "custom.mp4").parent
+        == tmp_path / "custom_highlights"
+    )

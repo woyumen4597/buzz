@@ -18,7 +18,7 @@ from .auto_edit import (
     selection_summary,
     select_auto_candidates,
 )
-from .output import automatic_output_path
+from .output import automatic_output_path, work_dir_for
 from .media import (
     extract_subtitles_command,
     find_tools,
@@ -120,7 +120,7 @@ def run(
     output_dir = (
         Path(args.output_dir).expanduser().absolute()
         if args.output_dir
-        else video_path.with_name(f"{video_path.stem}_highlights")
+        else work_dir_for(video_path)
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     if not output_dir.is_dir():
@@ -311,19 +311,32 @@ def run(
             source_subtitles=source_subtitles,
         )
     LOG.info("wrote %s", final_output_path)
+    verification_note = ""
     if getattr(args, "verify", "fast") != "off":
-        _verify_output(args, final_output_path)
+        verification_note = _verify_output(args, final_output_path, output_dir)
     # A successful one-click run leaves only the final MP4 beside the source.
     if cleanup_work_dir:
         shutil.rmtree(output_dir, ignore_errors=True)
-    return final_output_path
+    # The GUI needs the summary after the work dir is gone, so it is returned
+    # rather than re-read from a report file that cleanup may have removed.
+    return final_output_path, verification_note
 
 
-def _verify_output(args: argparse.Namespace, output_path: Path) -> None:
+def _verify_output(
+    args: argparse.Namespace, output_path: Path, work_dir: Path
+) -> str:
     """Validate a freshly rendered reel and report through the log.
 
     Verification is best-effort: a defect in the reel is worth reporting, but
     it must never turn a successful render into a failed run.
+
+    The report is written inside ``work_dir`` rather than beside the reel. The
+    reel lives next to the source video, so writing there would leave a stray
+    file in the user's library that no later cleanup step owns; ``work_dir`` is
+    removed on a one-click run and kept when ``--output-dir`` asks for it.
+
+    Returns a one-line summary for callers that render after cleanup, or an
+    empty string when verification could not run.
     """
     mode = getattr(args, "verify", "fast")
     sample_count, window_s = (6, 5.0) if mode == "fast" else (24, 8.0)
@@ -334,7 +347,7 @@ def _verify_output(args: argparse.Namespace, output_path: Path) -> None:
             )
     except Exception as exc:  # verification must never break a good render
         LOG.warning("reel verification could not run: %s", exc)
-        return
+        return ""
     for check in report.checks:
         level = {"error": logging.ERROR, "warning": logging.WARNING}.get(
             check.severity, logging.INFO
@@ -351,11 +364,18 @@ def _verify_output(args: argparse.Namespace, output_path: Path) -> None:
             len(report.errors),
         )
     try:
-        (output_path.parent / "verification.txt").write_text(
+        (work_dir / "verification.txt").write_text(
             summarise(report) + "\n", encoding="utf-8"
         )
     except OSError as exc:
         LOG.debug("could not write verification report: %s", exc)
+    if report.errors:
+        return "Check failed: " + "; ".join(
+            check.detail for check in report.errors[:2]
+        )
+    if report.warnings:
+        return f"Checked, {len(report.warnings)} warning(s) to review"
+    return "Checked, no problems found"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -363,11 +383,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO, format="%(levelname)s: %(message)s")
     try:
-        output_dir = run(args)
+        output_path, _note = run(args)
     except (OSError, ValueError, NotADirectoryError, InterruptedError) as exc:
         parser.error(str(exc))
         return 2
-    print(f"Generated reel: {output_dir}")
+    print(f"Generated reel: {output_path}")
     return 0
 
 
