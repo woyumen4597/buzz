@@ -63,6 +63,14 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 REQUEST_TIMEOUT = httpx.Timeout(connect=10.0, read=30.0, write=30.0, pool=10.0)
 CHAT_COMPLETIONS_PROTOCOL = "chat_completions"
 RESPONSES_PROTOCOL = "responses"
+# Where the translation instruction travels. Some OpenAI-compatible relays
+# accept a `system`/`developer` entry, answer 200, and silently drop it, so the
+# model only ever sees the bare transcript and answers it as a chat message
+# (the classic symptom: the "translation" comes back in the source language).
+# Merging the instruction into the user turn survives those relays; the switch
+# exists for official endpoints, where system keeps its higher priority.
+PROMPT_ROLE_USER = "user"
+PROMPT_ROLE_SYSTEM = "system"
 
 
 class _TranslationStreamTimeout(httpx.StreamError):
@@ -240,6 +248,22 @@ def _translation_api_protocol(configured: str = "") -> str:
     return CHAT_COMPLETIONS_PROTOCOL
 
 
+def _translation_prompt_role(configured: str = "") -> str:
+    """Return how the translation instruction is delivered: "user" or "system".
+
+    "user" (the default) merges the instruction into the user turn, which is
+    what relays that strip the system role require. "system" keeps the
+    instruction in its own higher-priority turn for endpoints that honor it.
+    """
+    value = (
+        os.getenv("BUZZ_TRANSLATION_PROMPT_ROLE", "").strip().lower()
+        or str(configured or "").strip().lower()
+    )
+    if value in {PROMPT_ROLE_USER, PROMPT_ROLE_SYSTEM}:
+        return value
+    return PROMPT_ROLE_USER
+
+
 # Queue marker that cancels the current run without stopping the worker:
 # pending items are drained and the loop keeps running for the next run.
 _CANCEL = object()
@@ -368,6 +392,9 @@ class Translator(QObject):
                 CHAT_COMPLETIONS_PROTOCOL,
             )
         )
+        self.prompt_role = _translation_prompt_role(
+            settings.value(Settings.Key.TRANSLATION_PROMPT_ROLE, PROMPT_ROLE_USER)
+        )
         # Same precedence as batch_size / concurrency.
         self.read_timeout = min(
             MAX_TRANSLATION_READ_TIMEOUT,
@@ -435,7 +462,7 @@ class Translator(QObject):
             "Translation config resolved: batch_size=%s, concurrency=%s, "
             "requests_per_minute=%s, max_batch_tokens=%s, protocol=%s, "
             "read_timeout=%ss, max_request_duration=%ss, proxy=%s, max_output_tokens=%s, "
-            "reasoning=%s, model=%s",
+            "reasoning=%s, prompt_role=%s, model=%s",
             self.batch_size,
             self.max_concurrent_requests,
             requests_per_minute,
@@ -446,6 +473,7 @@ class Translator(QObject):
             "enabled" if self.proxy else "disabled",
             self.max_output_tokens,
             self.reasoning_effort or "default",
+            self.prompt_role,
             self.llm_model or "<empty>",
         )
 
@@ -646,6 +674,13 @@ class Translator(QObject):
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+        # Relays that drop the system/developer turn leave the model with a bare
+        # transcript, which it answers as a chat message instead of translating.
+        # Merging the instruction into the user turn is the only shape such
+        # relays reliably forward.
+        merge_prompt = self.prompt_role == PROMPT_ROLE_USER
+        if merge_prompt:
+            user_content = f"{system}\n\n{user_content}"
         if self.api_protocol == RESPONSES_PROTOCOL:
             url = _responses_url(self.base_url)
             system_role = "developer" if self.reasoning_effort else "system"
@@ -664,15 +699,19 @@ class Translator(QObject):
                 "store": False,
                 "input": [
                     {
-                        "role": system_role,
-                        "content": system_content,
-                    },
-                    {
                         "role": "user",
                         "content": [{"type": "input_text", "text": user_content}],
                     },
                 ],
             }
+            if not merge_prompt:
+                body["input"].insert(
+                    0,
+                    {
+                        "role": system_role,
+                        "content": system_content,
+                    },
+                )
             if self.reasoning_effort:
                 # DeepSeek defaults thinking ON and counts reasoning tokens
                 # against max_output_tokens; "none" keeps the whole budget for
@@ -695,10 +734,11 @@ class Translator(QObject):
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "messages": [
-                    {"role": "system", "content": system},
                     {"role": "user", "content": user_content},
                 ],
             }
+            if not merge_prompt:
+                body["messages"].insert(0, {"role": "system", "content": system})
             if json_mode:
                 body["response_format"] = {"type": "json_object"}
             if (
@@ -1211,7 +1251,15 @@ class Translator(QObject):
                 if retryable_status and body.get("stream") is True:
                     body["stream"] = False
                     if self.api_protocol == RESPONSES_PROTOCOL:
-                        body["input"] = f"{system}\n\n{user_content}"
+                        # The buffered payload is a single input string. When the
+                        # instruction already rode in the user turn, re-adding it
+                        # here would send it twice.
+                        merged_input = (
+                            user_content
+                            if user_content.startswith(system)
+                            else f"{system}\n\n{user_content}"
+                        )
+                        body["input"] = merged_input
                         body.pop("text", None)
                     logging.warning(
                         "Translation streaming request returned HTTP %s; "

@@ -18,6 +18,7 @@ from buzz.settings.settings import (
 from buzz.translator import (
     CHAT_COMPLETIONS_PROTOCOL,
     RESPONSES_PROTOCOL,
+    PROMPT_ROLE_SYSTEM,
     Translator,
     _compress_repetitive_translation_input,
     _sanitize_translation_input,
@@ -825,11 +826,42 @@ class TestTranslator:
                 "stream": True,
                 "stream_options": {"include_usage": True},
                 "messages": [
-                    {"role": "system", "content": "Translate this text:"},
-                    {"role": "user", "content": "Hello"},
+                    {"role": "user", "content": "Translate this text:\n\nHello"},
                 ],
             },
         )
+
+    @patch('buzz.translator.httpx.Client')
+    def test_openai_chat_completions_keeps_system_role_when_configured(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """Endpoints that honor the system role can opt back into it."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROMPT_ROLE", PROMPT_ROLE_SYSTEM)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=CHAT_COMPLETIONS_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        assert mock_client.stream.call_args.kwargs["json"]["messages"] == [
+            {"role": "system", "content": "Translate this text:"},
+            {"role": "user", "content": "Hello"},
+        ]
 
     @patch('buzz.translator.httpx.Client')
     def test_openai_responses(self, mock_client_class, qtbot, monkeypatch):
@@ -869,19 +901,81 @@ class TestTranslator:
                 "store": False,
                 "input": [
                     {
-                        "role": "system",
-                        "content": [
-                            {"type": "input_text", "text": "Translate this text:"}
-                        ],
-                    },
-                    {
                         "role": "user",
-                        "content": [{"type": "input_text", "text": "Hello"}],
+                        "content": [
+                            {"type": "input_text", "text": "Translate this text:\n\nHello"}
+                        ],
                     },
                 ],
                 "text": {"format": {"type": "json_object"}},
             },
         )
+
+    @patch('buzz.translator.httpx.Client')
+    def test_responses_keeps_system_role_when_configured(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """Official endpoints can keep the instruction on its own system turn."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "openai-key")
+        monkeypatch.setenv(
+            "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
+        )
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROMPT_ROLE", PROMPT_ROLE_SYSTEM)
+
+        mock_client = Mock()
+        mock_client.stream.return_value = _stream_response(
+            "AI Translated", protocol=RESPONSES_PROTOCOL
+        )
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        assert mock_client.stream.call_args.kwargs["json"]["input"] == [
+            {
+                "role": "system",
+                "content": [{"type": "input_text", "text": "Translate this text:"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Hello"}],
+            },
+        ]
+
+    @patch('buzz.translator.httpx.Client')
+    def test_buffered_fallback_does_not_duplicate_prompt(
+        self, mock_client_class, qtbot, monkeypatch
+    ):
+        """The HTTP-error fallback rebuilds `input`; the prompt must appear once."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_KEY", "relay-key")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_BASE_URL", "https://relay.test/v1")
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+
+        mock_client = Mock()
+        mock_client.stream.side_effect = [
+            _failing_response(500),
+            _stream_response("AI Translated", protocol=RESPONSES_PROTOCOL),
+        ]
+        mock_client_class.return_value = mock_client
+
+        options = TranscriptionOptions(
+            llm_model="relay-model", llm_prompt="Translate this text:"
+        )
+        translator = Translator(
+            options,
+            AdvancedSettingsDialog(transcription_options=options, parent=None),
+        )
+
+        assert translator._messages("Translate this text:", "Hello") == "AI Translated"
+        fallback = mock_client.stream.call_args.kwargs["json"]
+        assert fallback["input"] == "Translate this text:\n\nHello"
 
     @patch("buzz.translator.httpx.Client")
     def test_gpt56_reasoning_matches_dsh(self, mock_client_class, qtbot, monkeypatch):
@@ -890,6 +984,9 @@ class TestTranslator:
             "BUZZ_TRANSLATION_API_BASE_URL", "https://api.openai.com/v1"
         )
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)
+        # The developer-role turn is what this test pins down, so keep the
+        # instruction on its own turn instead of the default merged user turn.
+        monkeypatch.setenv("BUZZ_TRANSLATION_PROMPT_ROLE", PROMPT_ROLE_SYSTEM)
 
         mock_client = Mock()
         mock_client.stream.return_value = _stream_response(

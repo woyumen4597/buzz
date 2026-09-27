@@ -52,6 +52,8 @@ from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.translator import (
     CHAT_COMPLETIONS_PROTOCOL,
     DEFAULT_OPENAI_BASE_URL,
+    PROMPT_ROLE_SYSTEM,
+    PROMPT_ROLE_USER,
     RESPONSES_PROTOCOL,
     _chat_completions_url,
     _responses_url,
@@ -263,6 +265,40 @@ class GeneralPreferencesWidget(QWidget):
         )
         openai_layout.addRow(
             _("OpenAI API protocol"), self.translation_api_protocol_combo_box
+        )
+
+        self.translation_prompt_role_combo_box = QComboBox(self)
+        self.translation_prompt_role_combo_box.setObjectName(
+            "TranslationPromptRoleComboBox"
+        )
+        self.translation_prompt_role_combo_box.addItem(
+            _("Merge into the user message (works with any model)"), PROMPT_ROLE_USER
+        )
+        self.translation_prompt_role_combo_box.addItem(
+            _("Separate system message (higher priority)"), PROMPT_ROLE_SYSTEM
+        )
+        prompt_role = self.settings.value(
+            Settings.Key.TRANSLATION_PROMPT_ROLE, PROMPT_ROLE_USER
+        )
+        prompt_role_index = self.translation_prompt_role_combo_box.findData(prompt_role)
+        self.translation_prompt_role_combo_box.setCurrentIndex(
+            prompt_role_index if prompt_role_index >= 0 else 0
+        )
+        self.translation_prompt_role_combo_box.currentIndexChanged.connect(
+            self.on_translation_prompt_role_changed
+        )
+        # Some models (deepseek-v4.1-flash among them) ignore a translation
+        # instruction placed in the system turn and answer the transcript as a
+        # chat message, so the "translation" comes back in the source language.
+        self.translation_prompt_role_combo_box.setToolTip(
+            _(
+                "How the AI instruction is sent. Merge it into the user message "
+                "when the model ignores a separate system message and replies in "
+                "the original language instead of translating."
+            )
+        )
+        openai_layout.addRow(
+            _("Instruction placement"), self.translation_prompt_role_combo_box
         )
 
         self.translation_batch_size_spin_box = QSpinBox(self)
@@ -623,6 +659,11 @@ class GeneralPreferencesWidget(QWidget):
         protocol = self.translation_api_protocol_combo_box.itemData(index)
         if protocol in {CHAT_COMPLETIONS_PROTOCOL, RESPONSES_PROTOCOL}:
             self.settings.set_value(Settings.Key.TRANSLATION_API_PROTOCOL, protocol)
+
+    def on_translation_prompt_role_changed(self, index: int):
+        prompt_role = self.translation_prompt_role_combo_box.itemData(index)
+        if prompt_role in {PROMPT_ROLE_USER, PROMPT_ROLE_SYSTEM}:
+            self.settings.set_value(Settings.Key.TRANSLATION_PROMPT_ROLE, prompt_role)
 
     def on_translation_read_timeout_changed(self, value: int):
         self.settings.set_value(Settings.Key.TRANSLATION_READ_TIMEOUT, value)

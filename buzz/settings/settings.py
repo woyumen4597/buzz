@@ -94,6 +94,7 @@ class Settings:
         CUSTOM_OPENAI_BASE_URL = "transcriber/custom-openai-base-url"
         OPENAI_API_MODEL = "transcriber/openai-api-model"
         TRANSLATION_API_PROTOCOL = "transcriber/translation-api-protocol"
+        TRANSLATION_PROMPT_ROLE = "transcriber/translation-prompt-role"
         TRANSLATION_BATCH_SIZE = "transcriber/translation-batch-size"
         TRANSLATION_CONCURRENCY = "transcriber/translation-concurrency"
         TRANSLATION_READ_TIMEOUT = "transcriber/translation-read-timeout"
