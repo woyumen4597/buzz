@@ -108,14 +108,25 @@ class AdvancedSettingsDialog(QDialog):
         llm_model_row.addWidget(self.llm_model_info_button)
         layout.addRow(self.llm_model_label, llm_model_row)
 
-        default_llm_prompt = self.transcription_options.llm_prompt or _(
-            "Please translate each text sent to you from Japanese to Chinese. Translation will be used in an automated system, please do not add any comments or notes, just the translation."
-        )
-        self.transcription_options.llm_prompt = default_llm_prompt
+        # No default instruction is invented here. A built-in example can only
+        # guess the language pair, and because the value is written back into
+        # transcription_options (and persisted) a wrong guess looks like a
+        # deliberate user choice. Empty means "not configured yet": the viewer
+        # and the CLI both refuse to start translation and ask for it.
+        default_llm_prompt = self.transcription_options.llm_prompt
         self.llm_prompt_text_edit = QPlainTextEdit(default_llm_prompt)
         self.llm_prompt_text_edit.setEnabled(self.transcription_options.enable_llm_translation)
         self.llm_prompt_text_edit.setMinimumWidth(170)
         self.llm_prompt_text_edit.setFixedHeight(80)
+        self.llm_prompt_text_edit.setPlaceholderText(
+            _(
+                "Describe how to translate, including the target language, e.g. "
+                "\"Translate each text into Chinese without adding notes or comments.\""
+            )
+        )
+        self.llm_prompt_text_edit.setToolTip(
+            _("Required when AI translation is enabled")
+        )
         self.llm_prompt_text_edit.textChanged.connect(self.on_llm_prompt_changed)
         self.llm_prompt_label = QLabel(_("Instructions for AI:"))
         self.llm_prompt_label.setEnabled(self.transcription_options.enable_llm_translation)

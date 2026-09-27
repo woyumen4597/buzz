@@ -20,6 +20,7 @@ from buzz.translator import (
     RESPONSES_PROTOCOL,
     PROMPT_ROLE_SYSTEM,
     Translator,
+    _clean_translated_text,
     _compress_repetitive_translation_input,
     _sanitize_translation_input,
     _TranslationStreamTimeout,
@@ -90,6 +91,41 @@ def _success_response(content):
         lines = _sse_lines(text, RESPONSES_PROTOCOL)
     resp.iter_lines = MagicMock(return_value=iter(lines))
     return resp
+
+
+class TestCleanTranslatedText:
+    def test_removes_code_fence(self):
+        assert _clean_translated_text("```\n你好。\n```") == "你好。"
+        assert _clean_translated_text("```text\n你好。\n```") == "你好。"
+
+    def test_removes_leading_label(self):
+        assert _clean_translated_text("翻译：你好。") == "你好。"
+        assert _clean_translated_text("Translation: Hello.") == "Hello."
+        assert _clean_translated_text("Here is the translation: Hello.") == "Hello."
+
+    def test_removes_batch_marker_and_outer_quotes(self):
+        assert _clean_translated_text("[3] 你好。") == "你好。"
+        assert _clean_translated_text('"你好。"') == "你好。"
+
+    def test_keeps_legitimate_prose(self):
+        # A colon, quotes, or fence-like text inside real prose must survive.
+        assert _clean_translated_text("我说：你好。") == "我说：你好。"
+        assert _clean_translated_text("He said \"你好\" today") == (
+            "He said \"你好\" today"
+        )
+        assert _clean_translated_text("안녕하세요") == "안녕하세요"
+
+    def test_does_not_strip_lone_note_text(self):
+        # An all-note response must survive so it surfaces as content, not
+        # silently become an empty (failed) translation.
+        assert _clean_translated_text("（注：无法翻译）", strip_notes=True) == (
+            "（注：无法翻译）"
+        )
+
+    def test_strips_inline_trailing_note(self):
+        assert _clean_translated_text(
+            "你好。（注：以上为翻译结果）", strip_notes=True
+        ) == "你好。"
 
 
 class TestRepetitiveTranslationInput:
@@ -241,6 +277,42 @@ class TestRepetitiveTranslationInput:
         response = '{"translations": {"1": "see [2] for details", "2": "done"}}'
         result = Translator._parse_batch_response(response, 2)
         assert result == ["see [2] for details", "done"]
+
+    def test_marker_inside_translated_text_is_not_a_segment(self):
+        # A '[N]' inside the prose used to split the entry and swallow the rest.
+        response = "[1] 见第[2]章\n[2] 谢谢"
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["见第[2]章", "谢谢"]
+
+    def test_trailing_note_is_discarded_not_appended(self):
+        # Commentary after the last entry used to be glued onto it.
+        response = (
+            "[1] 你好。\n"
+            "[2] 我很好，谢谢。\n"
+            "（注：以上为日译中结果，未作删改。）"
+        )
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["你好。", "我很好，谢谢。"]
+
+    def test_note_line_after_last_entry_is_dropped(self):
+        response = "[1] 你好。\n[2] 再见。\n备注：翻译完成"
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["你好。", "再见。"]
+
+    def test_out_of_range_marker_is_ignored(self):
+        response = "[1] 你好。\n[2] 再见。\n[7] 多余的条目"
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["你好。", "再见。"]
+
+    def test_single_line_collapsed_response_still_parses(self):
+        response = "[1] 你好。 [2] 再见。"
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["你好。", "再见。"]
+
+    def test_entries_are_cleaned_of_scaffolding(self):
+        response = '```\n[1] 翻译：你好。\n[2] "再见。"\n```'
+        result = Translator._parse_batch_response(response, 2)
+        assert result == ["你好。", "再见。"]
 
     def test_read_stream_stops_at_responses_output_text_done(self, qtbot, monkeypatch):
         monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", RESPONSES_PROTOCOL)

@@ -220,6 +220,109 @@ def _log_repetition_compression(transcript_id: int, diagnostic: dict) -> None:
     )
 
 
+# Models routinely wrap the answer in a code fence or prefix it with a label
+# ("翻译：", "Here is the translation:") even when the instruction forbids it.
+# Left alone these markers are written straight into the subtitle file, so the
+# response is cleaned before it is cached or emitted. Every rule below is
+# deliberately narrow: it only fires on shapes that are unambiguously model
+# scaffolding, never on ordinary translated prose.
+_FENCED_TEXT_RE = re.compile(
+    r"^[ \t]*```[A-Za-z0-9_-]*[ \t]*\r?\n(?P<body>.*?)\r?\n?[ \t]*```[ \t]*$",
+    re.DOTALL,
+)
+_LEADING_LABEL_RE = re.compile(
+    r"^[ \t]*(?:翻译|译文|譯文|翻訳|번역|Translation|Translated text|"
+    r"Here is the translation|Here's the translation|"
+    r"Here are the translations)[ \t]*[:：][ \t]*",
+    re.IGNORECASE,
+)
+_LEADING_NUMBER_RE = re.compile(r"^[ \t]*\[\d+\][ \t]*")
+# A trailing "（注：…）" aside is meta-commentary, not translation content. It is
+# only removed when something else survives, so a segment that is *only* a note
+# is kept and reported as a failure instead of silently vanishing.
+_TRAILING_NOTE_PREFIXES = (
+    "注：", "注:", "註：", "註:", "备注", "備註", "注释", "註釋", "注意：",
+    "（注", "(注", "（註", "(註", "（备注", "(备注",
+    "note:", "note：", "notes:", "notes：", "translation note",
+)
+_TRAILING_INLINE_NOTE_RE = re.compile(
+    r"[ \t]*[（(](?:注|註|备注|備註|Note|Notes)[：:][^）)]*[）)][ \t]*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_code_fence(text: str) -> str:
+    """Unwrap a response that is entirely enclosed in a Markdown code fence."""
+    stripped = str(text or "").strip()
+    fenced = _FENCED_TEXT_RE.match(stripped)
+    if fenced:
+        body = fenced.group("body").strip()
+        return body if body else stripped
+    return stripped
+
+
+def _strip_trailing_note(text: str, drop_note_lines: bool = False) -> str:
+    """Drop trailing model commentary.
+
+    A trailing parenthesised aside ("（注：…）") is meta-commentary in every
+    context, so it is always removed. A bare note *line* is ambiguous — it may
+    be genuine dialogue — so it is only removed when ``drop_note_lines`` is set,
+    i.e. for numbered batch output where the protocol forbids notes outright.
+    Nothing is ever removed if that would empty the text: an all-note response
+    is kept so it surfaces as a failure rather than silently vanishing.
+    """
+    without_inline = _TRAILING_INLINE_NOTE_RE.sub("", text).rstrip()
+    if without_inline:
+        text = without_inline
+
+    if drop_note_lines:
+        lines = text.splitlines()
+        while len(lines) > 1:
+            last = lines[-1].strip().lower()
+            if last and last.startswith(_TRAILING_NOTE_PREFIXES):
+                lines.pop()
+                continue
+            break
+        text = "\n".join(lines).strip()
+
+    return text
+
+
+def _clean_translated_text(
+    text: str, strip_notes: bool = False, drop_note_lines: bool = False
+) -> str:
+    """Remove model scaffolding from a translation response.
+
+    Handles code fences, an ``[N]`` batch marker, a leading label, an
+    ASCII-quoted whole answer, and — when asked — trailing commentary.
+    Legitimate prose is left untouched.
+    """
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = _strip_code_fence(cleaned)
+    if not cleaned:
+        return ""
+
+    cleaned = _LEADING_LABEL_RE.sub("", cleaned, count=1).strip()
+    cleaned = _LEADING_NUMBER_RE.sub("", cleaned, count=1).strip()
+
+    for quote in ('"', "'"):
+        if (
+            len(cleaned) > 1
+            and cleaned.startswith(quote)
+            and cleaned.endswith(quote)
+            and cleaned.count(quote) == 2
+        ):
+            cleaned = cleaned[1:-1].strip()
+            break
+
+    if strip_notes:
+        cleaned = _strip_trailing_note(cleaned, drop_note_lines=drop_note_lines)
+    return cleaned
+
+
 def _chat_completions_url(base_url: str) -> str:
     base = base_url.rstrip("/")
     if base.endswith("/chat/completions"):
@@ -1358,9 +1461,10 @@ class Translator(QObject):
         translation = self._messages(
             **message_args,
         )
+        translation = _clean_translated_text(translation or "", strip_notes=True)
         if translation:
             self._cache_put(transcript, translation)
-        return translation or "", transcript_id
+        return translation, transcript_id
 
     def _translate_batch(self, items: List[Tuple[str, int]]) -> List[Tuple[str, int]]:
         """Translate multiple transcripts in a single API call.
@@ -1420,9 +1524,10 @@ class Translator(QObject):
             f"You will receive {len(missing)} numbered texts. "
             f"Process each one separately according to the instruction above "
             f"and return each processed text on its own line using the exact "
-            f"format [number] translated text. Preserve the input numbering, "
-            f"do not add comments or notes, and respond with only those numbered "
-            f"lines."
+            f"format [number] translated text, with each [number] marker at the "
+            f"start of its own line. Preserve the input numbering and never add "
+            f"a marker inside a translated text. Do not add comments, notes or "
+            f"closing remarks, and respond with only those numbered lines."
         )
 
         generation, cancel_event = self._run_context()
@@ -1549,25 +1654,74 @@ class Translator(QObject):
     @staticmethod
     def _parse_batch_response(response: str, expected_count: int) -> List[str]:
         """Parse a batch response into a list of strings.
-        Accepts a JSON object mapping numbers to texts, or numbered '[N] text' lines."""
+
+        Accepts a JSON object mapping numbers to texts, or numbered '[N] text'
+        entries. Markers are matched at line start so an '[N]' occurring inside
+        translated prose (e.g. "see [2] for details") is not mistaken for the
+        next segment; a collapsed single-line response falls back to inline
+        markers. Everything after the last expected entry is discarded rather
+        than appended to it, and each entry is stripped of model scaffolding.
+        """
         mapping = Translator._try_parse_json_mapping(response)
         if mapping is not None:
-            return [mapping.get(i, "") for i in range(1, expected_count + 1)]
+            return [
+                _clean_translated_text(
+                    mapping.get(i, ""), strip_notes=True, drop_note_lines=True
+                )
+                for i in range(1, expected_count + 1)
+            ]
 
-        # Fallback: split on [N] markers — re.split with a group returns:
-        # [before, group1, after1, group2, after2, ...]
-        parts = re.split(r'\[(\d+)\]\s*', response)
-
-        translations = {}
-        for i in range(1, len(parts) - 1, 2):
-            num = int(parts[i])
-            text = parts[i + 1].strip()
-            translations[num] = text
+        # A fence wrapped around the whole answer would otherwise leave its
+        # closing marker inside the last entry, so unwrap it first.
+        text = _strip_code_fence(str(response or ""))
+        # Two candidate layouts: one marker per line (the requested format) and
+        # inline markers (what a gateway that collapses newlines produces).
+        # Line-anchoring is what keeps an "[N]" inside prose from splitting an
+        # entry, so it is preferred; inline splitting is used only when it
+        # recovers strictly more segments, i.e. the response really was
+        # collapsed onto one line.
+        by_line = Translator._split_numbered_entries(
+            text, r"(?m)^[ \t]*\[(\d+)\][ \t]*", expected_count
+        )
+        by_inline = Translator._split_numbered_entries(
+            text, r"\[(\d+)\][ \t]*", expected_count
+        )
+        translations = (
+            by_inline if len(by_inline) > len(by_line) else by_line
+        )
 
         return [
-            translations.get(i, "")
+            _clean_translated_text(
+                translations.get(i, ""), strip_notes=True, drop_note_lines=True
+            )
             for i in range(1, expected_count + 1)
         ]
+
+    @staticmethod
+    def _split_numbered_entries(
+        text: str, marker_pattern: str, expected_count: int
+    ) -> dict:
+        """Map entry number -> raw text for the given marker layout.
+
+        Markers outside 1..expected_count are stray output and ignored. A
+        repeated number keeps its first occurrence, so a marker inside prose
+        cannot overwrite a real entry.
+        """
+        # re.split with a capture group returns
+        # [before, group1, after1, group2, after2, ...]
+        parts = re.split(marker_pattern, text)
+        translations: dict = {}
+        for i in range(1, len(parts) - 1, 2):
+            try:
+                num = int(parts[i])
+            except (TypeError, ValueError):
+                continue
+            if not 1 <= num <= expected_count:
+                continue
+            if num in translations:
+                continue
+            translations[num] = parts[i + 1]
+        return translations
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:

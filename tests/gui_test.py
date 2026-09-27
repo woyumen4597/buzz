@@ -130,7 +130,11 @@ class TestAdvancedSettingsDialog:
         assert dialog.initial_prompt_text_edit.toPlainText() == "prompt"
         assert dialog.enable_llm_translation_checkbox.isChecked() is False
         assert dialog.llm_model_line_edit.text() == ""
-        assert dialog.llm_prompt_text_edit.toPlainText() == _("Please translate each text sent to you from Japanese to Chinese. Translation will be used in an automated system, please do not add any comments or notes, just the translation.")
+        # No built-in instruction is invented: the field starts empty because a
+        # hardcoded language pair would be wrong for most users, and it must not
+        # be written back as if the user had chosen it.
+        assert dialog.llm_prompt_text_edit.toPlainText() == ""
+        assert dialog.transcription_options.llm_prompt == ""
 
         dialog.initial_prompt_text_edit.setPlainText("new prompt")
         dialog.enable_llm_translation_checkbox.setChecked(True)

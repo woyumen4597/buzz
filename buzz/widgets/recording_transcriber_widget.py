@@ -592,8 +592,37 @@ class RecordingTranscriberWidget(QWidget):
         )
         self.recording_amplitude_listener.start_recording()
 
+    def _translation_instruction_is_ready(self) -> bool:
+        """Ensure live translation has an instruction and a model before starting.
+
+        The prompt has no built-in default (a hardcoded language pair would be
+        wrong for most users), so an unconfigured live recording must be
+        reported instead of silently sending every segment with no instruction.
+        The transcription-only path is unaffected.
+        """
+        if not self.transcription_options.enable_llm_translation:
+            return True
+
+        if (self.transcription_options.llm_prompt or "").strip():
+            return True
+
+        logging.warning("Recording not started: translation prompt is missing")
+        QMessageBox.information(
+            self,
+            _("Translation Instructions Required"),
+            _(
+                "AI translation is enabled but no translation instructions are "
+                "set. Add instructions in Advanced Settings (including the "
+                "language to translate into), or disable AI translation."
+            ),
+        )
+        self.transcription_options_group_box.advanced_settings_dialog.show()
+        return False
+
     def on_record_button_clicked(self):
         if self.current_status == self.RecordingStatus.STOPPED:
+            if not self._translation_instruction_is_ready():
+                return
             # Stop amplitude listener and disconnect its signal before resetting
             # to prevent queued amplitude events from overriding the reset
             if self.recording_amplitude_listener is not None:
