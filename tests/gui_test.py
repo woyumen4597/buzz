@@ -130,11 +130,14 @@ class TestAdvancedSettingsDialog:
         assert dialog.initial_prompt_text_edit.toPlainText() == "prompt"
         assert dialog.enable_llm_translation_checkbox.isChecked() is False
         assert dialog.llm_model_line_edit.text() == ""
-        # No built-in instruction is invented: the field starts empty because a
-        # hardcoded language pair would be wrong for most users, and it must not
-        # be written back as if the user had chosen it.
-        assert dialog.llm_prompt_text_edit.toPlainText() == ""
-        assert dialog.transcription_options.llm_prompt == ""
+        # An empty prompt is seeded with a usable instruction whose target
+        # language follows the UI locale. Leaving it empty would make the
+        # viewer treat the feature as unconfigured and reopen this dialog on
+        # every Translate click.
+        seeded = dialog.llm_prompt_text_edit.toPlainText()
+        assert seeded
+        assert seeded == dialog.transcription_options.llm_prompt
+        assert not seeded.startswith("Please translate each text sent to you from Japanese")
 
         dialog.initial_prompt_text_edit.setPlainText("new prompt")
         dialog.enable_llm_translation_checkbox.setChecked(True)
@@ -145,6 +148,39 @@ class TestAdvancedSettingsDialog:
         assert transcription_options_mock.call_args[0][0].enable_llm_translation is True
         assert transcription_options_mock.call_args[0][0].llm_model == "model"
         assert transcription_options_mock.call_args[0][0].llm_prompt == "Please translate this text"
+
+    def test_seeds_instruction_so_translate_does_not_reopen_the_dialog(
+        self, qtbot: QtBot
+    ):
+        """An empty prompt must be seeded, or the viewer loops on this dialog.
+
+        The viewer treats an empty prompt as "not configured" and reopens the
+        dialog on every Translate click, so the seeded value has to land on the
+        caller's own options object before any of that can happen.
+        """
+        options = TranscriptionOptions(
+            enable_llm_translation=True, llm_model="", llm_prompt=""
+        )
+        dialog = AdvancedSettingsDialog(transcription_options=options)
+        qtbot.add_widget(dialog)
+
+        assert options.llm_prompt, "empty prompt was not seeded"
+        assert dialog.llm_prompt_text_edit.toPlainText() == options.llm_prompt
+
+        # Clicking Ok without typing must not leave the prompt empty again,
+        # otherwise the next Translate click reopens this same dialog.
+        dialog.accept()
+        assert options.llm_prompt
+
+    def test_keeps_a_user_supplied_instruction(self, qtbot: QtBot):
+        options = TranscriptionOptions(
+            enable_llm_translation=True, llm_prompt="翻成粤语，不要加注释"
+        )
+        dialog = AdvancedSettingsDialog(transcription_options=options)
+        qtbot.add_widget(dialog)
+
+        assert options.llm_prompt == "翻成粤语，不要加注释"
+        assert dialog.llm_prompt_text_edit.toPlainText() == "翻成粤语，不要加注释"
 
 
 @pytest.mark.skipif(

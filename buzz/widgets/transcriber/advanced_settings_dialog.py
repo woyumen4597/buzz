@@ -1,4 +1,4 @@
-from PyQt6.QtCore import pyqtSignal, QUrl
+from PyQt6.QtCore import pyqtSignal, QUrl, QLocale
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QDialog,
@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from buzz.locale import _
-from buzz.transcriber.transcriber import TranscriptionOptions
+from buzz.transcriber.transcriber import TranscriptionOptions, LANGUAGES
 from buzz.settings.settings import Settings
 from buzz.settings.recording_transcriber_mode import RecordingTranscriberMode
 from buzz.widgets.line_edit import LineEdit
@@ -55,6 +55,34 @@ class AdvancedSettingsDialog(QDialog):
         if show_recording_settings:
             self._setup_recording_section(layout)
         self._setup_button_box(layout)
+
+    def _default_llm_prompt(self) -> str:
+        """Build a starting instruction whose target language is the UI language.
+
+        Hardcoding a language pair (the previous default was Japanese to
+        Chinese) is wrong for anyone whose UI is not in that pair, and a
+        prompt with no target language leaves the model to guess. Following
+        the UI locale gives a usable starting point that the user can edit.
+        """
+        return _(
+            "Translate each text sent to you into {0}. Translation will be used "
+            "in an automated system, please do not add any comments or notes, "
+            "just the translation."
+        ).format(self._target_language_name())
+
+    def _target_language_name(self) -> str:
+        """Localized name of the language matching the configured UI locale."""
+        ui_locale = str(
+            self.settings.value(Settings.Key.UI_LOCALE, QLocale().name()) or ""
+        )
+        # "zh_CN" / "zh-TW" / "lv_LV" -> language subtag.
+        language_code = ui_locale.replace("-", "_").split("_")[0].lower()
+        language = LANGUAGES.get(language_code)
+        if language is None:
+            # An unsupported UI locale (the UI itself falls back to English),
+            # so match that rather than emit an unnamed placeholder.
+            language = LANGUAGES["en"]
+        return language
 
     def _setup_transcription_section(self, layout: QFormLayout):
         transcription_settings_title = _("Speech recognition settings")
@@ -108,25 +136,21 @@ class AdvancedSettingsDialog(QDialog):
         llm_model_row.addWidget(self.llm_model_info_button)
         layout.addRow(self.llm_model_label, llm_model_row)
 
-        # No default instruction is invented here. A built-in example can only
-        # guess the language pair, and because the value is written back into
-        # transcription_options (and persisted) a wrong guess looks like a
-        # deliberate user choice. Empty means "not configured yet": the viewer
-        # and the CLI both refuse to start translation and ask for it.
-        default_llm_prompt = self.transcription_options.llm_prompt
+        # A translation instruction needs a target language, and starting with
+        # an empty field leaves the feature unusable: the viewer treats an empty
+        # prompt as "not configured" and reopens this dialog instead of
+        # translating. So seed a usable instruction whose target language
+        # follows the UI locale rather than a hardcoded pair, and let the user
+        # edit it. The value is stored on transcription_options because the
+        # caller holds (and persists) that same object.
+        default_llm_prompt = (
+            self.transcription_options.llm_prompt or self._default_llm_prompt()
+        )
+        self.transcription_options.llm_prompt = default_llm_prompt
         self.llm_prompt_text_edit = QPlainTextEdit(default_llm_prompt)
         self.llm_prompt_text_edit.setEnabled(self.transcription_options.enable_llm_translation)
         self.llm_prompt_text_edit.setMinimumWidth(170)
         self.llm_prompt_text_edit.setFixedHeight(80)
-        self.llm_prompt_text_edit.setPlaceholderText(
-            _(
-                "Describe how to translate, including the target language, e.g. "
-                "\"Translate each text into Chinese without adding notes or comments.\""
-            )
-        )
-        self.llm_prompt_text_edit.setToolTip(
-            _("Required when AI translation is enabled")
-        )
         self.llm_prompt_text_edit.textChanged.connect(self.on_llm_prompt_changed)
         self.llm_prompt_label = QLabel(_("Instructions for AI:"))
         self.llm_prompt_label.setEnabled(self.transcription_options.enable_llm_translation)

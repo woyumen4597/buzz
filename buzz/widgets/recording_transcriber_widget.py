@@ -593,12 +593,14 @@ class RecordingTranscriberWidget(QWidget):
         self.recording_amplitude_listener.start_recording()
 
     def _translation_instruction_is_ready(self) -> bool:
-        """Ensure live translation has an instruction and a model before starting.
+        """Ensure live translation has an instruction before starting.
 
-        The prompt has no built-in default (a hardcoded language pair would be
-        wrong for most users), so an unconfigured live recording must be
-        reported instead of silently sending every segment with no instruction.
-        The transcription-only path is unaffected.
+        Advanced Settings seeds a usable instruction, so this normally passes.
+        It still guards the case where an instruction never reaches the
+        options (a stored value edited outside the UI, or a widget built
+        without the dialog), because silently sending every segment with no
+        instruction yields unusable output. The transcription-only path is
+        unaffected.
         """
         if not self.transcription_options.enable_llm_translation:
             return True
