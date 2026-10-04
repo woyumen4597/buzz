@@ -162,7 +162,9 @@ class TranscriptionOptions:
     silence_threshold: float = 0.0025
     line_separator: str = "\n\n"
     transcription_step: float = 3.5
-    use_vad: bool = False
+    #: On by default for whisper.cpp: it keeps the decoder away from silence,
+    #: where it invents sign-offs and whole sentences that are not in the audio.
+    use_vad: bool = True
 
 
 def humanize_language(language: str) -> str:
@@ -374,7 +376,7 @@ def deserialize_task_options(
         extract_speech=as_bool(
             options_data.get("extract_speech", value("extract_speech"))
         ),
-        use_vad=as_bool(options_data.get("use_vad")),
+        use_vad=as_bool(options_data.get("use_vad"), True),
         temperature=temperature,
         initial_prompt=options_data.get("initial_prompt", ""),
         openai_access_token=openai_access_token,

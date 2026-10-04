@@ -13,6 +13,11 @@ from buzz.transcriber.transcriber import (
 )
 
 
+#: Bumped when a stored default has to change for installations that already
+#: have a settings file. Version 2 turns voice activity detection on.
+SETTINGS_VERSION = 2
+
+
 @dataclass()
 class FileTranscriptionPreferences:
     language: Optional[str]
@@ -25,9 +30,13 @@ class FileTranscriptionPreferences:
     llm_prompt: str
     llm_model: str
     output_formats: Set["OutputFormat"]
-    use_vad: bool = False
+    #: On by default: whisper.cpp hallucinates sign-offs and invented sentences
+    #: wherever the audio holds no speech, and VAD keeps those windows away from
+    #: the decoder. The form still exposes it, so it can be turned off.
+    use_vad: bool = True
 
     def save(self, settings: QSettings) -> None:
+        settings.setValue("settings_version", SETTINGS_VERSION)
         settings.setValue("language", self.language)
         settings.setValue("task", self.task)
         settings.setValue("model", self.model)
@@ -59,8 +68,14 @@ class FileTranscriptionPreferences:
         extract_speech = False if extract_speech_value == "false" \
             else bool(extract_speech_value)
 
-        use_vad_value = settings.value("use_vad", False)
+        use_vad_value = settings.value("use_vad", True)
         use_vad = False if use_vad_value == "false" else bool(use_vad_value)
+        # Settings written before VAD became the default recorded the old default
+        # (off) without the user ever touching the checkbox, so a stored off from
+        # that era cannot be told apart from a deliberate opt-out. Version 2
+        # applies the new default once; anything saved from then on is kept.
+        if settings.value("settings_version", 1, type=int) < SETTINGS_VERSION:
+            use_vad = True
 
         initial_prompt = settings.value("initial_prompt", "")
         enable_llm_translation_value = settings.value("enable_llm_translation", True)

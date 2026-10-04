@@ -25,16 +25,31 @@ class TestFileTranscriberWidget:
         settings.setValue("enable_llm_translation", False)
         assert FileTranscriptionPreferences.load(settings).enable_llm_translation is False
 
-    def test_vad_defaults_off_and_is_persisted(self, tmp_path):
+    def test_vad_defaults_on_and_an_explicit_choice_is_persisted(self, tmp_path):
         settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
 
         preferences = FileTranscriptionPreferences.load(settings)
-        assert preferences.use_vad is False
+        assert preferences.use_vad is True
 
-        preferences.use_vad = True
+        preferences.use_vad = False
         preferences.save(settings)
 
+        assert FileTranscriptionPreferences.load(settings).use_vad is False
+
+    def test_legacy_settings_adopt_the_new_vad_default_once(self, tmp_path):
+        """A settings file written while VAD defaulted to off records that off
+        without the user ever touching the checkbox, so it must not pin the old
+        default forever. Saving an explicit choice ends the migration."""
+        settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        settings.setValue("use_vad", False)
+
         assert FileTranscriptionPreferences.load(settings).use_vad is True
+
+        preferences = FileTranscriptionPreferences.load(settings)
+        preferences.use_vad = False
+        preferences.save(settings)
+
+        assert FileTranscriptionPreferences.load(settings).use_vad is False
 
     def test_vad_checkbox_updates_transcription_options(self, qtbot: QtBot):
         form = FileTranscriptionFormWidget(
@@ -43,9 +58,9 @@ class TestFileTranscriberWidget:
         )
         qtbot.add_widget(form)
 
-        assert form.use_vad_checkbox.isChecked() is False
-        form.use_vad_checkbox.setChecked(True)
-        assert form.transcription_options.use_vad is True
+        assert form.use_vad_checkbox.isChecked() is True
+        form.use_vad_checkbox.setChecked(False)
+        assert form.transcription_options.use_vad is False
 
     def test_should_set_window_title(self, qtbot: QtBot):
         widget = FileTranscriberWidget(

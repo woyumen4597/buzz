@@ -159,13 +159,14 @@ class TestTranscriptionDAO:
     def test_deserialize_task_options_accepts_old_rows(self):
         options, file_options = deserialize_task_options(None)
         assert options.initial_prompt == ""
-        assert options.use_vad is False
+        # Rows written before VAD existed follow the current default (on).
+        assert options.use_vad is True
         assert file_options.output_formats == set()
 
         old_json_options, _ = deserialize_task_options(
             json.dumps({"version": TASK_OPTIONS_VERSION, "transcription_options": {}})
         )
-        assert old_json_options.use_vad is False
+        assert old_json_options.use_vad is True
 
     def test_insert_transcription_with_name_and_notes(self, transcription_dao, sample_transcription):
         """Test inserting a transcription with name and notes fields"""
