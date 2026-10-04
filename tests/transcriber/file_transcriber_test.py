@@ -188,3 +188,52 @@ class TestFileTranscriberTranslationExport:
         )
         assert "bonjour" in content
         assert "monde" not in content
+
+
+class HallucinatingFileTranscriber(StubFileTranscriber):
+    """A transcriber whose decoder also returned text that is not in the audio."""
+
+    def transcribe(self):
+        return [
+            Segment(start=0, end=29980, text="ご視聴ありがとうございました"),
+            Segment(start=30000, end=32000, text="hello"),
+            Segment(start=32000, end=34000, text="world"),
+        ]
+
+
+class TestHallucinationFiltering:
+    def test_artifacts_never_reach_the_checkpoint_or_the_subtitles(
+        self, tmp_path, qtbot
+    ):
+        task = _task(tmp_path, {OutputFormat.SRT})
+        transcriber = HallucinatingFileTranscriber(task)
+        checkpoints = []
+        completed = []
+        transcriber.checkpoint.connect(checkpoints.append)
+        transcriber.completed.connect(completed.append)
+
+        transcriber.run()
+
+        assert [segment.text for segment in checkpoints[0]] == ["hello", "world"]
+        assert [segment.text for segment in completed[0]] == ["hello", "world"]
+        content = list(tmp_path.glob("*.srt"))[0].read_text(encoding="utf-8")
+        assert "ご視聴" not in content
+
+    def test_artifacts_are_not_sent_to_translation(self, tmp_path, qtbot, mocker):
+        task = _task(tmp_path, {OutputFormat.SRT}, translate=True)
+        fake_translator = mocker.Mock()
+        fake_translator.translate_items_sync.return_value = [
+            ("bonjour", 0),
+            ("monde", 1),
+        ]
+        mocker.patch(
+            "buzz.transcriber.file_transcriber.Translator",
+            return_value=fake_translator,
+        )
+        transcriber = HallucinatingFileTranscriber(task)
+
+        transcriber.run()
+
+        fake_translator.translate_items_sync.assert_called_once_with(
+            [("hello", 0), ("world", 1)]
+        )

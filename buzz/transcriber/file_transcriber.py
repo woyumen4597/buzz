@@ -19,6 +19,7 @@ from buzz.transcriber.download_cookies import (
     apply_cookie_options,
     parse_cookies_from_browser,
 )
+from buzz.transcriber.hallucinations import drop_hallucinated_segments
 from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     get_output_file_path,
@@ -62,6 +63,12 @@ class FileTranscriber(QObject):
             logging.exception("")
             self.error.emit(str(exc))
             return
+
+        # Whisper answers silence with text from its training data (sign-offs,
+        # subtitle credits, invented sentences). That text is not in the audio,
+        # so drop it here: everything downstream (the checkpoint, the viewer,
+        # translation and the exported subtitles) then agrees on what was said.
+        segments = drop_hallucinated_segments(segments)
 
         for segment in segments:
             segment.text = segment.text.strip()
