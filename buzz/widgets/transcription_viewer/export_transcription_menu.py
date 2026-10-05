@@ -44,6 +44,28 @@ _COPY_AUDIO_CODECS = {"aac", "mp3", "ac3", "alac", "opus"}
 # make the whole MP4 mux fail with "Result too large" (FFmpeg exit 222).
 _MAX_MP4_SUBTITLE_BYTES = 60000
 
+# The same muxer keeps a cue's duration and its delta from the previous cue in
+# a signed 32-bit microsecond field, so 2147483647 us (~35m47s) is a hard
+# ceiling for both. A longer cue makes the muxer refuse the packet with EINVAL,
+# which FFmpeg reports as exit code 234; a larger delta is not fatal but is
+# collapsed, silently shifting every cue after it. Whisper's VAD produces both
+# whenever it skips a long stretch of silence, because the neighbouring cue is
+# stretched across the whole gap -- a 7h38m recording held one 37-minute cue.
+# Video export therefore clamps cues to a normal subtitle length and steps over
+# long silences with cues that render as nothing.
+_MAX_MP4_SUBTITLE_US = 2_147_483_647
+_MAX_SUBTITLE_CUE_MS = 10_000
+_MAX_SUBTITLE_STEP_MS = _MAX_MP4_SUBTITLE_US // 1000 // 2
+#: A zero-width space. It must render as nothing, so a bridge cue is invisible,
+#: but it must also survive the SRT writer, which drops cues whose text is
+#: blank -- and U+3000/U+00A0 are both stripped by ``str.strip()``.
+_SILENT_CUE_TEXT = "\u200b"
+
+#: Messages the mov muxer emits when it refuses a subtitle packet. The stream
+#: copy and the transcode fallback mux the same SRT, so re-encoding the video
+#: cannot change either one.
+_MUXER_SUBTITLE_FAILURE_HINTS = ("packet duration:", "pts has no value")
+
 
 def _split_long_subtitle_segments(
     segments: list[Segment], segment_key: str, max_bytes: int = _MAX_MP4_SUBTITLE_BYTES
@@ -89,6 +111,70 @@ def _split_long_subtitle_segments(
             segment_key,
             len(chunks),
             len(text.encode("utf-8")),
+        )
+    return result
+
+
+def _clamp_subtitle_timing(
+    segments: list[Segment],
+    max_cue_ms: int = _MAX_SUBTITLE_CUE_MS,
+    max_step_ms: int = _MAX_SUBTITLE_STEP_MS,
+) -> list[Segment]:
+    """Keep every cue inside what the MP4 muxer's mov_text writer can store.
+
+    Cues are clamped to a normal subtitle length, and a silence longer than
+    ``max_step_ms`` is spanned by silent cues instead of being folded into one
+    enormous cue. Transcripts that already fit are returned unchanged, so an
+    ordinary export is not rewritten.
+    """
+    ordered = sorted(segments, key=lambda item: (item.start, item.end))
+    result: list[Segment] = []
+    clamped = 0
+    bridged = 0
+    for index, segment in enumerate(ordered):
+        start = max(0, segment.start)
+        following = ordered[index + 1].start if index + 1 < len(ordered) else None
+        # Only ever shorten a cue: extending one would change the transcript.
+        end = min(segment.end, start + max_cue_ms)
+        if following is not None:
+            # Never let a clamped cue run into the next one.
+            end = min(end, following)
+        if end < segment.end:
+            clamped += 1
+        result.append(
+            Segment(
+                start=start,
+                end=max(start + 1, end),
+                text=segment.text,
+                translation=segment.translation,
+            )
+        )
+        if following is None or following <= start:
+            continue
+        gap = following - start
+        if gap <= max_step_ms:
+            continue
+        # Evenly spaced bridges keep every consecutive cue delta under the
+        # ceiling while adding as few cues as possible.
+        bridges = gap // max_step_ms
+        for step in range(1, bridges + 1):
+            at = start + gap * step // (bridges + 1)
+            result.append(
+                Segment(
+                    start=at,
+                    end=min(at + max_cue_ms, following),
+                    text=_SILENT_CUE_TEXT,
+                    translation=_SILENT_CUE_TEXT,
+                )
+            )
+            bridged += 1
+    if clamped or bridged:
+        logging.warning(
+            "Adjusted subtitle timing for the MP4 muxer: %d cue(s) clamped to "
+            "%d ms, %d silent bridge cue(s) added",
+            clamped,
+            max_cue_ms,
+            bridged,
         )
     return result
 
@@ -497,6 +583,7 @@ class ExportTranscriptionMenu(QMenu):
         copy_audio = audio_codec in _COPY_AUDIO_CODECS if audio_codec else True
         segments = self._segments_within_duration(proc.segments, proc.duration_ms)
         segments = _split_long_subtitle_segments(segments, proc.segment_key)
+        segments = _clamp_subtitle_timing(segments)
         try:
             write_output(
                 path=proc.srt_path,
@@ -671,19 +758,27 @@ class ExportTranscriptionMenu(QMenu):
 
         # A failed stream-copy attempt usually fails fast (incompatible muxer
         # combination); retry once with full transcoding instead of giving up.
+        # That retry re-encodes the entire source, so it is only worth starting
+        # when re-encoding can actually change the outcome.
         if (
             exit_code != 0
             and getattr(proc, "try_copy", False)
             and getattr(proc, "transcode_cmd", None)
         ):
+            if self._transcode_retry_can_help(proc):
+                logging.warning(
+                    "Soft subtitle stream copy failed (exit %s), falling back to "
+                    "transcoding", exit_code,
+                )
+                self._cleanup_part(part_path)
+                proc.try_copy = False
+                proc.start(proc.transcode_cmd[0], proc.transcode_cmd[1:])
+                return
             logging.warning(
-                "Soft subtitle stream copy failed (exit %s), falling back to "
-                "transcoding", exit_code,
+                "Soft subtitle stream copy failed (exit %s) on a subtitle the "
+                "muxer refuses; not re-encoding the source, because both "
+                "attempts mux the same subtitles", exit_code,
             )
-            self._cleanup_part(part_path)
-            proc.try_copy = False
-            proc.start(proc.transcode_cmd[0], proc.transcode_cmd[1:])
-            return
 
         self._cleanup_srt(proc.srt_path)
         self._cleanup_part(part_path)
@@ -699,6 +794,19 @@ class ExportTranscriptionMenu(QMenu):
                 exit_code, tail or _("No error details available.")
             ),
         )
+
+    @staticmethod
+    def _transcode_retry_can_help(proc: QProcess) -> bool:
+        """Whether re-encoding the source could rescue a failed stream copy.
+
+        The fallback exists for a source whose codecs the MP4 muxer rejects,
+        which re-encoding does fix. A subtitle packet the muxer refuses is a
+        different failure: both commands mux the same subtitles, so the retry
+        only repeats the error after encoding the whole source -- on a
+        multi-hour recording that wasted the entire encode.
+        """
+        tail = " ".join(getattr(proc, "output_tail", ())).lower()
+        return not any(hint in tail for hint in _MUXER_SUBTITLE_FAILURE_HINTS)
 
     def _on_ffmpeg_error(self, proc: QProcess, err):
         self._cleanup_srt(proc.srt_path)

@@ -9,11 +9,16 @@ from pytestqt.qtbot import QtBot
 from buzz.db.entity.transcription import Transcription
 from buzz.db.entity.transcription_segment import TranscriptionSegment
 from buzz.model_loader import ModelType, WhisperModelSize
+from buzz.transcriber.file_transcriber import sanitize_segments
 from buzz.transcriber.transcriber import Segment, Task
 from buzz.widgets.transcription_viewer.export_transcription_menu import (
     ExportTranscriptionMenu,
     MP4_BURNED,
     MP4_SOFT,
+    _MAX_SUBTITLE_CUE_MS,
+    _MAX_SUBTITLE_STEP_MS,
+    _SILENT_CUE_TEXT,
+    _clamp_subtitle_timing,
     _split_long_subtitle_segments,
 )
 from tests.audio import test_audio_path
@@ -48,6 +53,99 @@ def test_split_long_subtitle_segments_preserves_text_and_duration():
     assert split[0].start == segment.start
     assert split[-1].end == segment.end
     assert all(item.end > item.start for item in split)
+
+
+def test_clamp_subtitle_timing_leaves_normal_cues_alone():
+    segments = [
+        Segment(start=0, end=2000, text="a", translation="甲"),
+        Segment(start=2000, end=4000, text="b", translation="乙"),
+    ]
+
+    assert _clamp_subtitle_timing(segments) == segments
+
+
+def test_clamp_subtitle_timing_shortens_a_cue_stretched_over_a_long_silence():
+    """A VAD gap must not reach the muxer as one 37-minute cue.
+
+    A cue that long makes the mov_text muxer return EINVAL, which FFmpeg
+    reports as exit code 234 after the whole source has been encoded.
+    """
+    segment = Segment(
+        start=24_200_530, end=26_457_980, text="といえば", translation="说到这个"
+    )
+
+    clamped = _clamp_subtitle_timing([segment])
+
+    assert len(clamped) == 1
+    assert clamped[0].start == segment.start
+    assert clamped[0].end - clamped[0].start <= _MAX_SUBTITLE_CUE_MS
+    assert clamped[0].translation == "说到这个"
+
+
+def test_clamp_subtitle_timing_bridges_a_long_silence():
+    segments = [
+        Segment(start=0, end=2_000, text="a", translation="甲"),
+        Segment(start=2_257_450, end=2_459_450, text="b", translation="乙"),
+    ]
+
+    clamped = _clamp_subtitle_timing(segments)
+
+    assert clamped[0].start == segments[0].start
+    assert clamped[-1].start == segments[1].start
+    assert clamped[-1].translation == "乙"
+    steps = [later.start - earlier.start for earlier, later in zip(clamped, clamped[1:])]
+    assert max(steps) <= _MAX_SUBTITLE_STEP_MS
+    assert all(item.end - item.start <= _MAX_SUBTITLE_CUE_MS for item in clamped)
+    bridges = [item for item in clamped if item.text == _SILENT_CUE_TEXT]
+    assert bridges, "the silence needs at least one bridge cue"
+    assert all(item.translation == _SILENT_CUE_TEXT for item in bridges)
+    assert all(item.end > item.start for item in clamped)
+
+
+def test_silent_bridge_cues_survive_the_srt_writer():
+    """A bridge must not be blank text: the SRT writer drops blank cues.
+
+    Dropping one silently restores the very gap the bridge exists to break, so
+    the muxer truncates the track instead of failing loudly.
+    """
+    segments = [
+        Segment(start=0, end=2_000, text="a", translation="甲"),
+        Segment(start=2_257_450, end=2_459_450, text="b", translation="乙"),
+    ]
+
+    clamped = _clamp_subtitle_timing(segments)
+
+    assert len(sanitize_segments(clamped, "translation")) == len(clamped)
+    assert len(sanitize_segments(clamped, "text")) == len(clamped)
+
+
+class _FakeFfmpegProcess:
+    def __init__(self, output_tail):
+        self.output_tail = output_tail
+
+
+def test_transcode_retry_is_skipped_when_the_muxer_refused_a_subtitle_packet():
+    proc = _FakeFfmpegProcess(
+        [
+            "[mp4 @ 0x1] Packet duration: 2257450000 / dts: 26457980000 in "
+            "stream 2 is out of range",
+            "[mp4 @ 0x1] pts has no value",
+        ]
+    )
+
+    assert ExportTranscriptionMenu._transcode_retry_can_help(proc) is False
+
+
+def test_transcode_retry_still_runs_for_an_incompatible_codec():
+    proc = _FakeFfmpegProcess(
+        [
+            "[mp4 @ 0x1] Could not find tag for codec av1 in stream #0, codec "
+            "not currently supported in container",
+            "Could not write header for output file #0",
+        ]
+    )
+
+    assert ExportTranscriptionMenu._transcode_retry_can_help(proc) is True
 
 
 class TestExportTranscriptionMenu:
