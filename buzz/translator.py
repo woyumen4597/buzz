@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import dataclasses
 import logging
 import queue
 import threading
@@ -288,6 +289,68 @@ def _strip_trailing_note(text: str, drop_note_lines: bool = False) -> str:
     return text
 
 
+# Punctuation and spacing are dropped before the echo comparison below, so a
+# model that reflows or re-punctuates the source still matches it.
+_ECHO_NOISE_RE = re.compile(
+    r"[\s\u3000。、．，,！!？?…‥「」『』（）()\[\]【】｛｝{}<>《》\"'“”‘’·・:：;；—–\-]+"
+)
+_ECHO_MIN_CHARS = 6
+
+
+def _normalize_for_echo(text: str) -> str:
+    """Strip spacing and punctuation so an echo survives reformatting."""
+    return _ECHO_NOISE_RE.sub("", str(text or ""))
+
+
+def _echoes_source(source: str, candidate: str) -> bool:
+    """True when a response embeds the whole text it was asked to translate.
+
+    A thinking model that runs out of output budget mid-reasoning often has its
+    chain of thought routed into the visible channel. That commentary quotes the
+    source in full before proposing translations, so an answer carrying the
+    complete source is commentary rather than a translation. Spacing and
+    punctuation are ignored on both sides so a reflowed quote still matches, but
+    anything shorter than a few characters is skipped: there a legitimate
+    translation can repeat the source by coincidence.
+    """
+    normalized_source = _normalize_for_echo(source)
+    if len(normalized_source) < _ECHO_MIN_CHARS:
+        return False
+    return normalized_source in _normalize_for_echo(candidate)
+
+
+def _redacted_options(options: TranscriptionOptions) -> dict:
+    """Options as a plain dict with credentials masked, for logging.
+
+    ``TranscriptionOptions`` carries the provider API key, so logging the whole
+    object writes a live credential into the on-disk debug log.
+    """
+    redacted = {}
+    for name, value in dataclasses.asdict(options).items():
+        lowered = name.lower()
+        if any(marker in lowered for marker in ("token", "key", "password", "secret")):
+            redacted[name] = "***" if value else ""
+        else:
+            redacted[name] = value
+    return redacted
+
+
+def _is_mirrored_reasoning(text: str, reasoning: str) -> bool:
+    """True when the visible answer is a copy of the model's own reasoning.
+
+    Some OpenAI-compatible relays emit a thinking model's chain of thought on
+    both ``reasoning_content`` and ``content`` (observed when the output budget
+    runs out before the model leaves its thinking phase). The "visible" text is
+    then model commentary — source text, arrows, notes — and it must never reach
+    a subtitle; reporting a failure lets the caller retry with a smaller request,
+    which thinks less and normally finishes.
+    """
+    visible = str(text or "").strip()
+    if not visible:
+        return False
+    return visible == str(reasoning or "").strip()
+
+
 def _clean_translated_text(
     text: str, strip_notes: bool = False, drop_note_lines: bool = False
 ) -> str:
@@ -403,7 +466,9 @@ class Translator(QObject):
     ) -> None:
         super().__init__(parent)
 
-        logging.debug(f"Translator init: {transcription_options}")
+        logging.debug(
+            "Translator init: %s", _redacted_options(transcription_options)
+        )
 
         self.transcription_options = transcription_options
         self.advanced_settings_dialog = advanced_settings_dialog
@@ -883,6 +948,20 @@ class Translator(QObject):
         logging.error("Translation error! Unexpected response shape")
         return None
 
+    def _extract_reasoning(self, data: dict) -> str:
+        """Pull the hidden reasoning text out of a buffered response body."""
+        if self.api_protocol == RESPONSES_PROTOCOL:
+            return ""
+        choices = data.get("choices", [])
+        message = choices[0].get("message", {}) if choices else {}
+        if not isinstance(message, dict):
+            return ""
+        for key in ("reasoning_content", "reasoning"):
+            value = message.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
+
     def _read_stream(
         self,
         resp: httpx.Response,
@@ -898,10 +977,15 @@ class Translator(QObject):
         `response.incomplete` event (e.g. "max_output_tokens" on DeepSeek when
         the token budget is exhausted), else None.
 
+        A stream whose visible text is a copy of the model's own reasoning is
+        reported as an empty translation with "reasoning_mirrored": see
+        ``_is_mirrored_reasoning``.
+
         ``stream_deadline`` protects against a provider that keeps emitting
         deltas but never sends a terminal event.
         """
         chunks: List[str] = []
+        reasoning_chunks: List[str] = []
         raw_lines: List[str] = []
         event_types = []
         saw_events = False
@@ -982,6 +1066,9 @@ class Translator(QObject):
                 if stream_state is not None:
                     stream_state["text_chars"] = stream_state.get("text_chars", 0) + len(delta)
                     stream_state["last_text_at"] = time.monotonic()
+            reasoning_delta = self._stream_reasoning_delta(event)
+            if reasoning_delta:
+                reasoning_chunks.append(reasoning_delta)
             if event_type in {
                 "response.completed",
                 "response.incomplete",
@@ -1011,6 +1098,20 @@ class Translator(QObject):
 
         if saw_events:
             text = "".join(chunks)
+            reasoning = "".join(reasoning_chunks)
+            if stream_state is not None:
+                stream_state["reasoning_chars"] = len(reasoning)
+            if _is_mirrored_reasoning(text, reasoning):
+                # The relay routed the model's reasoning into the visible
+                # channel, so there is no answer here — only commentary.
+                if stream_state is not None:
+                    stream_state["leaked_reasoning"] = True
+                logging.warning(
+                    "Translation stream mirrored its reasoning into the answer "
+                    "(%d chars); discarding it and retrying",
+                    len(text),
+                )
+                return None, "reasoning_mirrored"
             if text:
                 logging.debug(
                     "Received streamed translation (%d chars, events=%s, terminal=%s)",
@@ -1045,10 +1146,48 @@ class Translator(QObject):
 
         # No SSE framing at all: treat the body as one JSON document.
         try:
-            return self._extract_text(json.loads("".join(raw_lines))), None
+            data = json.loads("".join(raw_lines))
         except (ValueError, TypeError):
             logging.error("Translation error! Unparsable response body")
             return None, None
+        text = self._extract_text(data)
+        if _is_mirrored_reasoning(text, self._extract_reasoning(data)):
+            if stream_state is not None:
+                stream_state["leaked_reasoning"] = True
+            logging.warning(
+                "Translation response mirrored its reasoning into the answer "
+                "(%d chars); discarding it and retrying",
+                len(text or ""),
+            )
+            return None, "reasoning_mirrored"
+        return text, None
+
+    def _stream_reasoning_delta(self, event: dict) -> str:
+        """Pull the incremental hidden reasoning out of one SSE event.
+
+        Only needed to tell a leaked reasoning channel apart from a real
+        answer; the text itself is never emitted.
+        """
+        if self.api_protocol == RESPONSES_PROTOCOL:
+            if event.get("type") == "response.reasoning_summary_text.delta":
+                delta = event.get("delta")
+                return delta if isinstance(delta, str) else ""
+            return ""
+
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return ""
+        first = choices[0]
+        if not isinstance(first, dict):
+            return ""
+        delta = first.get("delta")
+        if not isinstance(delta, dict):
+            return ""
+        for key in ("reasoning_content", "reasoning"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                return value
+        return ""
 
     def _stream_delta(self, event: dict) -> str:
         """Pull the incremental text out of one SSE event."""
@@ -1304,7 +1443,19 @@ class Translator(QObject):
                             attempts=attempt + 1,
                             incomplete_reason=incomplete_reason,
                         )
-                        if incomplete_reason == "max_output_tokens":
+                        if incomplete_reason == "reasoning_mirrored":
+                            # The relay handed back the model's chain of thought
+                            # as the answer. Retrying the same request is worth
+                            # it (thinking length varies run to run); if it keeps
+                            # happening the caller splits the batch, which makes
+                            # the model think less and finish.
+                            logging.warning(
+                                "Translation returned reasoning instead of an "
+                                "answer, attempt %d/%d",
+                                attempt + 1,
+                                MAX_ATTEMPTS,
+                            )
+                        elif incomplete_reason == "max_output_tokens":
                             # Distinct cause: the upstream burned the whole output
                             # budget (typically on reasoning tokens) before any
                             # visible text. Retrying usually won't help unless the
@@ -1462,6 +1613,12 @@ class Translator(QObject):
             **message_args,
         )
         translation = _clean_translated_text(translation or "", strip_notes=True)
+        if translation and _echoes_source(translation_input, translation):
+            logging.warning(
+                "Discarded model commentary in single translation id=%s",
+                transcript_id,
+            )
+            translation = ""
         if translation:
             self._cache_put(transcript, translation)
         return translation, transcript_id
@@ -1541,57 +1698,8 @@ class Translator(QObject):
             **message_args,
         )
         if not response_text:
-            if self._last_request_failure() == "response.failed" and len(missing) > 1:
-                midpoint = max(1, len(missing) // 2)
-                logging.warning(
-                    "Translation batch received response.failed; retrying %d items "
-                    "as smaller batches",
-                    len(missing),
-                )
-                recovered = []
-                for chunk in (missing[:midpoint], missing[midpoint:]):
-                    recovered.extend(
-                        self._translate_batch(
-                            [(transcript, tid) for _, transcript, tid in chunk]
-                        )
-                    )
-                recovered_by_id = {tid: text for text, tid in recovered}
-                return [
-                    (
-                        by_index.get(index, recovered_by_id.get(tid, "")),
-                        tid,
-                    )
-                    for index, (_, tid) in enumerate(items)
-                ]
-
-            failed_status = self._last_request_status()
-            if (
-                isinstance(failed_status, int)
-                and failed_status >= 500
-                and len(missing) > 1
-            ):
-                midpoint = max(1, len(missing) // 2)
-                logging.warning(
-                    "Translation batch failed with HTTP %s; retrying %d items "
-                    "as smaller batches",
-                    failed_status,
-                    len(missing),
-                )
-                recovered = []
-                for chunk in (missing[:midpoint], missing[midpoint:]):
-                    recovered.extend(
-                        self._translate_batch(
-                            [(transcript, tid) for _, transcript, tid in chunk]
-                        )
-                    )
-                recovered_by_id = {tid: text for text, tid in recovered}
-                return [
-                    (
-                        by_index.get(index, recovered_by_id.get(tid, "")),
-                        tid,
-                    )
-                    for index, (_, tid) in enumerate(items)
-                ]
+            if self._batch_failure_is_recoverable(len(missing)):
+                return self._retry_as_smaller_batches(missing, by_index, items)
             return [
                 (by_index.get(index, ""), tid)
                 for index, (_, tid) in enumerate(items)
@@ -1600,11 +1708,29 @@ class Translator(QObject):
         translations = self._parse_batch_response(response_text, len(missing))
         retry_missing = []
         for translation, (index, transcript, tid) in zip(translations, missing):
+            if translation and _echoes_source(request_inputs[index], translation):
+                # An answer that quotes its own source is model commentary (the
+                # leaked chain of thought), not a translation.
+                logging.warning(
+                    "Discarded model commentary in batch response id=%s", tid
+                )
+                translation = ""
             if translation:
                 by_index[index] = translation
                 self._cache_put(transcript, translation)
             else:
                 retry_missing.append((index, transcript, tid))
+
+        if retry_missing and len(retry_missing) == len(missing) and len(missing) > 1:
+            # Nothing in the response was usable, so there is no point in
+            # re-requesting this exact shape: split it, because a shorter
+            # request makes the model think less and finish inside the budget.
+            logging.warning(
+                "Translation batch of %d returned no usable text; retrying as "
+                "smaller batches",
+                len(missing),
+            )
+            return self._retry_as_smaller_batches(missing, by_index, items)
 
         if retry_missing:
             # A malformed/missing entry must not lose the whole batch; re-request
@@ -1618,6 +1744,43 @@ class Translator(QObject):
 
         return [
             (by_index.get(index, ""), tid)
+            for index, (_, tid) in enumerate(items)
+        ]
+
+    def _batch_failure_is_recoverable(self, count: int) -> bool:
+        """Whether an unusable batch response is worth splitting in half.
+
+        A single item has nothing to split. Past that, only transient causes
+        qualify: a ``response.failed`` event, a 5xx, or a stream that produced no
+        usable text at all (the status stays None — e.g. leaked reasoning or an
+        empty body). A 4xx is permanent, so re-sending it as many smaller
+        requests would only burn the user's quota for the same error.
+        """
+        if count <= 1:
+            return False
+        if self._last_request_failure() == "response.failed":
+            return True
+        status = self._last_request_status()
+        return status is None or (isinstance(status, int) and status >= 500)
+
+    def _retry_as_smaller_batches(
+        self,
+        missing: List[Tuple[int, str, int]],
+        by_index: dict,
+        items: List[Tuple[str, int]],
+    ) -> List[Tuple[str, int]]:
+        """Re-request a failed batch as two halves, preserving input order."""
+        midpoint = max(1, len(missing) // 2)
+        recovered = []
+        for chunk in (missing[:midpoint], missing[midpoint:]):
+            recovered.extend(
+                self._translate_batch(
+                    [(transcript, tid) for _, transcript, tid in chunk]
+                )
+            )
+        recovered_by_id = {tid: text for text, tid in recovered}
+        return [
+            (by_index.get(index, recovered_by_id.get(tid, "")), tid)
             for index, (_, tid) in enumerate(items)
         ]
 

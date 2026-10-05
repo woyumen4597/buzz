@@ -1,3 +1,4 @@
+import json
 import threading
 import time
 from unittest.mock import Mock, call, patch, MagicMock
@@ -22,6 +23,8 @@ from buzz.translator import (
     Translator,
     _clean_translated_text,
     _compress_repetitive_translation_input,
+    _echoes_source,
+    _is_mirrored_reasoning,
     _sanitize_translation_input,
     _TranslationStreamTimeout,
 )
@@ -126,6 +129,53 @@ class TestCleanTranslatedText:
         assert _clean_translated_text(
             "你好。（注：以上为翻译结果）", strip_notes=True
         ) == "你好。"
+
+
+class TestLeakedReasoningGuards:
+    """The two shapes a thinking model's commentary reaches subtitles in."""
+
+    def test_detects_echo_of_the_whole_source(self):
+        source = "そうなんですか、いろんな男の人から褒められて"
+        commentary = (
+            f'{source}\n→ "是吗，被各种男人夸奖" — 中文: "是这样啊，被各种各样的男人夸奖"'
+        )
+        assert _echoes_source(source, commentary) is True
+
+    def test_ignores_spacing_and_punctuation_when_matching(self):
+        source = "あれ本当なんですか?"
+        assert _echoes_source(source, '彼说 "あれ、本当なんですか" 的意思') is True
+
+    def test_accepts_a_translation_that_only_quotes_a_phrase(self):
+        source = "そうなんですか、いろんな男の人から褒められて"
+        assert _echoes_source(source, "是吗，被各种各样的男人夸奖。") is False
+
+    def test_skips_sources_too_short_to_be_conclusive(self):
+        # A short cue can legitimately appear verbatim in its own translation.
+        assert _echoes_source("はい。", "はい") is False
+
+    def test_detects_a_reasoning_channel_mirrored_into_the_answer(self):
+        assert _is_mirrored_reasoning("Need to translate", "Need to translate") is True
+
+    def test_keeps_a_real_answer_that_merely_has_reasoning(self):
+        assert _is_mirrored_reasoning("[1] 早上好", "The user wants a translation") is False
+        assert _is_mirrored_reasoning("", "The user wants a translation") is False
+
+
+class TestCredentialLogging:
+    def test_translator_init_log_does_not_expose_the_api_key(self, caplog, qtbot):
+        """The options object holds the provider key, so it must be redacted."""
+        caplog.set_level("DEBUG")
+        secret = "sk-secret-key-1234567890"
+        options = TranscriptionOptions(
+            llm_model="gpt-4o-mini",
+            llm_prompt="Translate:",
+            openai_access_token=secret,
+        )
+
+        Translator(options)
+
+        assert secret not in caplog.text
+        assert "'openai_access_token': '***'" in caplog.text
 
 
 class TestRepetitiveTranslationInput:
@@ -368,6 +418,84 @@ class TestRepetitiveTranslationInput:
 
         assert state["text_chars"] == len("partial")
         assert state["termination"] == "max_duration"
+
+
+    def test_read_stream_discards_reasoning_mirrored_into_the_answer(
+        self, qtbot, monkeypatch
+    ):
+        """A relay that copies the chain of thought into `content` yields no answer.
+
+        Reproduces the relay behaviour behind subtitles filled with model
+        commentary: the output budget runs out mid-thinking and the reasoning is
+        emitted on both channels.
+        """
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        reasoning = "Need to translate Japanese into Chinese"
+        response = _stream_response(
+            lines=[
+                'data: {"choices":[{"delta":{"reasoning_content":"%s"}}]}' % reasoning,
+                'data: {"choices":[{"delta":{"content":"%s"}}]}' % reasoning,
+                'data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}',
+                'data: [DONE]',
+            ]
+        )
+        state = {}
+
+        text, incomplete_reason = translator._read_stream(response, state)
+
+        assert text is None
+        assert incomplete_reason == "reasoning_mirrored"
+        assert state["leaked_reasoning"] is True
+        assert state["reasoning_chars"] == len(reasoning)
+
+    def test_read_stream_keeps_an_answer_with_separate_reasoning(
+        self, qtbot, monkeypatch
+    ):
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        response = _stream_response(
+            lines=[
+                'data: {"choices":[{"delta":{"reasoning_content":"thinking"}}]}',
+                'data: {"choices":[{"delta":{"content":"[1] 早上好"}}]}',
+                'data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}',
+            ]
+        )
+        state = {}
+
+        text, incomplete_reason = translator._read_stream(response, state)
+
+        assert text == "[1] 早上好"
+        assert incomplete_reason is None
+        assert "leaked_reasoning" not in state
+
+    def test_read_stream_discards_a_buffered_body_mirroring_reasoning(
+        self, qtbot, monkeypatch
+    ):
+        """The same guard covers a gateway that ignores `stream: true`."""
+        monkeypatch.setenv("BUZZ_TRANSLATION_API_PROTOCOL", CHAT_COMPLETIONS_PROTOCOL)
+        options = TranscriptionOptions(llm_model="gpt-4o-mini", llm_prompt="Translate:")
+        translator = Translator(options)
+        body = json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Need to translate",
+                            "reasoning_content": "Need to translate",
+                        }
+                    }
+                ]
+            }
+        )
+        response = _stream_response(lines=[body])
+
+        text, incomplete_reason = translator._read_stream(response)
+
+        assert text is None
+        assert incomplete_reason == "reasoning_mirrored"
 
 
 class TestSplitBatches:
@@ -854,6 +982,81 @@ class TestBatchRecovery:
             ("single", 3),
             ("single", 4),
         ]
+
+    def test_single_translation_echoing_its_source_is_discarded(self, qtbot):
+        """Commentary must never be cached and emitted as a translation."""
+        translator = self._make_translator()
+        source = "そうなんですか、いろんな男の人から褒められて"
+        translator._messages = Mock(
+            return_value=f'{source}\n→ "是吗，被各种男人夸奖" — 中文: "是这样啊"'
+        )
+
+        result = translator._translate_single(source, 7)
+
+        assert result == ("", 7)
+        assert translator._cache_get(source) is None
+
+    def test_batch_entry_echoing_its_source_is_retried_individually(self, qtbot):
+        translator = self._make_translator()
+        source = "そうなんですか、いろんな男の人から褒められて"
+        translator._messages = Mock(
+            return_value=f'[1] {source}\n→ "是吗，被各种男人夸奖"\n[2] 早上好。'
+        )
+        with patch.object(
+            translator,
+            "_translate_single",
+            side_effect=lambda text, tid: (f"single-{tid}", tid),
+        ):
+            results = translator._translate_batch([(source, 1), ("おはよう", 2)])
+
+        assert results == [("single-1", 1), ("早上好。", 2)]
+
+    def test_batch_of_only_echoed_entries_is_split_not_failed(self, qtbot):
+        """A whole batch of commentary is split, so the model thinks less."""
+        translator = self._make_translator()
+        first = "そうなんですか、いろんな男の人から褒められて"
+        second = "それは大きいですね、確かに"
+        requested = []
+
+        def messages(**kwargs):
+            requested.append(kwargs["user_content"])
+            if kwargs["user_content"].count("[") > 1:
+                return f"[1] {first}\n[2] {second}"
+            return "[1] 早上好。"
+
+        with patch.object(translator, "_messages", side_effect=messages):
+            results = translator._translate_batch([(first, 1), (second, 2)])
+
+        assert results == [("早上好。", 1), ("早上好。", 2)]
+        assert len(requested) == 3  # one batch, then one request per half
+
+    def test_empty_batch_response_splits_when_transient(self, qtbot):
+        translator = self._make_translator()
+
+        def messages(**kwargs):
+            if kwargs["user_content"].count("[") > 1:
+                return None
+            return "[1] single"
+
+        with patch.object(translator, "_messages", side_effect=messages):
+            results = translator._translate_batch([("a", 1), ("b", 2)])
+
+        assert results == [("single", 1), ("single", 2)]
+
+    def test_batch_response_does_not_split_on_a_client_error(self, qtbot):
+        """A 4xx is permanent: splitting would only repeat it per item."""
+        translator = self._make_translator()
+
+        def messages(**kwargs):
+            translator._set_last_request_status(400)
+            return None
+
+        with patch.object(translator, "_messages", side_effect=messages), \
+                patch.object(translator, "_translate_single") as single:
+            results = translator._translate_batch([("a", 1), ("b", 2)])
+
+        assert results == [("", 1), ("", 2)]
+        single.assert_not_called()
 
 
 class TestTranslator:
@@ -1679,8 +1882,10 @@ class TestTranslator:
             assert text.startswith("AI Translated:")
 
         mock_client = Mock()
+        # The answer must not quote the source: a response that carries the whole
+        # source is treated as leaked model commentary and discarded.
         mock_client.stream.return_value = _stream_response(
-            "AI Translated: Hello, how are you?"
+            "AI Translated: 你好，你好吗？"
         )
         mock_client_class.return_value = mock_client
 
