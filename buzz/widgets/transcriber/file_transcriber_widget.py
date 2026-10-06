@@ -57,6 +57,9 @@ class FileTranscriberWidget(QWidget):
         openai_access_token = get_password(Key.OPENAI_API_KEY)
 
         preferences = self.load_preferences()
+        #: Whether the VAD checkbox holds a choice the user made, as opposed to
+        #: whatever the default was when the settings were last saved.
+        self.use_vad_explicit = preferences.use_vad_explicit
 
         (
             self.transcription_options,
@@ -81,6 +84,7 @@ class FileTranscriberWidget(QWidget):
         self.form_widget.transcription_options_changed.connect(
             self.reset_transcriber_controls
         )
+        self.form_widget.use_vad_chosen.connect(self.on_use_vad_chosen)
 
         self.run_button = QPushButton(_("Run"), self)
         self.run_button.setDefault(True)
@@ -119,10 +123,15 @@ class FileTranscriberWidget(QWidget):
     def save_preferences(self):
         self.settings.settings.beginGroup("file_transcriber")
         preferences = FileTranscriptionPreferences.from_transcription_options(
-            self.transcription_options, self.file_transcription_options
+            self.transcription_options,
+            self.file_transcription_options,
+            use_vad_explicit=self.use_vad_explicit,
         )
         preferences.save(settings=self.settings.settings)
         self.settings.settings.endGroup()
+
+    def on_use_vad_chosen(self):
+        self.use_vad_explicit = True
 
     def on_click_run(self):
         self.run_button.setDisabled(True)

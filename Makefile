@@ -98,17 +98,24 @@ ifeq ($(shell uname -s), Darwin)
 	-mkdir -p buzz/whisper_cpp
 
 ifeq ($(shell uname -m), arm64)
-	cmake -S whisper.cpp -B whisper.cpp/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DWHISPER_COREML=1
+	cmake -S whisper.cpp -B whisper.cpp/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DWHISPER_COREML=1 -DCMAKE_BUILD_RPATH='@loader_path'
 else
     # Intel
-	cmake -S whisper.cpp -B whisper.cpp/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=0 -DGGML_METAL=0
+	cmake -S whisper.cpp -B whisper.cpp/build/ -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_VULKAN=0 -DGGML_METAL=0 -DCMAKE_BUILD_RPATH='@loader_path'
 endif
 
 	cmake --build whisper.cpp/build -j --config Release --verbose
 	cp whisper.cpp/build/bin/whisper-cli buzz/whisper_cpp/ || true
 	cp whisper.cpp/build/bin/whisper-server buzz/whisper_cpp/ || true
-	cp whisper.cpp/build/src/libwhisper.dylib buzz/whisper_cpp/ || true
-	cp whisper.cpp/build/ggml/src/libggml* buzz/whisper_cpp/ || true
+	# Copy the dylibs under the names the binaries link against. -P keeps the
+	# version symlinks (libwhisper.1.dylib -> ...), and the backends live in
+	# their own directories: copying only ggml/src/libggml* left libggml-metal,
+	# libggml-blas and libwhisper.coreml behind, so Metal and CoreML were only
+	# ever found through the absolute build-tree paths baked in by CMake.
+	cp -P whisper.cpp/build/src/libwhisper*.dylib buzz/whisper_cpp/ || true
+	cp -P whisper.cpp/build/ggml/src/libggml*.dylib buzz/whisper_cpp/ || true
+	cp -P whisper.cpp/build/ggml/src/ggml-metal/libggml-metal*.dylib buzz/whisper_cpp/ || true
+	cp -P whisper.cpp/build/ggml/src/ggml-blas/libggml-blas*.dylib buzz/whisper_cpp/ || true
 	test -f buzz/whisper_cpp/ggml-silero-v6.2.0.bin || curl -L -o buzz/whisper_cpp/ggml-silero-v6.2.0.bin https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin
 endif
 

@@ -30,26 +30,48 @@ class TestFileTranscriberWidget:
 
         preferences = FileTranscriptionPreferences.load(settings)
         assert preferences.use_vad is True
+        assert preferences.use_vad_explicit is False
 
         preferences.use_vad = False
+        preferences.use_vad_explicit = True
         preferences.save(settings)
 
         assert FileTranscriptionPreferences.load(settings).use_vad is False
 
-    def test_legacy_settings_adopt_the_new_vad_default_once(self, tmp_path):
-        """A settings file written while VAD defaulted to off records that off
-        without the user ever touching the checkbox, so it must not pin the old
-        default forever. Saving an explicit choice ends the migration."""
+    def test_a_stored_vad_default_does_not_pin_the_old_value(self, tmp_path):
+        """The form saves its options on close, so a settings file written while
+        VAD defaulted to off holds that off without the user ever touching the
+        checkbox -- and saving again used to write it back as if it had been
+        chosen. A value nobody chose must keep following the current default."""
         settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
         settings.setValue("use_vad", False)
+        settings.setValue("settings_version", 2)
 
         assert FileTranscriptionPreferences.load(settings).use_vad is True
 
-        preferences = FileTranscriptionPreferences.load(settings)
-        preferences.use_vad = False
-        preferences.save(settings)
+        # Saving the loaded state must not turn that default into a choice.
+        FileTranscriptionPreferences.load(settings).save(settings)
 
-        assert FileTranscriptionPreferences.load(settings).use_vad is False
+        reloaded = FileTranscriptionPreferences.load(settings)
+        assert reloaded.use_vad is True
+        assert reloaded.use_vad_explicit is False
+
+    def test_vad_checkbox_reports_a_user_choice(self, qtbot: QtBot):
+        form = FileTranscriptionFormWidget(
+            transcription_options=TranscriptionOptions(),
+            file_transcription_options=FileTranscriptionOptions(),
+        )
+        qtbot.add_widget(form)
+
+        chosen = []
+        form.use_vad_chosen.connect(lambda: chosen.append(True))
+
+        # Populating the form is not a choice; moving the checkbox is.
+        form.use_vad_checkbox.setChecked(True)
+        assert chosen == []
+
+        form.use_vad_checkbox.setChecked(False)
+        assert chosen == [True]
 
     def test_vad_checkbox_updates_transcription_options(self, qtbot: QtBot):
         form = FileTranscriptionFormWidget(

@@ -8,7 +8,7 @@ from buzz.transcriber.transcriber import (
     FileTranscriptionTask,
     FileTranscriptionOptions,
 )
-from buzz.transcriber.whisper_cpp import WhisperCpp
+from buzz.transcriber.whisper_cpp import WhisperCpp, get_vad_model_path
 from tests.audio import test_audio_path, test_multibyte_utf8_audio_path
 from tests.model_loader import get_model_path
 
@@ -380,6 +380,69 @@ class TestWhisperCpp:
 
             WhisperCpp.transcribe(task(True))
             assert build_command.call_args[0][-1] is True
+
+    @staticmethod
+    def _command_task(word_level_timings: bool = False, use_vad: bool = False):
+        return FileTranscriptionTask(
+            transcription_options=TranscriptionOptions(
+                language="ja",
+                word_level_timings=word_level_timings,
+                use_vad=use_vad,
+                model=TranscriptionModel(
+                    model_type=ModelType.WHISPER_CPP,
+                    whisper_model_size=WhisperModelSize.TINY,
+                ),
+            ),
+            file_transcription_options=FileTranscriptionOptions(),
+            model_path="/fake/model.bin",
+            file_path="/fake/audio.wav",
+        )
+
+    def test_build_command_asks_for_token_json_only_for_word_timings(self):
+        without_timings = WhisperCpp._build_command(
+            self._command_task(), "/fake/audio.wav", "ja", vad_enabled=False
+        )
+        assert "--output-json" in without_timings
+        assert "--output-json-full" not in without_timings
+
+        with_timings = WhisperCpp._build_command(
+            self._command_task(word_level_timings=True),
+            "/fake/audio.wav",
+            "ja",
+            vad_enabled=False,
+        )
+        assert "--output-json-full" in with_timings
+
+    def test_build_command_adds_vad_flags_and_overrides(self, monkeypatch):
+        monkeypatch.setenv("BUZZ_WHISPERCPP_VAD_THRESHOLD", "0.4")
+        monkeypatch.setenv("BUZZ_WHISPERCPP_VAD_SPEECH_PAD_MS", "120")
+
+        cmd = WhisperCpp._build_command(
+            self._command_task(use_vad=True), "/fake/audio.wav", "ja", vad_enabled=True
+        )
+        assert cmd[cmd.index("--vad-model") + 1] == get_vad_model_path()
+        assert cmd[cmd.index("--vad-threshold") + 1] == "0.4"
+        assert cmd[cmd.index("--vad-speech-pad-ms") + 1] == "120"
+
+        without_vad = WhisperCpp._build_command(
+            self._command_task(), "/fake/audio.wav", "ja", vad_enabled=False
+        )
+        assert "--vad" not in without_vad
+        assert "--vad-threshold" not in without_vad
+
+    def test_transcribe_warns_when_the_vad_model_is_missing(self, caplog):
+        with patch.object(WhisperCpp, "_build_command", return_value=[]), patch.object(
+            WhisperCpp, "_run_whisper", return_value=0
+        ), patch.object(
+            WhisperCpp, "_read_json_output", return_value={"transcription": []}
+        ), patch.object(
+            WhisperCpp, "_cleanup_files"
+        ), patch(
+            "buzz.transcriber.whisper_cpp.os.path.exists", return_value=False
+        ):
+            WhisperCpp.transcribe(self._command_task(use_vad=True))
+
+        assert "Voice activity detection is enabled" in caplog.text
 
     def test_vad_remaps_word_offsets_to_original_time(self):
         """With VAD enabled, whisper-cli remaps segment offsets back to the original

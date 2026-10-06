@@ -95,6 +95,10 @@ class FolderWatchPreferencesWidget(QWidget):
         self.transcription_form_widget.transcription_options_changed.connect(
             self.on_transcription_options_changed
         )
+        self.use_vad_explicit = config.file_transcription_options.use_vad_explicit
+        self.transcription_form_widget.use_vad_chosen.connect(
+            self.on_use_vad_chosen
+        )
 
         self.delete_checkbox = delete_checkbox
 
@@ -205,6 +209,10 @@ class FolderWatchPreferencesWidget(QWidget):
             FileTranscriptionPreferences.from_transcription_options(
                 transcription_options=transcription_options,
                 file_transcription_options=file_transcription_options,
+                use_vad_explicit=self.use_vad_explicit,
             )
         )
         self.config_changed.emit(self.config)
+
+    def on_use_vad_chosen(self):
+        self.use_vad_explicit = True

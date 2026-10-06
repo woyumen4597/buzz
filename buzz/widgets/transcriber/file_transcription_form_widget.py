@@ -19,6 +19,10 @@ from buzz.widgets.transcriber.transcription_options_group_box import (
 class FileTranscriptionFormWidget(QWidget):
     openai_access_token_changed = pyqtSignal(str)
     transcription_options_changed = pyqtSignal(tuple)
+    #: Emitted only when the user moves the checkbox, never when the form is
+    #: populated from the saved settings. Hosts use it to record that VAD was
+    #: chosen rather than merely inherited from a default.
+    use_vad_chosen = pyqtSignal()
 
     def __init__(
         self,
@@ -118,6 +122,7 @@ class FileTranscriptionFormWidget(QWidget):
     def on_use_vad_changed(self, value: int):
         self.transcription_options.use_vad = value == Qt.CheckState.Checked.value
 
+        self.use_vad_chosen.emit()
         self.transcription_options_changed.emit(
             (self.transcription_options, self.file_transcription_options)
         )

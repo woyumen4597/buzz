@@ -14,7 +14,9 @@ from buzz.transcriber.transcriber import (
 
 
 #: Bumped when a stored default has to change for installations that already
-#: have a settings file. Version 2 turns voice activity detection on.
+#: have a settings file. Version 2 turned voice activity detection on; ``use_vad``
+#: no longer uses it, because a choice the user never made is not stored as one
+#: any more (see ``use_vad_explicit``), which is what the counter stood in for.
 SETTINGS_VERSION = 2
 
 
@@ -34,6 +36,11 @@ class FileTranscriptionPreferences:
     #: wherever the audio holds no speech, and VAD keeps those windows away from
     #: the decoder. The form still exposes it, so it can be turned off.
     use_vad: bool = True
+    #: True only while the value above came from the user touching the checkbox.
+    #: The form saves on close and on run, so a settings file written without an
+    #: explicit choice holds the default of that moment -- keeping it would pin
+    #: that default forever, which is exactly how VAD stayed off after the switch.
+    use_vad_explicit: bool = False
 
     def save(self, settings: QSettings) -> None:
         settings.setValue("settings_version", SETTINGS_VERSION)
@@ -43,6 +50,7 @@ class FileTranscriptionPreferences:
         settings.setValue("word_level_timings", self.word_level_timings)
         settings.setValue("extract_speech", self.extract_speech)
         settings.setValue("use_vad", self.use_vad)
+        settings.setValue("use_vad_explicit", self.use_vad_explicit)
         settings.setValue("initial_prompt", self.initial_prompt)
         settings.setValue("enable_llm_translation", self.enable_llm_translation)
         settings.setValue("llm_model", self.llm_model)
@@ -69,13 +77,17 @@ class FileTranscriptionPreferences:
             else bool(extract_speech_value)
 
         use_vad_value = settings.value("use_vad", True)
-        use_vad = False if use_vad_value == "false" else bool(use_vad_value)
-        # Settings written before VAD became the default recorded the old default
-        # (off) without the user ever touching the checkbox, so a stored off from
-        # that era cannot be told apart from a deliberate opt-out. Version 2
-        # applies the new default once; anything saved from then on is kept.
-        if settings.value("settings_version", 1, type=int) < SETTINGS_VERSION:
-            use_vad = True
+        use_vad_stored = False if use_vad_value == "false" else bool(use_vad_value)
+        use_vad_explicit_value = settings.value("use_vad_explicit", False)
+        use_vad_explicit = (
+            False
+            if use_vad_explicit_value == "false"
+            else bool(use_vad_explicit_value)
+        )
+        # Only what the user chose is kept. Anything else follows the default of
+        # the running version, so a settings file that merely recorded an old
+        # default -- and has since been saved again -- picks the new one up.
+        use_vad = use_vad_stored if use_vad_explicit else True
 
         initial_prompt = settings.value("initial_prompt", "")
         enable_llm_translation_value = settings.value("enable_llm_translation", True)
@@ -93,6 +105,7 @@ class FileTranscriptionPreferences:
             word_level_timings=word_level_timings,
             extract_speech=extract_speech,
             use_vad=use_vad,
+            use_vad_explicit=use_vad_explicit,
             initial_prompt=initial_prompt,
             enable_llm_translation=enable_llm_translation,
             llm_model=llm_model,
@@ -107,6 +120,7 @@ class FileTranscriptionPreferences:
         cls,
         transcription_options: TranscriptionOptions,
         file_transcription_options: FileTranscriptionOptions,
+        use_vad_explicit: bool = False,
     ) -> "FileTranscriptionPreferences":
         return FileTranscriptionPreferences(
             task=transcription_options.task,
@@ -118,6 +132,7 @@ class FileTranscriptionPreferences:
             word_level_timings=transcription_options.word_level_timings,
             extract_speech=transcription_options.extract_speech,
             use_vad=transcription_options.use_vad,
+            use_vad_explicit=use_vad_explicit,
             model=transcription_options.model,
             output_formats=file_transcription_options.output_formats,
         )

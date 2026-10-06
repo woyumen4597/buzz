@@ -45,6 +45,31 @@ def get_whisper_cli_path() -> str:
     return whisper_cli_path
 
 
+def get_vad_model_path() -> str:
+    return os.path.join(
+        os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
+    )
+
+
+def _vad_tuning_flags() -> list:
+    """Optional VAD overrides, for speech the built-in defaults leave out.
+
+    Silero's defaults (threshold 0.5, 30 ms of padding) suit ordinary dialogue.
+    Quiet or clipped speech can fall under the threshold and be dropped before
+    whisper ever sees it; raising the padding and lowering the threshold keeps
+    those spans. Set them instead of turning VAD off, which hands the whole
+    silence back to the decoder.
+    """
+    flags = []
+    threshold = os.getenv("BUZZ_WHISPERCPP_VAD_THRESHOLD")
+    if threshold:
+        flags.extend(["--vad-threshold", threshold])
+    speech_pad_ms = os.getenv("BUZZ_WHISPERCPP_VAD_SPEECH_PAD_MS")
+    if speech_pad_ms:
+        flags.extend(["--vad-speech-pad-ms", speech_pad_ms])
+    return flags
+
+
 def _make_offset_mapper(segment_data, vad_enabled):
     """Return a function mapping a token offset to original audio time."""
     if not vad_enabled:
@@ -178,16 +203,17 @@ class WhisperCpp:
             "--suppress-nst",
             "--max-context", "0",
             "--entropy-thold", "2.8",
-            "--output-json-full",
+            # Token-level probabilities are only read back for word-level
+            # timings; without them the plain JSON is all we parse.
+            "--output-json-full" if task.transcription_options.word_level_timings
+            else "--output-json",
             "--threads", str(os.getenv("BUZZ_WHISPERCPP_N_THREADS", (os.cpu_count() or 8) // 2)),
             "-f", file_to_process,
         ]
 
         if vad_enabled:
-            vad_model_path = os.path.join(
-                os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
-            )
-            cmd.extend(["--vad", "--vad-model", vad_model_path])
+            cmd.extend(["--vad", "--vad-model", get_vad_model_path()])
+            cmd.extend(_vad_tuning_flags())
 
         if task.transcription_options.task == Task.TRANSLATE:
             cmd.extend(["--translate"])
@@ -196,6 +222,14 @@ class WhisperCpp:
         if force_cpu != "false" or (not IS_VULKAN_SUPPORTED and platform.system() != "Darwin"):
             cmd.extend(["--no-gpu"])
 
+        # The effective flags, so a run that turns out slow can be told apart
+        # from one that never picked up VAD or the GPU.
+        logging.info(
+            "Whisper CLI: %s (vad=%s, json=%s)",
+            " ".join(cmd),
+            vad_enabled,
+            "full" if task.transcription_options.word_level_timings else "segments",
+        )
         print(f"Running Whisper CLI: {' '.join(cmd)}")
         return cmd
 
@@ -378,12 +412,17 @@ class WhisperCpp:
             temp_file = WhisperCpp._convert_to_wav(task.file_path)
             file_to_process = temp_file
 
-        vad_model_path = os.path.join(
-            os.path.dirname(get_whisper_cli_path()), "ggml-silero-v6.2.0.bin"
-        )
+        vad_model_path = get_vad_model_path()
         vad_enabled = (
             task.transcription_options.use_vad and os.path.exists(vad_model_path)
         )
+        if task.transcription_options.use_vad and not vad_enabled:
+            logging.warning(
+                "Voice activity detection is enabled but its model is missing at "
+                "%s; transcribing without it, which is slower and lets whisper "
+                "invent text over silence.",
+                vad_model_path,
+            )
 
         cmd = WhisperCpp._build_command(task, file_to_process, language, vad_enabled)
         return_code = WhisperCpp._run_whisper(cmd)
