@@ -65,7 +65,9 @@ class FileTranscriptionFormWidget(QWidget):
 
         file_transcription_layout.addRow("", self.extract_speech_checkbox)
 
-        self.use_vad_checkbox = QCheckBox(_("Use voice activity detection (faster)"))
+        self.use_vad_checkbox = QCheckBox(
+            _("Use voice activity detection (skips silence, may drop quiet speech)")
+        )
         self.use_vad_checkbox.setChecked(self.transcription_options.use_vad)
         self.use_vad_checkbox.stateChanged.connect(self.on_use_vad_changed)
         file_transcription_layout.addRow("", self.use_vad_checkbox)

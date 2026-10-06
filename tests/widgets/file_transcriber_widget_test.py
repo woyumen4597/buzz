@@ -25,36 +25,45 @@ class TestFileTranscriberWidget:
         settings.setValue("enable_llm_translation", False)
         assert FileTranscriptionPreferences.load(settings).enable_llm_translation is False
 
-    def test_vad_defaults_on_and_an_explicit_choice_is_persisted(self, tmp_path):
+    def test_vad_defaults_off_and_an_explicit_choice_is_persisted(self, tmp_path):
         settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
 
         preferences = FileTranscriptionPreferences.load(settings)
-        assert preferences.use_vad is True
+        assert preferences.use_vad is False
         assert preferences.use_vad_explicit is False
 
-        preferences.use_vad = False
+        preferences.use_vad = True
         preferences.use_vad_explicit = True
         preferences.save(settings)
 
-        assert FileTranscriptionPreferences.load(settings).use_vad is False
+        assert FileTranscriptionPreferences.load(settings).use_vad is True
 
     def test_a_stored_vad_default_does_not_pin_the_old_value(self, tmp_path):
-        """The form saves its options on close, so a settings file written while
-        VAD defaulted to off holds that off without the user ever touching the
-        checkbox -- and saving again used to write it back as if it had been
-        chosen. A value nobody chose must keep following the current default."""
+        """The form saves its options on close, so a settings file can hold a
+        value the user never chose. Whatever it holds, a value nobody chose must
+        keep following the current default instead of pinning the old one."""
         settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
-        settings.setValue("use_vad", False)
+        settings.setValue("use_vad", True)
         settings.setValue("settings_version", 2)
 
-        assert FileTranscriptionPreferences.load(settings).use_vad is True
+        assert FileTranscriptionPreferences.load(settings).use_vad is False
 
         # Saving the loaded state must not turn that default into a choice.
         FileTranscriptionPreferences.load(settings).save(settings)
 
         reloaded = FileTranscriptionPreferences.load(settings)
-        assert reloaded.use_vad is True
+        assert reloaded.use_vad is False
         assert reloaded.use_vad_explicit is False
+
+    def test_version_2_vad_is_migrated_back_to_the_current_default(self, tmp_path):
+        """Version 2 turned VAD on for installations that had never touched the
+        checkbox, so a stored on without use_vad_explicit belongs to one of
+        those and must not survive as if the user had asked for it."""
+        settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+        settings.setValue("use_vad", True)
+        settings.setValue("settings_version", 2)
+
+        assert FileTranscriptionPreferences.load(settings).use_vad is False
 
     def test_vad_checkbox_reports_a_user_choice(self, qtbot: QtBot):
         form = FileTranscriptionFormWidget(
@@ -67,10 +76,10 @@ class TestFileTranscriberWidget:
         form.use_vad_chosen.connect(lambda: chosen.append(True))
 
         # Populating the form is not a choice; moving the checkbox is.
-        form.use_vad_checkbox.setChecked(True)
+        form.use_vad_checkbox.setChecked(False)
         assert chosen == []
 
-        form.use_vad_checkbox.setChecked(False)
+        form.use_vad_checkbox.setChecked(True)
         assert chosen == [True]
 
     def test_vad_checkbox_updates_transcription_options(self, qtbot: QtBot):
@@ -80,9 +89,9 @@ class TestFileTranscriberWidget:
         )
         qtbot.add_widget(form)
 
-        assert form.use_vad_checkbox.isChecked() is True
-        form.use_vad_checkbox.setChecked(False)
-        assert form.transcription_options.use_vad is False
+        assert form.use_vad_checkbox.isChecked() is False
+        form.use_vad_checkbox.setChecked(True)
+        assert form.transcription_options.use_vad is True
 
     def test_should_set_window_title(self, qtbot: QtBot):
         widget = FileTranscriberWidget(

@@ -20,6 +20,13 @@ TASK_OPTIONS_VERSION = 1
 SEGMENT_CHECKPOINT_VERSION = 1
 _FINGERPRINT_SAMPLE_BYTES = 64 * 1024
 
+#: Voice activity detection stays opt-in for every whisper.cpp entry point. It
+#: removes the silence whisper invents text over, but silero also reads quiet or
+#: breathy speech as silence: on a measured source it kept 1.5% of the
+#: transcript, dropping ordinary dialogue. Missing speech costs more than
+#: transcribing silence, so it only runs when asked for.
+DEFAULT_USE_VAD = False
+
 
 class Task(enum.Enum):
     TRANSLATE = "translate"
@@ -162,9 +169,10 @@ class TranscriptionOptions:
     silence_threshold: float = 0.0025
     line_separator: str = "\n\n"
     transcription_step: float = 3.5
-    #: On by default for whisper.cpp: it keeps the decoder away from silence,
-    #: where it invents sign-offs and whole sentences that are not in the audio.
-    use_vad: bool = True
+    #: Off by default (see DEFAULT_USE_VAD). The form exposes it, and
+    #: BUZZ_WHISPERCPP_VAD_THRESHOLD / BUZZ_WHISPERCPP_VAD_SPEECH_PAD_MS tune
+    #: it for whoever turns it on.
+    use_vad: bool = DEFAULT_USE_VAD
 
 
 def humanize_language(language: str) -> str:
@@ -376,7 +384,7 @@ def deserialize_task_options(
         extract_speech=as_bool(
             options_data.get("extract_speech", value("extract_speech"))
         ),
-        use_vad=as_bool(options_data.get("use_vad"), True),
+        use_vad=as_bool(options_data.get("use_vad"), DEFAULT_USE_VAD),
         temperature=temperature,
         initial_prompt=options_data.get("initial_prompt", ""),
         openai_access_token=openai_access_token,

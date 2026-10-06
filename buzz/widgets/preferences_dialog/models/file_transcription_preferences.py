@@ -6,6 +6,7 @@ from PyQt6.QtCore import QSettings
 
 from buzz.model_loader import TranscriptionModel
 from buzz.transcriber.transcriber import (
+    DEFAULT_USE_VAD,
     Task,
     OutputFormat,
     TranscriptionOptions,
@@ -14,9 +15,7 @@ from buzz.transcriber.transcriber import (
 
 
 #: Bumped when a stored default has to change for installations that already
-#: have a settings file. Version 2 turned voice activity detection on; ``use_vad``
-#: no longer uses it, because a choice the user never made is not stored as one
-#: any more (see ``use_vad_explicit``), which is what the counter stood in for.
+#: have a settings file. Version 2 turned voice activity detection on.
 SETTINGS_VERSION = 2
 
 
@@ -32,14 +31,13 @@ class FileTranscriptionPreferences:
     llm_prompt: str
     llm_model: str
     output_formats: Set["OutputFormat"]
-    #: On by default: whisper.cpp hallucinates sign-offs and invented sentences
-    #: wherever the audio holds no speech, and VAD keeps those windows away from
-    #: the decoder. The form still exposes it, so it can be turned off.
-    use_vad: bool = True
+    #: Off by default (see DEFAULT_USE_VAD): silero reads quiet or breathy
+    #: speech as silence, so VAD only runs when the user asks for it.
+    use_vad: bool = DEFAULT_USE_VAD
     #: True only while the value above came from the user touching the checkbox.
     #: The form saves on close and on run, so a settings file written without an
-    #: explicit choice holds the default of that moment -- keeping it would pin
-    #: that default forever, which is exactly how VAD stayed off after the switch.
+    #: explicit choice holds the default of that moment; keeping it would pin
+    #: that default forever, which is how a switched default used to get stuck.
     use_vad_explicit: bool = False
 
     def save(self, settings: QSettings) -> None:
@@ -76,7 +74,7 @@ class FileTranscriptionPreferences:
         extract_speech = False if extract_speech_value == "false" \
             else bool(extract_speech_value)
 
-        use_vad_value = settings.value("use_vad", True)
+        use_vad_value = settings.value("use_vad", DEFAULT_USE_VAD)
         use_vad_stored = False if use_vad_value == "false" else bool(use_vad_value)
         use_vad_explicit_value = settings.value("use_vad_explicit", False)
         use_vad_explicit = (
@@ -87,7 +85,13 @@ class FileTranscriptionPreferences:
         # Only what the user chose is kept. Anything else follows the default of
         # the running version, so a settings file that merely recorded an old
         # default -- and has since been saved again -- picks the new one up.
-        use_vad = use_vad_stored if use_vad_explicit else True
+        # Version 2 turned VAD on for installations that had never chosen; that
+        # cannot be told apart from a choice except through use_vad_explicit, so
+        # a stored on without it is one of those and goes back to off.
+        if not use_vad_explicit:
+            use_vad = DEFAULT_USE_VAD
+        else:
+            use_vad = use_vad_stored
 
         initial_prompt = settings.value("initial_prompt", "")
         enable_llm_translation_value = settings.value("enable_llm_translation", True)

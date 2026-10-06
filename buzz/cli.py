@@ -90,6 +90,13 @@ def _add_command_options(parser: QCommandLineParser):
     extract_speech_option = QCommandLineOption(
         ["e", "extract-speech"], "Extract speech from audio before transcribing."
     )
+    use_vad_option = QCommandLineOption(
+        ["vad"],
+        "Skip silence with voice activity detection before transcribing. Faster "
+        "on audio that is mostly silent, but can drop quiet or breathy speech; "
+        "tune it with BUZZ_WHISPERCPP_VAD_THRESHOLD and "
+        "BUZZ_WHISPERCPP_VAD_SPEECH_PAD_MS.",
+    )
     open_ai_access_token_option = QCommandLineOption(
         "openai-token",
         f"OpenAI access token. Use only when --model-type is {CommandLineModelType.OPEN_AI_WHISPER_API.value}. Defaults to your previously saved access token, if one exists.",
@@ -123,6 +130,7 @@ def _add_command_options(parser: QCommandLineParser):
             initial_prompt_option,
             word_timestamp_option,
             extract_speech_option,
+            use_vad_option,
             open_ai_access_token_option,
             output_directory_option,
             srt_option,
@@ -142,6 +150,7 @@ def _add_command_options(parser: QCommandLineParser):
         "initial_prompt": initial_prompt_option,
         "word_timestamps": word_timestamp_option,
         "extract_speech": extract_speech_option,
+        "use_vad": use_vad_option,
         "openai_token": open_ai_access_token_option,
         "output_directory": output_directory_option,
         "srt": srt_option,
@@ -301,6 +310,7 @@ def _handle_add_command(app: Application, parser: QCommandLineParser):
         initial_prompt=parser.value(opts["initial_prompt"]),
         word_level_timings=parser.isSet(opts["word_timestamps"]),
         extract_speech=parser.isSet(opts["extract_speech"]),
+        use_vad=parser.isSet(opts["use_vad"]),
         openai_access_token=openai_access_token,
     )
     if translation_settings is not None:
